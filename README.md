@@ -92,6 +92,52 @@ przekierowanie USB, które trzeba włączyć.
 
 ---
 
+## Ramię na jednej maszynie, aplikacja na drugiej
+
+Przekierowanie całego USB przez sieć działa dobrze na LAN-ie i na lokalnym
+hypervisorze, a źle przez internet — i nie dlatego, że „jest wolniej".
+Protokół Feetech to pytanie–odpowiedź: aplikacja wysyła ramkę i **czeka** na
+odpowiedź serwa, zanim wyśle następną. Lokalnie jedna taka transakcja kosztuje
+**0,29 ms**. Przy przekierowaniu USB kosztuje tyle, ile wynosi RTT łącza —
+razy liczba przebiegów URB, których sterownik potrzebuje na jedną ramkę.
+`feetech-servo-sdk` daje na odpowiedź około **34 ms** przy 1 Mbaud, więc to
+wyścig, którego nie warto zaczynać na łączu o RTT rzędu 20 ms.
+
+Most przenosi przez sieć **sam strumień bajtów**, a nie transakcje USB, więc
+jedna ramka to jeden przebieg zamiast kilku. Na maszynie z ramieniem:
+
+```bash
+pip install -e ".[bridge]"
+lerobot-mp-bridge --port COM11 --listen 0.0.0.0:5555 --allow <IP-maszyny-zdalnej>
+```
+
+Na maszynie zdalnej wystarczy dowolny sterownik wirtualnego portu szeregowego
+po TCP — **HW VSP3** albo **com0com + com2tcp** na Windowsie, `socat` na
+Linuksie. Powstaje tam zwykły `COM3`, a aplikacja nie wie, że port jest gdzie
+indziej:
+
+```bash
+lerobot-mp --port COM3
+```
+
+Zmierzone: ping wszystkich sześciu serw przez most po pętli zwrotnej to
+**0,40 ms** wobec 0,29 ms bezpośrednio — sam most kosztuje więc **0,11 ms**,
+a cała reszta budżetu to RTT łącza. `--stats 5` pokazuje ruch na żywo, kiedy
+trzeba sprawdzić, czy coś w ogóle płynie.
+
+Dwie rzeczy warte zapamiętania:
+
+* `--allow` nie jest ozdobnikiem. Otwarty port TCP po drugiej stronie rusza
+  fizycznym ramieniem — bez listy adresów most ostrzega w logu i słucha
+  wszystkich.
+* Rozłączenie sieci **nie upuszcza ramienia**: serwa trzymają ostatnią zadaną
+  pozycję. Most zamyka wtedy port, żeby kolejny klient nie zastał go zajętego.
+
+Zostaje kamera — musi być na tej maszynie, na której liczy się wizja. Sieć
+przenosi tu port szeregowy, nie obraz.
+
+---
+
 ## Jak się tym steruje
 
 | Ruch dłoni | Co robi ramię |
@@ -104,7 +150,8 @@ przekierowanie USB, które trzeba włączyć.
 | szczypnięcie kciuk–wskazujący | chwytak `gripper` |
 | **zwinięcie trzech ostatnich palców** | **pauza** — ramię stoi, dłoń można przełożyć |
 
-To jest tryb `direct`. Są jeszcze dwa — `ik` i `arm` — opisane niżej.
+To jest tryb `direct`. Są jeszcze trzy — `ik`, `arm` i `keys` — opisane niżej.
+Ostatni z nich nie potrzebuje ani dłoni, ani kamery.
 
 Gest pauzy działa jak podniesienie myszy z podkładki: zwijasz środkowy,
 serdeczny i mały palec, przenosisz rękę w wygodne miejsce, prostujesz palce —
@@ -122,12 +169,16 @@ z chwili załączenia, a nie od bezwzględnego położenia dłoni w kadrze.
 | `-` / `=` | limit prędkości | `V` | podgląd ramienia wł./wył. |
 | `Q` / `ESC` | wyjście | | |
 
+W trybie `keys` dochodzą klawisze jazdy: `W` `S` `A` `D` prowadzą chwytak,
+`R` / `F` podnoszą i opuszczają, strzałki w bok obracają nadgarstek, a strzałki
+góra/dół rozwierają i zaciskają szczękę.
+
 **Kalibracja chwytaka pod własną dłoń** zajmuje dwie sekundy: rozstaw palce
 i naciśnij `O`, złącz je i naciśnij `P`.
 
 ---
 
-## Trzy tryby mapowania
+## Cztery tryby mapowania
 
 Przełączasz je klawiszem `M` albo flagą `--mode`.
 
@@ -180,6 +231,42 @@ Dwie rzeczy zmierzone, nie założone:
 Oba modele śledzenia naraz to około 30 ms na klatkę, czyli ~20 FPS wizji.
 Pętla sterowania i tak tyka niezależnie z 30 Hz, więc ramię jedzie płynnie —
 po to jest to rozdzielenie.
+
+**`keys`** — sterowanie z klawiatury, **bez kamery i bez dłoni**. Klawisze
+prowadzą końcówkę chwytaka po przestrzeni, a kąty stawów liczy ta sama odwrotna
+kinematyka co w trybie `ik`:
+
+| Klawisze | Co robi ramię |
+|---|---|
+| `W` / `S` | wysunięcie i cofnięcie końcówki |
+| `A` / `D` | ruch w bok |
+| `R` / `F` | góra i dół |
+| `←` / `→` | obrót nadgarstka `wrist_roll` |
+| `↑` / `↓` | rozwarcie i zaciśnięcie chwytaka |
+
+```bash
+lerobot-mp --mode keys
+```
+
+Osie są zaczepione w **bieżącym kierunku ramienia**, a nie w układzie świata:
+`W` zawsze wysuwa chwytak dalej od podstawy, niezależnie od tego, gdzie ramię
+akurat patrzy. Przy osiach światowych to samo `W` raz by wysuwało, a raz
+prowadziło bokiem — zależnie od obrotu podstawy.
+
+Wciśnięcie nie robi kroku, tylko **nadaje osi prędkość na 0,18 s**
+(`keyboard.hold_timeout`). Klawiatura nie wysyła zdarzenia „puszczono" —
+trzymany klawisz to seria powtórzeń z autopowtarzania systemu. Gdyby jedno
+zdarzenie znaczyło jeden krok, ruch szarpałby na starcie, bo pierwsze
+powtórzenie przychodzi dopiero po ~0,5 s. Tak wychodzi jazda ciągła przy
+trzymaniu i natychmiastowy stop po puszczeniu.
+
+Trzymanie klawisza poza zasięgiem **nie nakręca** zapamiętanego punktu: po
+przycięciu przez IK cel wraca na osiągalny, więc powrót nie trwa tyle, ile
+trwało wyjście.
+
+Ten tryb działa też jako awaryjne wyjście, kiedy kamery po prostu nie ma —
+`M` nie wyprowadzi z niego aplikacji uruchomionej bez obrazu, bo pozostałe
+tryby nie miałyby z czego liczyć ruchu.
 
 ### Czym steruje się szczęką chwytaka
 

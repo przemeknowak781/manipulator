@@ -16,6 +16,7 @@ Przyklady:
   lerobot-mp                                  # symulator + kamera 0
   lerobot-mp --camera 1 --mode ik             # inna kamera, sterowanie kartezjanskie
   lerobot-mp --mode arm                       # sterowanie calym ramieniem, z lokciem
+  lerobot-mp --mode keys                      # sterowanie klawiatura, bez kamery
   lerobot-mp --robot lerobot --port /dev/ttyACM0
   lerobot-mp --source demo.mp4 --no-view      # bez kamery i bez okna
 """
@@ -34,6 +35,11 @@ w miejscu, a dlon mozna przelozyc, jak przy podnoszeniu myszy z podkladki.
 
 Tryb `arm` sledzi cale ramie: Twoj bark, lokiec i nadgarstek steruja trzema
 pierwszymi stawami robota, a dlon nadal obraca nadgarstek i zaciska chwytak.
+
+Tryb `keys` prowadzi koncowke chwytaka klawiszami i nie potrzebuje kamery:
+  W / S   wysuniecie i cofniecie      R / F        gora i dol
+  A / D   ruch w bok                  strzalki < > obrot nadgarstka
+  strzalki gora / dol  rozwarcie i zacisniecie chwytaka
 """
 
 
@@ -56,7 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     robot = parser.add_argument_group("robot")
-    robot.add_argument("--robot", choices=("sim", "lerobot", "auto"), help="backend robota")
+    robot.add_argument(
+        "--robot",
+        choices=("sim", "lerobot", "feetech", "auto"),
+        help="backend robota: sim, lerobot (z torchem), feetech (wprost przez port), auto",
+    )
     robot.add_argument("--port", help="port szeregowy ramienia, np. /dev/ttyACM0")
     robot.add_argument("--robot-id", help="identyfikator ramienia w LeRobot (plik kalibracji)")
     robot.add_argument("--arm", choices=("so101", "so100"), help="typ ramienia")
@@ -64,8 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     control = parser.add_argument_group("sterowanie")
     control.add_argument(
         "--mode",
-        choices=("direct", "ik", "arm"),
-        help="mapowanie: direct (os dloni -> staw), ik (kartezjanskie), arm (cale ramie)",
+        choices=("direct", "ik", "arm", "keys"),
+        help="mapowanie: direct (os dloni -> staw), ik (kartezjanskie), arm (cale ramie), "
+        "keys (klawiatura, bez kamery)",
     )
     control.add_argument(
         "--arm-side",
@@ -130,7 +141,9 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         robot["backend"] = args.robot
     if args.port:
         robot["port"] = args.port
-        robot.setdefault("backend", "lerobot")
+        # `auto`, a nie `lerobot`: bez zainstalowanego LeRobota zostaje jeszcze
+        # backend `feetech`, ktory do teleoperacji wystarcza.
+        robot.setdefault("backend", "auto")
     if args.robot_id:
         robot["robot_id"] = args.robot_id
     if args.arm:

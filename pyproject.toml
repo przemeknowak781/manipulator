@@ -18,10 +18,15 @@ dependencies = [
 
 [project.optional-dependencies]
 robot = ["lerobot[feetech]>=0.3.0"]
+# Sterowanie serwami wprost, bez LeRobota i bez torcha.
+feetech = ["pyserial>=3.5"]
+# Most COM <-> TCP - potrzebny tylko na maszynie, do ktorej wpiete jest ramie.
+bridge = ["pyserial>=3.5"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]
 lerobot-mp = "lerobot_mp.cli:main"
+lerobot-mp-bridge = "lerobot_mp.robot.serial_bridge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
