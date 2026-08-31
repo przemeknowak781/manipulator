@@ -19,9 +19,13 @@ def test_camera_and_source_flags():
 
 
 def test_port_implies_real_robot():
-    """Podanie portu ma wystarczyc - nikt nie powinien musiec dopisywac --robot."""
+    """Podanie portu ma wystarczyc - nikt nie powinien musiec dopisywac --robot.
+
+    `auto`, a nie wprost `lerobot`: bez zainstalowanego LeRobota zostaje jeszcze
+    backend `feetech`, ktory rozmawia z serwami wprost. Wybor nalezy do fabryki.
+    """
     cfg, _ = build_config(["--port", "/dev/ttyACM0"])
-    assert cfg.robot.backend == "lerobot"
+    assert cfg.robot.backend == "auto"
     assert cfg.robot.port == "/dev/ttyACM0"
 
 
