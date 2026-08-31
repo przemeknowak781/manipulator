@@ -118,3 +118,57 @@ def test_angle_unwrapper_is_continuous_over_full_turn():
             assert abs(value - previous) < 0.5
         previous = value
     assert previous == pytest.approx(199 * 0.1, abs=1e-6)
+
+
+def group_delay(flt: OneEuroFilter, freq: float, amplitude: float, seconds: float = 20.0) -> float:
+    """Opoznienie grupowe filtru dla sinusa o zadanej czestotliwosci [s].
+
+    Faze wyjscia wyznaczamy dopasowaniem sinusa i cosinusa metoda najmniejszych
+    kwadratow, a nie szukaniem maksimum na siatce - dzieki temu wynik nie zalezy
+    od kroku probkowania.
+    """
+    omega = 2.0 * math.pi * freq
+    times, values = [], []
+    for step in range(int(seconds / DT)):
+        t = step * DT
+        out = flt(amplitude * math.sin(omega * t), DT)
+        if t > 4.0:  # rozbieg filtru nie nalezy do pomiaru
+            times.append(t)
+            values.append(out)
+
+    sin_energy = sum(math.sin(omega * t) ** 2 for t in times)
+    cos_energy = sum(math.cos(omega * t) ** 2 for t in times)
+    sin_part = sum(math.sin(omega * t) * v for t, v in zip(times, values)) / sin_energy
+    cos_part = sum(math.cos(omega * t) * v for t, v in zip(times, values)) / cos_energy
+    return -math.atan2(cos_part, sin_part) / omega
+
+
+def one_euro(section) -> OneEuroFilter:
+    return OneEuroFilter(section.min_cutoff, section.beta, section.d_cutoff)
+
+
+def test_configured_hand_filters_lag_less_than_a_tenth_of_a_second():
+    """Regresja na NASTAWY, nie na kod filtru.
+
+    Za mala `beta` zamienia One-Euro w zwykly filtr dolnoprzepustowy o stalym
+    `min_cutoff`. Filtr dalej "dziala" - tylko doklada ponad 140 ms opoznienia
+    przy zwyklym machnieciu reka, czego nie widac inaczej niz mierzac faze.
+    Amplitudy odpowiadaja typowemu ruchowi: pol kadru, zmiana rozmiaru dloni
+    o cwierc, obrot nadgarstka o ok. 35 stopni.
+    """
+    from lerobot_mp.config import load_config
+
+    filters = load_config().filters
+    assert group_delay(one_euro(filters.position), freq=0.5, amplitude=0.08) < 0.080
+    assert group_delay(one_euro(filters.scale), freq=0.5, amplitude=0.03) < 0.080
+    assert group_delay(one_euro(filters.angle), freq=0.5, amplitude=0.6) < 0.080
+
+
+def test_beta_too_small_for_the_unit_is_what_makes_the_filter_lag():
+    """Kontrola dla testu wyzej: o zwloce decyduje `beta`, a nie `min_cutoff`.
+
+    Ta sama czestotliwosc graniczna, tylko `beta` sprzed pomiaru - opoznienie
+    rosnie prawie dwukrotnie.
+    """
+    lagging = OneEuroFilter(min_cutoff=1.0, beta=0.02)
+    assert group_delay(lagging, freq=0.5, amplitude=0.08) > 0.120

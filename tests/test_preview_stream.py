@@ -93,6 +93,41 @@ def test_latest_pose_wins_without_a_backlog(stream):
     assert len(s.renderer.poses) < 5
 
 
+def test_an_unchanged_pose_is_not_drawn_a_second_time(stream):
+    """Nieruchome ramie nie ma po co rysowac ponownie.
+
+    Ten watek konkuruje o rdzen z detekcja dloni, ktora siedzi na sciezce
+    opoznienia - a robot stoi przez wiekszosc czasu pracy (sprzeglo
+    rozlaczone, pauza, dojechany cel).
+    """
+    s = stream()
+    s.start({"shoulder_pan": 3.0})
+    drawn = len(s.renderer.poses)
+
+    for _ in range(20):
+        s.submit({"shoulder_pan": 3.0})
+    time.sleep(0.2)
+
+    assert len(s.renderer.poses) == drawn
+
+
+def test_a_moved_joint_is_drawn_again(stream):
+    s = stream()
+    s.start({"shoulder_pan": 3.0})
+    s.submit({"shoulder_pan": 9.0})
+    assert wait_until(lambda: s.image[0, 0, 0] == 9)
+
+
+def test_moving_the_target_marker_alone_is_enough_to_redraw(stream):
+    """Sam znacznik celu tez zmienia obraz, choc poza stawow stoi w miejscu."""
+    s = stream()
+    s.start({"shoulder_pan": 3.0})
+    drawn = len(s.renderer.poses)
+
+    s.submit({"shoulder_pan": 3.0}, ee_target=(0.3, 0.0, 0.1))
+    assert wait_until(lambda: len(s.renderer.poses) > drawn)
+
+
 def test_camera_moves_are_applied_in_the_render_thread(stream):
     s = stream()
     s.start({"shoulder_pan": 0.0})

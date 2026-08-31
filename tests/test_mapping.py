@@ -39,6 +39,24 @@ def zeros() -> dict[str, float]:
     return {name: 0.0 for name in JOINT_NAMES}
 
 
+def test_hand_and_arm_angles_have_separate_filter_settings(cfg):
+    """Kat dloni jest w RADIANACH, kat ramienia w STOPNIACH.
+
+    `beta` mnozy predkosc sygnalu, wiec ta sama wartosc dziala na te dwa
+    wejscia 57 razy inaczej. Sklejenie ich w jedna sekcje konfiguracji znaczy,
+    ze strojenie jednego psuje drugie - i wlasnie tego pilnuje ten test.
+    """
+    cfg.filters.angle.beta = 111.0
+    cfg.filters.arm_angle.beta = 0.05
+    mapper = HandToJointMapper(cfg)
+
+    assert mapper._froll.beta == 111.0
+    assert mapper._fpitch.beta == 111.0
+    assert mapper._f_elbow.beta == 0.05
+    assert mapper._f_azimuth.beta == 0.05
+    assert mapper._f_elevation.beta == 0.05
+
+
 def test_no_hand_gives_no_target(cfg):
     mapper = HandToJointMapper(cfg)
     output = mapper.update(HandFeatures.absent(), zeros(), DT)

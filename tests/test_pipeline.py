@@ -244,3 +244,39 @@ def test_arm_mode_respects_velocity_limits_on_a_sudden_move():
         for name in JOINT_NAMES:
             assert abs(command[name] - previous[name]) <= rig.cfg.joint(name).max_vel * DT + 1e-6
         previous = command
+
+
+class StaleTracker:
+    """Tracker jak w trybie `live_stream`: wynik dotyczy klatki sprzed detekcji."""
+
+    def __init__(self, age: float):
+        self.age = age
+
+    def process_rgb(self, rgb, timestamp):
+        from lerobot_mp.vision.landmarks import TrackResult
+
+        return TrackResult(hands=[make_hand()], timestamp=timestamp - self.age)
+
+
+def test_detection_is_dated_by_its_frame_not_by_the_moment_it_arrived():
+    """Watchdog dloni ma liczyc wiek od KLATKI, a nie od odbioru wyniku.
+
+    Przy detekcji asynchronicznej te dwie chwile dzieli caly czas liczenia
+    modelu. Datowanie wyniku chwila odbioru sprawialoby, ze wynik sprzed
+    pol sekundy wyglada na swiezy - i ramie jechaloby za nieaktualna dlonia.
+    """
+    import numpy as np
+
+    from lerobot_mp.app import TeleopApp
+
+    cfg = load_config()
+    app = TeleopApp(cfg)
+    rgb = np.zeros((720, 1280, 3), dtype=np.uint8)
+    now = 100.0
+
+    app._detect_hand(StaleTracker(age=0.3), rgb, now, FRAME)
+
+    assert app._features_time == pytest.approx(now - 0.3)
+    assert app._current_features(now).present
+    # Prog swiezosci (0,4 s) mierzony od klatki, wiec 0,2 s pozniej juz po nim.
+    assert not app._current_features(now + 0.2).present
