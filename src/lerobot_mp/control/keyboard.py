@@ -35,12 +35,14 @@ ARROW_DOWN = (2621440, 65364, 63233)
 
 #: Os -> (nazwa, zwrot). Nazwy osi sa tez kluczami predkosci w konfiguracji.
 DEFAULT_BINDINGS: dict[object, tuple[str, float]] = {
-    "w": ("reach", 1.0),
-    "s": ("reach", -1.0),
+    # WSAD prowadzi chwytak po plaszczyznie widzianej z boku, a glebokosc
+    # siedzi na Q/E - jak w wiekszosci sterowan przestrzennych.
+    "w": ("height", 1.0),
+    "s": ("height", -1.0),
     "a": ("lateral", -1.0),
     "d": ("lateral", 1.0),
-    "r": ("height", 1.0),
-    "f": ("height", -1.0),
+    "e": ("reach", 1.0),
+    "q": ("reach", -1.0),
     ARROW_LEFT: ("roll", -1.0),
     ARROW_RIGHT: ("roll", 1.0),
     ARROW_DOWN: ("grip", -1.0),
@@ -214,4 +216,4 @@ class KeyboardPilot:
     # ------------------------------------------------------------------- opis
     def legend(self) -> str:
         """Krotka podpowiedz na HUD."""
-        return "WSAD ruch  R/F gora-dol  <- -> obrot  gora/dol chwytak"
+        return "WS gora-dol  AD bok  QE tyl-przod  <- -> obrot  gora/dol chwytak"

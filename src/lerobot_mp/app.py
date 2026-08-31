@@ -464,8 +464,21 @@ class TeleopApp:
 
         char = chr(key).lower() if 32 <= key < 127 else ""
 
-        if key == ESC or char == "q":
+        # X konczy prace, a stop awaryjny siedzi na ESC. Tryb `keys` potrzebuje
+        # Q i E na glebokosc, wiec dawne "Q wychodzi" nie moze zostac - a jeden
+        # klawisz wyjscia dla wszystkich trybow jest mniej mylacy niz dwa.
+        if char == "x":
             return False
+        if key == ESC:
+            if self.supervisor.estopped:
+                self.supervisor.clear_estop()
+                self._notify("Stop awaryjny skasowany")
+            else:
+                self.supervisor.trigger_estop()
+                self.mapper.set_key_clutch(False)
+                self.pilot.release()
+                self._notify("STOP AWARYJNY", 4.0)
+            return True
         if key == 32:  # spacja
             engaged = self.mapper.toggle_key_clutch()
             self._notify("Sterowanie WLACZONE" if engaged else "Sterowanie WYLACZONE")
@@ -476,15 +489,6 @@ class TeleopApp:
             # ramie z powrotem, gdy tylko dojedzie do pozycji domowej.
             self.pilot.release()
             self._notify("Powrot do pozycji domowej")
-        elif char == "x":
-            if self.supervisor.estopped:
-                self.supervisor.clear_estop()
-                self._notify("Stop awaryjny skasowany")
-            else:
-                self.supervisor.trigger_estop()
-                self.mapper.set_key_clutch(False)
-                self.pilot.release()
-                self._notify("STOP AWARYJNY", 4.0)
         elif char == "c":
             self.mapper.release_anchor()
             self.pilot.release()

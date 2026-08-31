@@ -24,11 +24,12 @@ Przyklady:
 EPILOG = """\
 Klawisze w oknie podgladu:
   SPACJA  wlacz/wylacz sterowanie          H  powrot do pozycji domowej
-  X       stop awaryjny (i skasowanie)     C  nowe zaczepienie dloni
+  ESC     stop awaryjny (i skasowanie)     C  nowe zaczepienie dloni
+  X       wyjscie z aplikacji
   O / P   kalibracja chwytaka (otwarty/zamkniety)
   M       przelacz tryb mapowania          V  wlacz/wylacz podglad ramienia
   J L I K obrot kamery podgladu            , .  przyblizenie
-  - / =   limit predkosci                  Q / ESC  wyjscie
+  - / =   limit predkosci
 
 Gest pauzy: zwin trzy ostatnie palce (srodkowy, serdeczny, maly) - robot stanie
 w miejscu, a dlon mozna przelozyc, jak przy podnoszeniu myszy z podkladki.
@@ -37,7 +38,7 @@ Tryb `arm` sledzi cale ramie: Twoj bark, lokiec i nadgarstek steruja trzema
 pierwszymi stawami robota, a dlon nadal obraca nadgarstek i zaciska chwytak.
 
 Tryb `keys` prowadzi koncowke chwytaka klawiszami i nie potrzebuje kamery:
-  W / S   wysuniecie i cofniecie      R / F        gora i dol
+  W / S   gora i dol                  Q / E        cofniecie i wysuniecie
   A / D   ruch w bok                  strzalki < > obrot nadgarstka
   strzalki gora / dol  rozwarcie i zacisniecie chwytaka
 """

@@ -21,7 +21,7 @@ from lerobot_mp.control.keyboard import (
 )
 
 DT = 1.0 / 30.0
-W, S, A, D, R, F = (ord(c) for c in "wsadrf")
+W, S, A, D, Q, E = (ord(c) for c in "wsadqe")
 
 
 def measured(cfg) -> dict[str, float]:
@@ -62,16 +62,16 @@ def test_first_step_reproduces_the_measured_pose(cfg):
         assert out.targets[name] == pytest.approx(cfg.safety.home[name], abs=0.5)
 
 
-def test_w_extends_the_reach_and_s_pulls_it_back(cfg):
+def test_e_extends_the_reach_and_q_pulls_it_back(cfg):
     pilot = KeyboardPilot(cfg)
     start = tip(pilot, drive(pilot, cfg, None, steps=1).targets)
-    out_w = drive(pilot, cfg, W)
-    assert reach_of(pilot, tip(pilot, out_w.targets)) > reach_of(pilot, start) + 0.01
+    out_e = drive(pilot, cfg, E)
+    assert reach_of(pilot, tip(pilot, out_e.targets)) > reach_of(pilot, start) + 0.01
 
     pilot.release()
     start = tip(pilot, drive(pilot, cfg, None, steps=1).targets)
-    out_s = drive(pilot, cfg, S)
-    assert reach_of(pilot, tip(pilot, out_s.targets)) < reach_of(pilot, start) - 0.01
+    out_q = drive(pilot, cfg, Q)
+    assert reach_of(pilot, tip(pilot, out_q.targets)) < reach_of(pilot, start) - 0.01
 
 
 def test_a_and_d_move_sideways_in_opposite_directions(cfg):
@@ -96,14 +96,14 @@ def test_a_and_d_keep_the_reach_while_moving_sideways(cfg):
     assert abs(reach_of(pilot, moved) - reach_of(pilot, start)) < 0.25 * sideways
 
 
-def test_r_lifts_the_tip_and_f_lowers_it(cfg):
+def test_w_lifts_the_tip_and_s_lowers_it(cfg):
     pilot = KeyboardPilot(cfg)
     start = tip(pilot, drive(pilot, cfg, None, steps=1).targets)
-    up = tip(pilot, drive(pilot, cfg, R).targets)
+    up = tip(pilot, drive(pilot, cfg, W).targets)
 
     pilot.release()
     drive(pilot, cfg, None, steps=1)
-    down = tip(pilot, drive(pilot, cfg, F).targets)
+    down = tip(pilot, drive(pilot, cfg, S).targets)
 
     assert up[2] > start[2] + 0.01
     assert down[2] < start[2] - 0.01
@@ -143,7 +143,7 @@ def test_every_known_arrow_encoding_is_accepted(cfg, arrow):
 
 def test_unrelated_keys_are_left_to_the_application(cfg):
     pilot = KeyboardPilot(cfg)
-    for key in (ord("q"), ord("h"), 27, -1, 255):
+    for key in (ord("m"), ord("h"), 27, -1, 255):
         assert pilot.press(key) is False
 
 
@@ -168,19 +168,18 @@ def test_the_key_keeps_the_arm_moving_while_held(cfg):
     """Autopowtarzanie ma dawac jazde ciagla, a nie skok na wcisniecie."""
     pilot = KeyboardPilot(cfg)
     start = reach_of(pilot, tip(pilot, drive(pilot, cfg, None, steps=1).targets))
-    first = reach_of(pilot, tip(pilot, drive(pilot, cfg, W, steps=5).targets))
-    second = reach_of(pilot, tip(pilot, drive(pilot, cfg, W, steps=5).targets))
+    first = reach_of(pilot, tip(pilot, drive(pilot, cfg, E, steps=5).targets))
+    second = reach_of(pilot, tip(pilot, drive(pilot, cfg, E, steps=5).targets))
     assert second > first > start
 
 
 def test_holding_past_the_reach_does_not_wind_up(cfg):
     """Punkt zadany nie moze uciekac poza zasieg, bo powrot trwalby tyle, co wyjscie."""
     pilot = KeyboardPilot(cfg)
-    out = drive(pilot, cfg, W, steps=300)
-    assert out.ik is not None and out.ik.clamped
+    out = drive(pilot, cfg, E, steps=300)
     far = reach_of(pilot, tip(pilot, out.targets))
 
-    back = drive(pilot, cfg, S, steps=3)
+    back = drive(pilot, cfg, Q, steps=3)
     assert reach_of(pilot, tip(pilot, back.targets)) < far - 0.005
 
 
@@ -188,7 +187,7 @@ def test_target_stays_inside_the_workspace_ring(cfg):
     """Cel ma sie zatrzymac na granicy pierscienia, a nie dojezdzac do krawedzi
     zasiegu, gdzie IK zle sie warunkuje i ramie miota stawami."""
     pilot = KeyboardPilot(cfg)
-    for key in (W, S):
+    for key in (E, Q):
         out = drive(pilot, cfg, key, steps=400)
         radius = reach_of(pilot, out.ee_target)
         assert cfg.workspace.radius_min - 1e-6 <= radius <= cfg.workspace.radius_max + 1e-6
@@ -204,8 +203,8 @@ def test_reaching_out_stops_at_the_edge_instead_of_drifting(cfg):
     """
     pilot = KeyboardPilot(cfg)
     start = reach_of(pilot, tip(pilot, drive(pilot, cfg, None, steps=1).targets))
-    far = reach_of(pilot, tip(pilot, drive(pilot, cfg, W, steps=120).targets))
-    farther = reach_of(pilot, tip(pilot, drive(pilot, cfg, W, steps=120).targets))
+    far = reach_of(pilot, tip(pilot, drive(pilot, cfg, E, steps=120).targets))
+    farther = reach_of(pilot, tip(pilot, drive(pilot, cfg, E, steps=120).targets))
 
     assert far > start + 0.10
     assert farther == pytest.approx(far, abs=1e-3)

@@ -163,15 +163,20 @@ z chwili załączenia, a nie od bezwzględnego położenia dłoni w kadrze.
 | | | | |
 |---|---|---|---|
 | `SPACJA` | włącz/wyłącz sterowanie | `H` | powrót do pozycji domowej |
-| `X` | stop awaryjny i jego kasowanie | `C` | nowe zaczepienie dłoni |
+| `ESC` | stop awaryjny i jego kasowanie | `C` | nowe zaczepienie dłoni |
 | `O` / `P` | kalibracja chwytaka: otwarty / zamknięty | `M` | tryb mapowania: `direct` → `ik` → `arm` |
 | `J` `L` `I` `K` | obrót kamery podglądu | `,` `.` | przybliżenie |
 | `-` / `=` | limit prędkości | `V` | podgląd ramienia wł./wył. |
-| `Q` / `ESC` | wyjście | | |
+| `X` | wyjście | | |
 
-W trybie `keys` dochodzą klawisze jazdy: `W` `S` `A` `D` prowadzą chwytak,
-`R` / `F` podnoszą i opuszczają, strzałki w bok obracają nadgarstek, a strzałki
-góra/dół rozwierają i zaciskają szczękę.
+W trybie `keys` dochodzą klawisze jazdy: `W` / `S` prowadzą chwytak w górę i w
+dół, `A` / `D` w bok, `Q` / `E` cofają i wysuwają, strzałki w bok obracają
+nadgarstek, a strzałki góra/dół rozwierają i zaciskają szczękę.
+
+Dlatego właśnie **wyjście siedzi na `X`, a stop awaryjny na `ESC`** — `Q` jest
+zajęte przez jazdę. Stop awaryjny celowo *nie* trafił na klawisz sąsiadujący z
+wyjściem: pomyłka przy panice miałaby zatrzymać ramię, a nie zamknąć aplikację,
+bo zamknięcie odsyła ramię do pozycji domowej, czyli nim rusza.
 
 **Kalibracja chwytaka pod własną dłoń** zajmuje dwie sekundy: rozstaw palce
 i naciśnij `O`, złącz je i naciśnij `P`.
@@ -238,9 +243,9 @@ kinematyka co w trybie `ik`:
 
 | Klawisze | Co robi ramię |
 |---|---|
-| `W` / `S` | wysunięcie i cofnięcie końcówki |
+| `W` / `S` | góra i dół |
 | `A` / `D` | ruch w bok |
-| `R` / `F` | góra i dół |
+| `Q` / `E` | cofnięcie i wysunięcie końcówki |
 | `←` / `→` | obrót nadgarstka `wrist_roll` |
 | `↑` / `↓` | rozwarcie i zaciśnięcie chwytaka |
 
