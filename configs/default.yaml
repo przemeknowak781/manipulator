@@ -33,10 +33,19 @@ tracker:
 # Filtr One-Euro: mocno tlumi drzenie przy wolnym ruchu, a przy szybkim
 # prawie nie opoznia. Mniejsze `min_cutoff` = gladziej, ale z wieksza zwloka;
 # wieksze `beta` = szybsza reakcja na gwaltowne ruchy.
+#
+# `beta` mnozy PREDKOSC sygnalu, wiec jej sensowna wartosc zalezy od jednostki
+# tego sygnalu - i dlatego kazde wejscie ma tu wlasny wpis. Za mala `beta`
+# zamienia One-Euro w zwykly filtr o stalym `min_cutoff`, czyli w czyste
+# opoznienie. Zmierzone przy machnieciu reka 0,5 Hz (opoznienie grupowe):
+#   position beta 0.02 -> 143 ms,  beta 3.0 -> 66 ms   (drzenie bez zmian)
+#   scale    beta 0.01 -> 173 ms,  beta 10  -> 63 ms
+#   angle    beta 0.05 ->  89 ms,  beta 1.5 -> 32 ms
 filters:
-  position: {min_cutoff: 1.0, beta: 0.02, d_cutoff: 1.0}
-  scale:    {min_cutoff: 0.8, beta: 0.01, d_cutoff: 1.0}
-  angle:    {min_cutoff: 1.5, beta: 0.05, d_cutoff: 1.0}
+  position:  {min_cutoff: 1.0, beta: 3.0,  d_cutoff: 1.0}   # polozenie dloni, 0..1
+  scale:     {min_cutoff: 0.8, beta: 10.0, d_cutoff: 1.0}   # rozmiar dloni (glebokosc)
+  angle:     {min_cutoff: 1.5, beta: 1.5,  d_cutoff: 1.0}   # katy dloni [rad]
+  arm_angle: {min_cutoff: 1.5, beta: 0.05, d_cutoff: 1.0}   # katy ramienia [stopnie]
   gripper_ema: 0.5
 
 mapping:
@@ -74,6 +83,12 @@ clutch:
   debounce_s: 0.12
   engaged_on_start: false   # bezpiecznie: robot rusza dopiero po SPACJI
   curl_threshold: 0.58      # otwarta dlon ~0.78, piesc ~0.40
+
+keyboard:                   # tryb `keys`: prowadzenie koncowki klawiszami
+  move_speed: 0.12          # WSAD oraz R/F [m/s trzymania]
+  roll_speed: 60.0          # strzalki w bok: obrot nadgarstka [stopnie/s]
+  gripper_speed: 60.0       # strzalki gora/dol: zacisk chwytaka [jednostki/s]
+  hold_timeout: 0.18        # jak dlugo wcisniecie podtrzymuje ruch bez powtorzen
 
 safety:
   hold_timeout_s: 0.4       # brak dloni dluzej -> zamrozenie ruchu

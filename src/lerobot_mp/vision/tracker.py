@@ -100,6 +100,10 @@ class _TasksBackend:
 
     def _on_result(self, result: object, _image: object, _timestamp_ms: int) -> None:
         converted = self._convert(result)
+        # Wynik opisujemy czasem KLATKI, z ktorej powstal, a nie chwila jego
+        # odbioru. W trybie asynchronicznym te dwie rzeczy dzieli caly czas
+        # detekcji, a od nich zalezy watchdog dloni i pomiar opoznienia.
+        converted.timestamp = _timestamp_ms / 1000.0
         with self._lock:
             self._async_result = converted
 
@@ -114,7 +118,9 @@ class _TasksBackend:
             self._landmarker.detect_async(mp_image, timestamp_ms)
             with self._lock:
                 return self._async_result or TrackResult()
-        return self._convert(self._landmarker.detect_for_video(mp_image, timestamp_ms))
+        result = self._convert(self._landmarker.detect_for_video(mp_image, timestamp_ms))
+        result.timestamp = timestamp_ms / 1000.0
+        return result
 
     def close(self) -> None:
         try:
@@ -140,7 +146,7 @@ class _LegacyBackend:
             min_tracking_confidence=cfg.min_tracking_confidence,
         )
 
-    def process(self, image_rgb: np.ndarray, timestamp_ms: int) -> TrackResult:  # noqa: ARG002
+    def process(self, image_rgb: np.ndarray, timestamp_ms: int) -> TrackResult:
         result = self._hands.process(image_rgb)
         hands: list[HandSample] = []
         multi = result.multi_hand_landmarks or []
@@ -158,7 +164,7 @@ class _LegacyBackend:
                 label = cls.label or "Unknown"
                 score = float(cls.score)
             hands.append(HandSample(pts, wpts, label, score))
-        return TrackResult(hands=hands)
+        return TrackResult(hands=hands, timestamp=timestamp_ms / 1000.0)
 
     def close(self) -> None:
         self._hands.close()
@@ -204,11 +210,23 @@ class HandTracker:
         """Wykrywa dlonie na klatce BGR (jak z OpenCV)."""
         import cv2
 
-        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        rgb = np.ascontiguousarray(rgb)
-        result = self._backend.process(rgb, int(timestamp * 1000.0))
-        result.timestamp = timestamp
-        return result
+        rgb = np.ascontiguousarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        return self.process_rgb(rgb, timestamp)
+
+    def process_rgb(self, image_rgb: np.ndarray, timestamp: float) -> TrackResult:
+        """To samo, ale na gotowej klatce RGB.
+
+        W trybie `arm` te sama klatke oglada tez model sylwetki. Konwersja
+        BGR->RGB kosztuje ok. 1,4 ms przy 720p, wiec robienie jej raz zamiast
+        dwa razy jest darmowym zyskiem - a nie da sie tego zrobic, dopoki
+        kazdy tracker konwertuje sobie sam.
+
+        `TrackResult.timestamp` opisuje klatke, z ktorej wynik POWSTAL. W trybie
+        `live_stream` jest to klatka starsza niz podana tutaj, bo detekcja
+        chodzi asynchronicznie - i wlasnie dlatego ustawia go backend, a nie ta
+        metoda.
+        """
+        return self._backend.process(image_rgb, int(timestamp * 1000.0))
 
     def close(self) -> None:
         self._backend.close()

@@ -52,11 +52,14 @@ class PoseSample:
             (poczatek miedzy biodrami). To z nich licza sie katy - wspolrzedne
             obrazu splaszczylyby ruch "do kamery".
         visibility: (33,) wiarygodnosc kazdego punktu, 0..1.
+        timestamp: czas KLATKI, z ktorej sylwetka powstala [s, monotoniczny].
+            W trybie `live_stream` jest starszy niz chwila odbioru wyniku.
     """
 
     landmarks: np.ndarray
     world_landmarks: np.ndarray | None = None
     visibility: np.ndarray = field(default_factory=lambda: np.zeros(NUM_POSE_LANDMARKS))
+    timestamp: float = 0.0
 
     def __post_init__(self) -> None:
         self.landmarks = np.asarray(self.landmarks, dtype=np.float32).reshape(-1, 3)
@@ -121,6 +124,9 @@ class _PoseTasksBackend:
 
     def _on_result(self, result: object, _image: object, _timestamp_ms: int) -> None:
         converted = self._convert(result)
+        # Tak samo jak przy dloni: liczy sie czas klatki, a nie czas odbioru.
+        if converted is not None:
+            converted.timestamp = _timestamp_ms / 1000.0
         with self._lock:
             self._async_result = converted
 
@@ -133,7 +139,10 @@ class _PoseTasksBackend:
             self._landmarker.detect_async(mp_image, timestamp_ms)
             with self._lock:
                 return self._async_result
-        return self._convert(self._landmarker.detect_for_video(mp_image, timestamp_ms))
+        sample = self._convert(self._landmarker.detect_for_video(mp_image, timestamp_ms))
+        if sample is not None:
+            sample.timestamp = timestamp_ms / 1000.0
+        return sample
 
     def close(self) -> None:
         try:
@@ -157,7 +166,7 @@ class _PoseLegacyBackend:
             min_tracking_confidence=cfg.min_tracking_confidence,
         )
 
-    def process(self, image_rgb: np.ndarray, timestamp_ms: int) -> PoseSample | None:  # noqa: ARG002
+    def process(self, image_rgb: np.ndarray, timestamp_ms: int) -> PoseSample | None:
         result = self._pose.process(image_rgb)
         if not result.pose_landmarks:
             return None
@@ -172,7 +181,7 @@ class _PoseLegacyBackend:
             world = np.array(
                 [[p.x, p.y, p.z] for p in result.pose_world_landmarks.landmark], dtype=np.float32
             )
-        return PoseSample(points, world, visibility)
+        return PoseSample(points, world, visibility, timestamp_ms / 1000.0)
 
     def close(self) -> None:
         self._pose.close()
@@ -206,7 +215,11 @@ class PoseTracker:
         import cv2
 
         rgb = np.ascontiguousarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-        return self._backend.process(rgb, int(timestamp * 1000.0))
+        return self.process_rgb(rgb, timestamp)
+
+    def process_rgb(self, image_rgb: np.ndarray, timestamp: float) -> PoseSample | None:
+        """To samo, ale na gotowej klatce RGB - patrz `HandTracker.process_rgb`."""
+        return self._backend.process(image_rgb, int(timestamp * 1000.0))
 
     def close(self) -> None:
         self._backend.close()

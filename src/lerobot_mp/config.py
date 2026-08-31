@@ -76,9 +76,31 @@ class OneEuroConfig:
 
 @dataclass
 class FilterConfig:
-    position: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=1.0, beta=0.02))
-    scale: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=0.8, beta=0.01))
-    angle: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=1.5, beta=0.05))
+    """Nastawy filtrow wejscia sterowania.
+
+    UWAGA NA JEDNOSTKI. `beta` mnozy *predkosc* filtrowanego sygnalu, wiec ta
+    sama liczba znaczy cos zupelnie innego dla kazdego z tych czterech wejsc.
+    Zbyt mala `beta` zamienia One-Euro w zwykly filtr dolnoprzepustowy o stalej
+    czestotliwosci `min_cutoff` - a wtedy caly jego sens (malo opoznienia przy
+    szybkim ruchu) znika. Wartosci ponizej sa zmierzone, nie zgadniete:
+    przy typowym machnieciu reka (0,5 Hz) daja odpowiednio 66, 63 i 32 ms
+    opoznienia grupowego wobec 143, 173 i 89 ms przy poprzednich nastawach,
+    przy praktycznie tym samym drzeniu na postoju.
+    """
+
+    #: Polozenie dloni w kadrze, 0..1. Ruch przez pol kadru w pol sekundy to
+    #: ok. 1,0 jednostki/s - stad `beta` rzedu jednosci.
+    position: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=1.0, beta=3.0))
+    #: Rozmiar dloni w kadrze (ok. 0,12), czyli sygnal glebokosci. Zmienia sie
+    #: kilkanascie razy wolniej niz polozenie, wiec `beta` musi byc tyle razy
+    #: wieksza, zeby filtr w ogole zauwazyl ruch.
+    scale: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=0.8, beta=10.0))
+    #: Katy dloni (roll, pitch) w RADIANACH.
+    angle: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=1.5, beta=1.5))
+    #: Katy ramienia operatora w STOPNIACH (tryb `arm`). Ten sam ruch daje tu
+    #: 57 razy wieksza liczbe niz w radianach, wiec `beta` musi byc 57 razy
+    #: mniejsza - dlatego to osobny wpis, a nie ten sam co `angle`.
+    arm_angle: OneEuroConfig = field(default_factory=lambda: OneEuroConfig(min_cutoff=1.5, beta=0.05))
     #: Chwytak wygladzamy prostym EMA (0 = brak wygladzania, 0.9 = mocne).
     gripper_ema: float = 0.5
 
@@ -301,7 +323,10 @@ class SafetyConfig:
 
 @dataclass
 class RobotConfig:
-    #: "sim" | "lerobot" | "auto" (lerobot jesli podano port i biblioteke widac)
+    #: "sim" | "lerobot" | "feetech" | "auto".
+    #:   lerobot - pelna zgodnosc z ekosystemem LeRobot (wymaga torcha),
+    #:   feetech - rozmowa wprost z serwami przez port szeregowy (sam pyserial).
+    #:   auto    - lerobot, jesli jest zainstalowany, inaczej feetech.
     backend: str = "sim"
     #: Port szeregowy plytki sterujacej, np. /dev/ttyACM0 albo COM5.
     port: str | None = None
@@ -317,6 +342,22 @@ class RobotConfig:
     #: Jak czesto odczytywac faktyczna pozycje stawow [Hz]. Kazdy odczyt to
     #: transakcja po porcie szeregowym, wiec nie ma sensu robic tego co klatke.
     read_state_hz: float = 10.0
+
+    # --- ponizsze dotyczy wylacznie backendu `feetech` -----------------------
+    #: Predkosc portu. Serwa STS3215 w SO-101 wychodza z fabryki na 1 Mbaud.
+    baudrate: int = 1_000_000
+    #: Tik odpowiadajacy zeru stawu. Serwo ma 4096 tikow na obrot, a przy
+    #: standardowym montazu SO-101 sklada sie je wysrodkowane, czyli na 2048.
+    center_ticks: int = 2048
+    #: Zakres szczeki chwytaka w tikach: 0 w skali aplikacji to `closed`,
+    #: 100 to `open`. Domyslne wartosci sa CELOWO ciasne - lepiej, zeby chwytak
+    #: nie domykal sie do konca, niz zeby napieral na wlasny mechanizm.
+    #: Zmierz swoje: rozewrzyj szczeke reka i odczytaj `Present_Position`.
+    gripper_closed_ticks: int = 2048
+    gripper_open_ticks: int = 2700
+    #: Wylaczenie momentu przy wyjsciu. Domyslnie NIE, bo wiotkie ramie opada
+    #: pod wlasnym ciezarem - wlacz tylko, gdy wiesz, ze jest podparte.
+    torque_off_on_exit: bool = False
 
 
 @dataclass
@@ -345,6 +386,26 @@ class UIConfig:
 
 
 @dataclass
+class KeyboardConfig:
+    """Tryb `keys`: prowadzenie koncowki chwytaka klawiszami, bez kamery.
+
+    Predkosci sa podane "na sekunde trzymania", a nie "na wcisniecie", bo
+    klawisz trzymany wciskiem generuje powtorzenia z autopowtarzania systemu.
+    """
+
+    #: Predkosc liniowa koncowki [m/s] dla WSAD oraz R/F.
+    move_speed: float = 0.12
+    #: Predkosc obrotu nadgarstka [stopnie/s] dla strzalek w lewo/prawo.
+    roll_speed: float = 60.0
+    #: Predkosc zaciskania chwytaka [jednostki/s] dla strzalek gora/dol.
+    gripper_speed: float = 60.0
+    #: Jak dlugo wcisniecie utrzymuje ruch, gdy nie przyszlo kolejne powtorzenie.
+    #: Musi byc dluzsze niz odstep autopowtarzania (~33 ms), inaczej ruch rwie;
+    #: i wyraznie krotsze niz czas reakcji, inaczej ramie jedzie po puszczeniu.
+    hold_timeout: float = 0.18
+
+
+@dataclass
 class AppConfig:
     loop_hz: float = 30.0
     #: Automatyczne zakonczenie po tylu sekundach (None = bez limitu).
@@ -356,6 +417,7 @@ class AppConfig:
     mapping: MappingConfig = field(default_factory=MappingConfig)
     arm: ArmTrackingConfig = field(default_factory=ArmTrackingConfig)
     clutch: ClutchConfig = field(default_factory=ClutchConfig)
+    keyboard: KeyboardConfig = field(default_factory=KeyboardConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
     ui: UIConfig = field(default_factory=UIConfig)

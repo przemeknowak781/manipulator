@@ -70,11 +70,13 @@ class HandToJointMapper:
         self._gripper_ema = ExponentialFilter(f.gripper_ema)
         self._roll_unwrap = AngleUnwrapper()
 
-        # Tryb `arm`: katy sa juz w stopniach, wiec filtrujemy je tak samo
-        # jak katy dloni, tylko w innej jednostce.
-        self._f_azimuth = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
-        self._f_elevation = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
-        self._f_elbow = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
+        # Tryb `arm`: katy sa w STOPNIACH, a nie w radianach jak katy dloni.
+        # `beta` mnozy predkosc sygnalu, wiec te same nastawy co dla dloni
+        # dzialalyby tu 57 razy mocniej - stad osobna sekcja konfiguracji.
+        a = f.arm_angle
+        self._f_azimuth = OneEuroFilter(a.min_cutoff, a.beta, a.d_cutoff)
+        self._f_elevation = OneEuroFilter(a.min_cutoff, a.beta, a.d_cutoff)
+        self._f_elbow = OneEuroFilter(a.min_cutoff, a.beta, a.d_cutoff)
         self._azimuth_unwrap = AngleUnwrapper(period=360.0)
 
         self._engaged = cfg.clutch.engaged_on_start
@@ -104,6 +106,15 @@ class HandToJointMapper:
         if self.arm_mode:
             return self._anchor_arm is not None
         return self._anchor is not None
+
+    @property
+    def key_engaged(self) -> bool:
+        """Sam stan sprzegla klawiszowego (SPACJA), bez udzialu gestu.
+
+        Tryb `keys` nie wola `update()`, wiec nie ma skad wziac `engaged` -
+        a sprzeglo z klawiatury dziala tam tak samo jak w pozostalych trybach.
+        """
+        return self._key_engaged
 
     def toggle_key_clutch(self) -> bool:
         """Przelacza sprzeglo klawiszem (spacja). Zwraca nowy stan."""

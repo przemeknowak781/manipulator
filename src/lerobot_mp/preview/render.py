@@ -82,7 +82,7 @@ class Renderer3D:
         self.background = background
         self.camera = Camera()
         self.fit()
-        self._light = self.LIGHT / np.linalg.norm(self.LIGHT)
+        self._light = (self.LIGHT / np.linalg.norm(self.LIGHT)).astype(np.float32)
         # Kolory czlonow trzymamy w BGR, bo OpenCV rysuje w BGR.
         self._colors_bgr = model.link_colors[:, ::-1].astype(np.float32)
 
@@ -126,8 +126,14 @@ class Renderer3D:
         image = np.full((self.height, self.width, 3), self.background, dtype=np.uint8)
 
         view = self.camera.view_matrix()
-        world = self.model.posed_vertices(joints_deg).astype(np.float64)
-        camera_space = world @ view[:3, :3].T + view[:3, 3]
+        # Caly rachunek trzymamy w float32. Podglad ma 360 px szerokosci, wiec
+        # o dokladnosc tu nie chodzi - chodzi o to, ze float64 przewala przez
+        # pamiec dwa razy wiecej bajtow na siatce 22 tys. trojkatow, a ten watek
+        # konkuruje o rdzen z detekcja dloni, ktora siedzi na sciezce opoznienia.
+        rotation = np.ascontiguousarray(view[:3, :3].T, dtype=np.float32)
+        translation = view[:3, 3].astype(np.float32)
+        world = self.model.posed_vertices(joints_deg)
+        camera_space = world @ rotation + translation
 
         self._draw_ground(image, view)
 

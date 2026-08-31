@@ -68,6 +68,8 @@ class ArmModel:
     dof_max: np.ndarray
     source: dict
     reference: dict
+    #: Pamiec podreczna podzialu wierzcholkow na czlony - patrz `_link_vertices`.
+    _link_cache: list[tuple[np.ndarray, np.ndarray]] | None = None
 
     # ------------------------------------------------------------- wczytanie
     @classmethod
@@ -136,16 +138,30 @@ class ArmModel:
             world[link] = base @ self.chain_pre[step] @ move @ self.chain_post[step]
         return world
 
+    def _link_vertices(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Indeksy i wierzcholki kazdego czlonu - liczone raz, nie co klatke.
+
+        Podglad rysuje sie kilkanascie razy na sekunde, a przypisanie
+        wierzcholkow do czlonow jest stale. Wyznaczanie go od nowa przy kazdej
+        klatce to kilka maskowan po 12 tys. elementow za darmo.
+        """
+        if self._link_cache is None:
+            cache = []
+            for index in range(len(self.link_names)):
+                which = np.flatnonzero(self.vertex_link == index)
+                if len(which):
+                    cache.append((which, np.ascontiguousarray(self.vertices[which])))
+            self._link_cache = cache
+        return self._link_cache
+
     def posed_vertices(self, joints_deg: dict[str, float]) -> np.ndarray:
         """Wierzcholki wszystkich czlonow przeniesione do ukladu swiata."""
         transforms = self.link_transforms(joints_deg)
         out = np.empty_like(self.vertices, dtype=np.float32)
-        for index in range(len(self.link_names)):
-            mask = self.vertex_link == index
-            if not mask.any():
-                continue
-            matrix = transforms[index]
-            out[mask] = (self.vertices[mask] @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
+        for which, local in self._link_vertices():
+            matrix = transforms[int(self.vertex_link[which[0]])]
+            rotation = np.ascontiguousarray(matrix[:3, :3].T, dtype=np.float32)
+            out[which] = local @ rotation + matrix[:3, 3].astype(np.float32)
         return out
 
     # ------------------------------------------------- jednostki z LeRobot

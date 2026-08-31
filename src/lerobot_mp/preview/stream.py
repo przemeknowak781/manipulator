@@ -34,6 +34,13 @@ Target = tuple[float, float, float] | None
 class PreviewStream:
     """Nieblokujace zrodlo obrazow podgladu 3D."""
 
+    #: Ponizej tej roznicy kata (stopnie) nowa poza nie przesunelaby zadnego
+    #: wierzcholka nawet o piksel. Renderowanie jej drugi raz to czysta strata
+    #: rdzenia - a ten rdzen jest potrzebny detekcji dloni, ktora siedzi na
+    #: sciezce opoznienia. Ramie stoi przez wiekszosc czasu pracy (sprzeglo
+    #: rozlaczone, pauza, dojazd do celu), wiec to nie jest przypadek brzegowy.
+    POSE_EPSILON_DEG = 0.05
+
     def __init__(self, renderer: Renderer3D, model: ArmModel, hz: float = 30.0):
         self.renderer = renderer
         self.model = model
@@ -47,6 +54,10 @@ class PreviewStream:
         self._pose: Pose = {}
         self._target: Target = None
         self._dirty = False
+        #: Poza, ktora widac na ostatnim gotowym obrazie - punkt odniesienia
+        #: dla decyzji "czy to sie w ogole zmienilo".
+        self._drawn_pose: Pose | None = None
+        self._drawn_target: Target = None
         # Obroty i przyblizenia z klawiatury przychodza z watku glownego, a
         # kamera nalezy do renderera - kolejkujemy je i stosujemy tam, gdzie
         # sie rysuje, zamiast ruszac kamera spod rak watkowi.
@@ -63,6 +74,7 @@ class PreviewStream:
         """
         self._pose, self._target = dict(pose), ee_target
         self._image = self.renderer.render(self._pose, ee_target=self._target)
+        self._drawn_pose, self._drawn_target = dict(self._pose), self._target
 
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="preview", daemon=True)
@@ -74,8 +86,17 @@ class PreviewStream:
         """Zostawia najnowsza poze do narysowania. Nie blokuje."""
         with self._lock:
             self._pose, self._target = pose, ee_target
+            if not self._differs(pose, ee_target):
+                return  # ten sam obraz - nie ma po co budzic renderera
             self._dirty = True
         self._wake.set()
+
+    def _differs(self, pose: Pose, ee_target: Target) -> bool:
+        """Czy nowa poza da inny obraz niz ostatnio narysowany."""
+        drawn = self._drawn_pose
+        if drawn is None or ee_target != self._drawn_target or pose.keys() != drawn.keys():
+            return True
+        return any(abs(pose[name] - drawn[name]) > self.POSE_EPSILON_DEG for name in pose)
 
     @property
     def image(self) -> np.ndarray | None:
@@ -129,6 +150,7 @@ class PreviewStream:
                 continue
             with self._lock:
                 self._image = image
+                self._drawn_pose, self._drawn_target = pose, target
 
             # Limit czestotliwosci liczony od *konca* rysowania: na wolnej
             # maszynie render sam z siebie zejdzie ponizej `hz` i nie ma sensu
