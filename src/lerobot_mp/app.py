@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 
 from .config import AppConfig
+from .control.keyboard import KeyboardPilot
 from .control.mapping import ControlOutput, HandToJointMapper
 from .control.safety import SafetyState, SafetySupervisor
 from .robot import create_backend
@@ -25,6 +26,7 @@ from .ui.arm_view import compose, draw_arm_view
 from .ui.hud import HudData, draw_arm_skeleton, draw_hand_skeleton, draw_hud
 from .utils.rate import FpsMeter, LoopRate
 from .vision.arm_features import ArmFeatures, extract_arm_features, pick_arm
+from .vision.blank import BlankSource
 from .vision.camera import CameraStream
 from .vision.features import HandFeatures, extract_features
 from .vision.pose import PoseTracker
@@ -54,8 +56,11 @@ class TeleopApp:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.mapper = HandToJointMapper(cfg)
+        self.pilot = KeyboardPilot(cfg)
         self.supervisor = SafetySupervisor(cfg)
         self.fps = FpsMeter()
+        #: Czy mamy z czego liczyc ruch dloni. Bez kamery zostaje tylko `keys`.
+        self._has_vision = True
 
         self._features = HandFeatures.absent()
         self._features_time = 0.0
@@ -115,26 +120,53 @@ class TeleopApp:
         return self.cfg.mapping.mode.lower() == "arm"
 
     @property
+    def _keys_mode(self) -> bool:
+        return self.cfg.mapping.mode.lower() == "keys"
+
+    @property
     def _wants_hand(self) -> bool:
         """Czy w ogole potrzebujemy sledzenia dloni w biezacym trybie."""
+        if self._keys_mode:
+            return False
         return not self._arm_mode or self.cfg.arm.use_hand
 
     # ------------------------------------------------------------------- run
     def run(self) -> int:
-        camera = CameraStream(self.cfg.camera)
+        # Tryb `keys` nie uzywa obrazu, ale okno podgladu nadal musi na czyms
+        # rysowac HUD - i to ono zbiera klawisze. Stad czarne tlo zamiast kamery.
+        self._has_vision = not self._keys_mode
+        camera = CameraStream(self.cfg.camera) if self._has_vision else BlankSource(self.cfg.camera)
         backend = create_backend(self.cfg)
         tracker: HandTracker | None = None
 
         try:
-            camera.open()
-            first = camera.wait_for_frame(timeout=8.0)
-            logger.info(
-                "Kamera %s: %dx%d", self.cfg.camera.source, first.image.shape[1], first.image.shape[0]
-            )
+            try:
+                camera.open()
+                first = camera.wait_for_frame(timeout=8.0)
+            except (RuntimeError, TimeoutError):
+                if self._has_vision:
+                    logger.error(
+                        "Bez obrazu zostaje sterowanie z klawiatury - uruchom z `--mode keys`."
+                    )
+                raise
 
-            tracker = HandTracker(self.cfg.tracker)
-            if self._arm_mode:
-                self._ensure_pose_tracker()
+            if self._has_vision:
+                logger.info(
+                    "Kamera %s: %dx%d",
+                    self.cfg.camera.source,
+                    first.image.shape[1],
+                    first.image.shape[0],
+                )
+                tracker = HandTracker(self.cfg.tracker)
+                if self._arm_mode:
+                    self._ensure_pose_tracker()
+            else:
+                logger.info("Tryb `keys`: bez kamery, sterowanie z klawiatury.")
+                if not self.cfg.ui.show:
+                    logger.warning(
+                        "Tryb `keys` bez okna podgladu nie ma skad brac klawiszy - "
+                        "ramie nie ruszy."
+                    )
             self._setup_preview()
 
             backend.connect()
@@ -154,7 +186,12 @@ class TeleopApp:
             self._shutdown(camera, tracker, backend)
         return 0
 
-    def _loop(self, camera: CameraStream, tracker: HandTracker, backend: RobotBackend) -> None:
+    def _loop(
+        self,
+        camera: CameraStream | BlankSource,
+        tracker: HandTracker | None,
+        backend: RobotBackend,
+    ) -> None:
         rate = LoopRate(self.cfg.loop_hz)
         previous = time.monotonic()
         deadline = (
@@ -178,17 +215,23 @@ class TeleopApp:
                 rate.sleep()
                 continue
 
-            if frame.index != self._last_frame_index:
+            if tracker is not None and frame.index != self._last_frame_index:
                 self._last_frame_index = frame.index
                 self._process_frame(frame, tracker)
 
-            features = self._current_features(now)
-            arm = self._current_arm(now)
-            output = self.mapper.update(features, self.supervisor.command, dt, arm=arm)
+            if self._keys_mode:
+                # Klawiatura nie potrzebuje ani klatki, ani zaczepienia dloni -
+                # sprzeglo (SPACJA) jest tu jedynym warunkiem ruchu.
+                output = self.pilot.update(dt, self.mapper.key_engaged, self._measured)
+                present = True
+            else:
+                features = self._current_features(now)
+                arm = self._current_arm(now)
+                output = self.mapper.update(features, self.supervisor.command, dt, arm=arm)
 
-            # Watchdog pilnuje OPERATORA: w trybie `arm` liczy sie ramie,
-            # bo dlon moze chwilowo wypasc z kadru bez utraty sterowania.
-            present = arm.present if self._arm_mode else features.present
+                # Watchdog pilnuje OPERATORA: w trybie `arm` liczy sie ramie,
+                # bo dlon moze chwilowo wypasc z kadru bez utraty sterowania.
+                present = arm.present if self._arm_mode else features.present
             command, report = self.supervisor.step(
                 output.targets,
                 dt,
@@ -204,7 +247,9 @@ class TeleopApp:
                 self._record(canvas)
                 if self.cfg.ui.show:
                     cv2.imshow(self.cfg.ui.window_name, canvas)
-                    if not self._handle_keys(cv2.waitKey(1) & 0xFF, backend):
+                    # `waitKeyEx`, nie `waitKey`: maskowanie `& 0xFF` zeruje kody
+                    # strzalek (0x250000..0x280000), a tryb `keys` na nich stoi.
+                    if not self._handle_keys(cv2.waitKeyEx(1), backend):
                         break
 
             rate.sleep()
@@ -213,20 +258,27 @@ class TeleopApp:
     def _process_frame(self, frame, tracker: HandTracker) -> None:
         started = time.perf_counter()
         height, width = frame.image.shape[:2]
+        wants_arm = self._arm_mode and self._pose is not None
+
+        # Konwersja BGR->RGB kosztuje ok. 1,4 ms przy 720p. W trybie `arm`
+        # ta sama klatka idzie do dwoch modeli, wiec robimy ja raz.
+        rgb = np.ascontiguousarray(cv2.cvtColor(frame.image, cv2.COLOR_BGR2RGB))
 
         if self._wants_hand:
-            self._detect_hand(tracker, frame, (width, height))
+            self._detect_hand(tracker, rgb, frame.timestamp, (width, height))
         else:
             self._last_hands = []
             self._features = HandFeatures.absent()
 
-        if self._arm_mode and self._pose is not None:
-            self._detect_arm(frame, (width, height))
+        if wants_arm:
+            self._detect_arm(rgb, frame.timestamp, (width, height))
 
         self._latency_ms = (time.perf_counter() - started) * 1000.0
 
-    def _detect_hand(self, tracker: HandTracker, frame, size: tuple[int, int]) -> None:
-        result = tracker.process(frame.image, frame.timestamp)
+    def _detect_hand(
+        self, tracker: HandTracker, rgb: np.ndarray, timestamp: float, size: tuple[int, int]
+    ) -> None:
+        result = tracker.process_rgb(rgb, timestamp)
         self._last_hands = result.hands
 
         hand = result.pick(self.cfg.tracker.preferred_hand)
@@ -240,11 +292,14 @@ class TeleopApp:
             previous=self._features if self._features.present else None,
             curl_threshold=self.cfg.clutch.curl_threshold,
         )
-        self._features_time = time.monotonic()
+        # Wiek cech liczymy od KLATKI, a nie od chwili odbioru wyniku. W trybie
+        # `live_stream` te dwie chwile dzieli caly czas detekcji, wiec inaczej
+        # watchdog dloni uznawalby stary wynik za swiezy.
+        self._features_time = result.timestamp or timestamp
 
-    def _detect_arm(self, frame, size: tuple[int, int]) -> None:
+    def _detect_arm(self, rgb: np.ndarray, timestamp: float, size: tuple[int, int]) -> None:
         assert self._pose is not None
-        sample = self._pose.process(frame.image, frame.timestamp)
+        sample = self._pose.process_rgb(rgb, timestamp)
         self._pose_sample = sample
         if sample is None:
             self._arm = ArmFeatures.absent()
@@ -257,7 +312,7 @@ class TeleopApp:
 
         self._arm = extract_arm_features(sample, side, size, self.cfg.arm.min_visibility)
         if self._arm.present:
-            self._arm_time = time.monotonic()
+            self._arm_time = sample.timestamp or timestamp
 
     def _current_features(self, now: float) -> HandFeatures:
         """Cechy dloni z kontrola swiezosci - stara detekcja to brak dloni."""
@@ -402,6 +457,11 @@ class TeleopApp:
         if key in (255, -1):
             return True
 
+        # Klawisze jazdy (WSAD, R/F, strzalki) obsluguje pilot. Nie koliduja z
+        # niczym nizej, wiec moga isc pierwsze i konczyc obsluge.
+        if self._keys_mode and self.pilot.press(key):
+            return True
+
         char = chr(key).lower() if 32 <= key < 127 else ""
 
         if key == ESC or char == "q":
@@ -412,6 +472,9 @@ class TeleopApp:
         elif char == "h":
             self.supervisor.begin_homing()
             self.mapper.release_anchor()
+            # Bez tego pilot dalej trzymalby cel sprzed powrotu i sciagnalby
+            # ramie z powrotem, gdy tylko dojedzie do pozycji domowej.
+            self.pilot.release()
             self._notify("Powrot do pozycji domowej")
         elif char == "x":
             if self.supervisor.estopped:
@@ -420,9 +483,11 @@ class TeleopApp:
             else:
                 self.supervisor.trigger_estop()
                 self.mapper.set_key_clutch(False)
+                self.pilot.release()
                 self._notify("STOP AWARYJNY", 4.0)
         elif char == "c":
             self.mapper.release_anchor()
+            self.pilot.release()
             self._notify("Nowe zaczepienie dloni")
         elif char in ("o", "p"):
             which = "open" if char == "o" else "closed"
@@ -450,16 +515,24 @@ class TeleopApp:
         return True
 
     def _cycle_mode(self) -> None:
-        """Przelacza mapowanie: direct -> ik -> arm -> direct."""
-        order = ("direct", "ik", "arm")
+        """Przelacza mapowanie: direct -> ik -> arm -> keys -> direct."""
+        order = ("direct", "ik", "arm", "keys")
         current = self.cfg.mapping.mode.lower()
+
+        # Aplikacja wystartowana bez kamery nie ma z czego liczyc ruchu dloni -
+        # zostaje w `keys`, zamiast przelaczyc sie w tryb, ktory nigdy nie ruszy.
+        if not self._has_vision:
+            self._notify("Bez kamery dziala tylko tryb `keys`", 3.0)
+            return
+
         nxt = order[(order.index(current) + 1) % len(order)] if current in order else "direct"
 
         if nxt == "arm" and not self._ensure_pose_tracker():
-            nxt = "direct"  # sledzenie sylwetki niedostepne - wracamy na poczatek
+            nxt = "keys"  # sledzenie sylwetki niedostepne - pomijamy ten tryb
 
         self.cfg.mapping.mode = nxt
         self.mapper.release_anchor()
+        self.pilot.release()
         self._arm = ArmFeatures.absent()
         self._notify(f"Tryb mapowania: {nxt}")
 
@@ -482,7 +555,10 @@ class TeleopApp:
 
     # ------------------------------------------------------------ zamkniecie
     def _shutdown(
-        self, camera: CameraStream, tracker: HandTracker | None, backend: RobotBackend
+        self,
+        camera: CameraStream | BlankSource,
+        tracker: HandTracker | None,
+        backend: RobotBackend,
     ) -> None:
         try:
             if backend.is_connected and self.cfg.safety.home_on_exit:
