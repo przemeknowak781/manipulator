@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-mp"
+version = "0.1.0"
+description = "Sterowanie ramieniem LeRobot 101 (SO-101) gestami dloni przy uzyciu MediaPipe"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "mediapipe>=0.10.9",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+robot = ["lerobot[feetech]>=0.3.0"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+lerobot-mp = "lerobot_mp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lerobot_mp = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

@@ -1,0 +1,8 @@
+# Rdzeń aplikacji (wizja + sterowanie + symulator)
+mediapipe>=0.10.9
+opencv-python>=4.8
+numpy>=1.24
+PyYAML>=6.0
+
+# Sterowanie prawdziwym ramieniem SO-101 (LeRobot 101) - opcjonalne:
+#   pip install "lerobot[feetech]"

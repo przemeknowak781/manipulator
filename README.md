@@ -1,0 +1,265 @@
+# LeRobot 101 × MediaPipe
+
+Sterowanie ramieniem **SO-101 (LeRobot 101)** ruchem dłoni przed kamerą.
+MediaPipe śledzi 21 punktów dłoni, a aplikacja zamienia je na zadane pozycje
+sześciu stawów — z filtracją, limitami i zatrzymaniem awaryjnym.
+
+Działa **bez robota**: wbudowany symulator i podgląd 3D pozwalają nauczyć się
+gestów, zanim cokolwiek podłączysz.
+
+```
+   dłoń przed kamerą              podgląd na żywo                  ramię
+  ┌────────────────┐        ┌──────────────────────┐        ┌──────────────┐
+  │  21 punktów    │──────► │  HUD: stan, stawy,   │──────► │  SO-101      │
+  │  MediaPipe     │        │  limity, chwytak     │        │  lub symulator│
+  └────────────────┘        │  + model 3D ramienia │        └──────────────┘
+                            └──────────────────────┘
+```
+
+---
+
+## Szybki start
+
+### Windows
+
+Kliknij dwukrotnie **`start.bat`**. Przy pierwszym uruchomieniu utworzy
+środowisko i zainstaluje zależności, potem pokaże menu: symulator, prawdziwe
+ramię, tryb IK, demo z pliku wideo, diagnostyka.
+
+### Linux / macOS
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+lerobot-mp                      # symulator + kamera 0
+```
+
+Model MediaPipe (~8 MB) pobiera się sam przy pierwszym starcie.
+
+### Prawdziwe ramię
+
+```bash
+pip install "lerobot[feetech]"
+lerobot-mp --port /dev/ttyACM0        # Linux
+lerobot-mp --port COM5                # Windows
+```
+
+Ramię musi być wcześniej skalibrowane narzędziami LeRobot — aplikacja korzysta
+z tej samej kalibracji (`--robot-id` wskazuje jej plik).
+
+> **Zanim podłączysz robota:** zrób wokół niego miejsce. Sterowanie rusza
+> dopiero po naciśnięciu **SPACJI**, a **X** to zatrzymanie awaryjne.
+
+---
+
+## Jak się tym steruje
+
+| Ruch dłoni | Co robi ramię |
+|---|---|
+| w lewo / w prawo | obrót podstawy `shoulder_pan` |
+| w górę / w dół | podnoszenie ramienia `shoulder_lift` |
+| bliżej / dalej od kamery | wysuwanie przedramienia `elbow_flex` |
+| pochylenie dłoni | pochylenie nadgarstka `wrist_flex` |
+| obrót dłoni | obrót nadgarstka `wrist_roll` |
+| szczypnięcie kciuk–wskazujący | chwytak `gripper` |
+| **zwinięcie trzech ostatnich palców** | **pauza** — ramię stoi, dłoń można przełożyć |
+
+Gest pauzy działa jak podniesienie myszy z podkładki: zwijasz środkowy,
+serdeczny i mały palec, przenosisz rękę w wygodne miejsce, prostujesz palce —
+i jedziesz dalej. Robot nigdy nie przeskakuje, bo ruch liczy się od pozycji
+z chwili załączenia, a nie od bezwzględnego położenia dłoni w kadrze.
+
+Kciuk i wskazujący są celowo **wyłączone** z rozpoznawania pauzy — dzięki temu
+szczypanie chwytakiem nie jest mylone z zaciskaniem pięści.
+
+### Klawisze
+
+| | | | |
+|---|---|---|---|
+| `SPACJA` | włącz/wyłącz sterowanie | `H` | powrót do pozycji domowej |
+| `X` | stop awaryjny i jego kasowanie | `C` | nowe zaczepienie dłoni |
+| `O` / `P` | kalibracja chwytaka: otwarty / zamknięty | `M` | tryb mapowania `direct` ⇄ `ik` |
+| `J` `L` `I` `K` | obrót kamery podglądu | `,` `.` | przybliżenie |
+| `-` / `=` | limit prędkości | `V` | podgląd ramienia wł./wył. |
+| `Q` / `ESC` | wyjście | | |
+
+**Kalibracja chwytaka pod własną dłoń** zajmuje dwie sekundy: rozstaw palce
+i naciśnij `O`, złącz je i naciśnij `P`.
+
+---
+
+## Dwa tryby mapowania
+
+**`direct`** (domyślny) — każda oś dłoni steruje jednym stawem. Nie wymaga
+znajomości wymiarów ramienia, więc działa poprawnie przy dowolnej kalibracji.
+Zacznij od niego.
+
+**`ik`** — pozycja dłoni wyznacza punkt w przestrzeni, a kąty stawów liczy
+odwrotna kinematyka. Ruch jest bardziej „kartezjański": dłoń w bok przesuwa
+chwytak w bok, a nie obraca całe ramię wokół podstawy.
+
+```bash
+lerobot-mp --mode ik
+```
+
+---
+
+## Podgląd 3D — prawdziwe złożenie, nie ilustracja
+
+Panel obok obrazu z kamery pokazuje **rzeczywistą geometrię SO-101**: bryły
+producenta (STEP z `TheRobotStudio/SO-ARM100`) złożone według jego URDF-a,
+zaimportowane z repozytorium [Articulus](https://github.com/przemeknowak781/articulus).
+
+Kinematyka podglądu nie jest przepisana drugi raz — łańcuch jest wczytywany
+z eksportu Articulusa jako ciąg kroków `pre @ ruch @ post`. Test
+`test_kinematics_matches_the_articulus_reference` porównuje wynik z
+transformacjami referencyjnymi zapisanymi przy eksporcie: **zgodność poniżej
+mikrometra dla każdego członu w każdej nazwanej pozie**.
+
+Model (~160 kB) jest w repozytorium. Odtworzenie go od zera:
+
+```bash
+pip install "build123d>=0.11,<0.12"
+git clone https://github.com/przemeknowak781/articulus ../articulus
+python scripts/import_articulus_model.py --articulus ../articulus
+```
+
+Bez tego pliku aplikacja działa dalej — pokazuje uproszczony rysunek
+schematyczny zamiast modelu.
+
+---
+
+## Skąd wzięły się liczby w konfiguracji
+
+Stałe geometryczne **nie są oszacowane**. Wyprowadza je
+`scripts/derive_geometry.py` z tego samego modelu 3D — długości ogniw,
+wysokość barku, położenie osi obrotu podstawy, przesunięcia i znaki wszystkich
+stawów — i od razu mierzy, jak bardzo uproszczony model płaski rozjeżdża się
+z pełną kinematyką:
+
+```
+$ python scripts/derive_geometry.py --check
+  sprawdzono 625 poz; blad mediana 1.06 mm, najgorszy 1.07 mm
+  domkniecie FK->IK->FK: najgorszy blad 0.0000 mm
+```
+
+Milimetr błędu przy zasięgu 45 cm — znacznie poniżej precyzji sterowania ręką.
+Kilka rzeczy, które ten pomiar wykrył i które inaczej zostałyby błędem:
+
+* oś obrotu podstawy **nie leży w początku układu** — pominięcie tego dawało
+  30 mm błędu przy obrocie o 45°,
+* wszystkie cztery stawy ramienia mają **ujemny** zwrot względem kąta ogniwa,
+* gałąź rozwiązania IK „łokieć w górę" wypada poza zakresy stawów SO-101 —
+  domyślna jest druga.
+
+---
+
+## Bezpieczeństwo
+
+Nic nie trafia do serw z pominięciem nadzoru (`control/safety.py`):
+
+* **limity pozycji** każdego stawu, ciaśniejsze niż zakres z kalibracji,
+* **limit prędkości** zadanej — gwałtowny ruch ręki nie daje szarpnięcia,
+* **start od zmierzonej pozycji** i płynne dojście do pozycji domowej,
+  zamiast skoku przy pierwszym rozkazie,
+* **watchdog dłoni** — zniknięcie ręki zamraża ruch po 0,4 s, a po 6 s
+  odsyła ramię do pozycji domowej,
+* **stop awaryjny** klawiszem `X`,
+* **`max_relative_target`** przekazywany do LeRobot jako dodatkowy limit
+  sprzętowy skoku.
+
+Sterowanie startuje **wyłączone** — robot nie ruszy, dopóki świadomie nie
+naciśniesz SPACJI.
+
+---
+
+## Konfiguracja
+
+Wszystkie parametry są w `configs/default.yaml`, opisane komentarzami:
+
+```bash
+lerobot-mp --config configs/default.yaml
+```
+
+Plik można skracać — brakujące klucze biorą wartości domyślne, a nieznany
+klucz kończy się czytelnym błędem zamiast cichego zignorowania.
+
+Najczęściej strojone rzeczy:
+
+| Objaw | Co zmienić |
+|---|---|
+| staw jedzie w złą stronę | `joints.<nazwa>.invert: true` |
+| ruch zbyt czuły / zbyt leniwy | `joints.<nazwa>.gain` |
+| drżenie obrazu przenosi się na ramię | `filters.position.min_cutoff` w dół |
+| wyczuwalne opóźnienie | `filters.*.beta` w górę |
+| ramię rusza się za szybko | `safety.velocity_scale: 0.5` |
+| pauza włącza się przypadkiem | `clutch.curl_threshold` w dół |
+
+Uwaga na jednostki `gain`: dla `shoulder_pan`, `shoulder_lift` i `elbow_flex`
+to **stopnie na jednostkę znormalizowaną** (ruch dłoni przez pół kadru ≈ 0,5),
+a dla `wrist_flex` i `wrist_roll` **bezwymiarowe przełożenie** (1,0 = ruch 1:1).
+
+---
+
+## Bez kamery i bez ekranu
+
+```bash
+lerobot-mp --source demo.mp4 --no-view --clutch always --record wynik.mp4
+```
+
+Odtwarza plik wideo zamiast kamery i zapisuje cały podgląd — z HUD-em i modelem
+3D — do pliku. Przydaje się do demonstracji i do zgłaszania błędów.
+
+---
+
+## Jak to jest zbudowane
+
+```
+src/lerobot_mp/
+├── config.py              parametry + wczytywanie YAML
+├── app.py                 pętla główna
+├── cli.py                 wiersz poleceń
+├── vision/                kamera, MediaPipe, cechy sterujące
+├── control/               filtry, kinematyka, mapowanie, nadzór
+├── robot/                 symulator i adapter LeRobot
+├── preview/               model 3D i renderer programowy
+└── ui/                    HUD i podgląd schematyczny
+```
+
+Wizja i sterowanie chodzą w **różnym tempie**: pętla sterowania tyka ze stałą
+częstotliwością niezależnie od tego, czy kamera zdążyła z nową klatką. Dzięki
+temu limity prędkości i watchdog działają tak samo, gdy detekcja chwilowo
+zwolni — ramię dojeżdża, zamiast szarpać.
+
+Podgląd 3D odświeża się rzadziej (domyślnie 15 Hz) niż sterowanie (30 Hz),
+bo rysowanie ~22 tys. trójkątów kosztuje kilkanaście milisekund, a robot ma
+priorytet.
+
+MediaPipe ma dwa niekompatybilne API — nowe `tasks` (1.x) i stare `solutions`
+(0.10.x). Aplikacja wykrywa dostępne automatycznie i w obu przypadkach zwraca
+ten sam format, więc działa na obu wersjach.
+
+### Testy
+
+```bash
+pip install pytest && pytest -q
+```
+
+133 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
+nadzór), zgodność modelu 3D ze źródłem oraz cały łańcuch od cech dłoni do
+symulowanego ramienia.
+
+---
+
+## Wymagania
+
+* Python 3.10+
+* kamera internetowa
+* dla prawdziwego ramienia: `lerobot[feetech]`, skalibrowane SO-101 i port USB
+
+## Licencja
+
+Apache-2.0. Geometria SO-101 pochodzi z
+[TheRobotStudio/SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100)
+(Apache-2.0) przez repozytorium
+[Articulus](https://github.com/przemeknowak781/articulus).

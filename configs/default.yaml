@@ -1,0 +1,139 @@
+# Konfiguracja sterowania ramieniem LeRobot 101 (SO-101) gestami dloni.
+#
+# Kazda sekcja odpowiada jednej dataclassie z `lerobot_mp/config.py`; wartosci
+# nieobecne w pliku biora sie z wartosci domyslnych, wiec mozna nadpisac
+# pojedynczy parametr bez przepisywania calosci. Nieznany klucz konczy sie
+# bledem, a nie cichym zignorowaniem.
+#
+# Uruchomienie:  lerobot-mp --config configs/default.yaml
+
+# Czestotliwosc petli sterowania [Hz]. Wizja moze chodzic wolniej - petla
+# tyka niezaleznie, wiec ograniczenia predkosci i watchdog dzialaja tak samo.
+loop_hz: 30.0
+
+camera:
+  source: 0            # indeks kamery albo sciezka do pliku wideo
+  width: 1280
+  height: 720
+  fps: 30
+  mirror: true         # obraz lustrzany - ruch dloni zgodny z obrazem
+  fourcc: MJPG         # czesto odblokowuje 30+ FPS na kamerach USB
+  loop_video: true
+
+tracker:
+  backend: auto        # auto | tasks (MediaPipe 1.x) | legacy (0.10.x)
+  model_path: models/hand_landmarker.task   # pobiera sie sam przy 1. starcie
+  num_hands: 2
+  preferred_hand: any  # any | Left | Right
+  min_detection_confidence: 0.6
+  min_presence_confidence: 0.6
+  min_tracking_confidence: 0.6
+  running_mode: video  # video (synchronicznie) | live_stream (mniejsze opoznienie)
+
+# Filtr One-Euro: mocno tlumi drzenie przy wolnym ruchu, a przy szybkim
+# prawie nie opoznia. Mniejsze `min_cutoff` = gladziej, ale z wieksza zwloka;
+# wieksze `beta` = szybsza reakcja na gwaltowne ruchy.
+filters:
+  position: {min_cutoff: 1.0, beta: 0.02, d_cutoff: 1.0}
+  scale:    {min_cutoff: 0.8, beta: 0.01, d_cutoff: 1.0}
+  angle:    {min_cutoff: 1.5, beta: 0.05, d_cutoff: 1.0}
+  gripper_ema: 0.5
+
+mapping:
+  mode: direct         # direct (kazda os dloni -> jeden staw) | ik (kartezjanskie)
+  relative: true       # ruch liczony od chwili zalaczenia sprzegla
+  deadzone: 0.012
+  depth_gain: 1.5      # jak mocno rozmiar dloni w kadrze steruje glebokoscia
+  pinch_open: 0.62     # rozwarcie kciuk-wskazujacy przy otwartym chwytaku
+  pinch_closed: 0.15   # ...i przy zamknietym (kalibracja na zywo: klawisze O/P)
+  gripper_invert: false
+  x_scale: 1.0
+  y_scale: 1.0
+
+clutch:
+  mode: gesture        # gesture (zwiniete palce = pauza) | key | always
+  debounce_s: 0.12
+  engaged_on_start: false   # bezpiecznie: robot rusza dopiero po SPACJI
+  curl_threshold: 0.58      # otwarta dlon ~0.78, piesc ~0.40
+
+safety:
+  hold_timeout_s: 0.4       # brak dloni dluzej -> zamrozenie ruchu
+  return_home_timeout_s: 6.0
+  startup_ramp_s: 2.5       # plynne dojscie do pozycji domowej po starcie
+  velocity_scale: 1.0       # globalny mnoznik limitow predkosci
+  home_on_exit: true
+  # Poza gotowosci wyliczona odwrotna kinematyka do srodka przestrzeni roboczej.
+  home:
+    shoulder_pan: 0.0
+    shoulder_lift: -23.3
+    elbow_flex: 46.4
+    wrist_flex: 3.3
+    wrist_roll: 0.0
+    gripper: 35.0
+
+robot:
+  backend: sim         # sim | lerobot | auto
+  port: null           # np. /dev/ttyACM0, /dev/tty.usbmodem58FA0958121, COM5
+  robot_id: so101_follower
+  kind: so101          # so101 | so100
+  use_degrees: true
+  max_relative_target: 12.0   # sprzetowy limit skoku (null = wylaczony)
+  calibration_dir: null
+  read_state_hz: 10.0
+
+ui:
+  show: true
+  window_name: "LeRobot 101 x MediaPipe"
+  draw_skeleton: true
+  draw_hud: true
+  draw_arm_view: true
+  preview_3d: true          # prawdziwe zlozenie SO-101 zamiast schematu
+  preview_asset: null       # domyslnie assets/so101_preview.npz
+  preview_hz: 15.0
+  preview_width: 360
+  display_scale: 1.0
+  record_path: null         # np. demo.mp4 - zapis podgladu do pliku
+
+# Limity i wzmocnienia stawow.
+#   gain dla pan/lift/elbow : stopnie na jednostke znormalizowana
+#                             (ruch dloni przez pol kadru ~ 0,5)
+#   gain dla wrist_flex/roll: przelozenie bezwymiarowe (1.0 = ruch 1:1)
+#   invert                  : odwroc kierunek, gdy Twoja kalibracja ma inny znak
+joints:
+  shoulder_pan:  {min: -105.0, max: 105.0, max_vel: 140.0, gain: 90.0, invert: false, offset: 0.0}
+  shoulder_lift: {min:  -95.0, max:  95.0, max_vel: 120.0, gain: 90.0, invert: false, offset: 0.0}
+  elbow_flex:    {min:  -92.0, max:  92.0, max_vel: 120.0, gain: 90.0, invert: false, offset: 0.0}
+  wrist_flex:    {min:  -95.0, max:  95.0, max_vel: 160.0, gain:  1.2, invert: false, offset: 0.0}
+  wrist_roll:    {min: -150.0, max: 150.0, max_vel: 220.0, gain:  1.0, invert: false, offset: 0.0}
+  gripper:       {min:    0.0, max: 100.0, max_vel: 300.0, gain: 100.0, invert: false, offset: 0.0}
+
+# Geometria wyliczona z prawdziwego zlozenia SO-101 (repo `articulus` ->
+# bryly STEP i URDF producenta). NIE zmieniaj "na oko" - uruchom
+# `python scripts/derive_geometry.py --check`, zeby zobaczyc skutek.
+geometry:
+  base_height: 0.1166
+  pan_axis_x: 0.03884
+  shoulder_offset: 0.0304
+  lateral_offset: 0.00046
+  upper_arm: 0.116
+  forearm: 0.135
+  wrist_to_tip: 0.16566
+  lift_offset_deg: 76.032
+  elbow_offset_deg: -73.825
+  wrist_offset_deg: -5.766
+  pan_sign: -1.0
+  lift_sign: -1.0
+  elbow_sign: -1.0
+  wrist_sign: -1.0
+  elbow_up: false
+
+# Przestrzen robocza dla trybu `ik` (promienie liczone od osi obrotu podstawy).
+workspace:
+  span_x: 0.12
+  span_y: 0.20
+  span_z: 0.12
+  center: [0.32, 0.0, 0.10]
+  radius_min: 0.15
+  radius_max: 0.42
+  pitch_min_deg: -50.0
+  pitch_max_deg: -5.0

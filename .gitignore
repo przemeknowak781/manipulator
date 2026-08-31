@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Pobierane automatycznie modele MediaPipe (~8 MB)
+models/*.task
+!models/.gitkeep
+
+# Nagrania / zrzuty z aplikacji
+recordings/
+*.mp4
+*.avi
+
+# Lokalne nadpisania konfiguracji
+configs/local*.yaml
+.DS_Store

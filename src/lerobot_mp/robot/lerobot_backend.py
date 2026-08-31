@@ -1,0 +1,168 @@
+"""Sterowanie prawdziwym ramieniem SO-101 przez biblioteke LeRobot.
+
+Uklad modulow w LeRobot zmienial sie miedzy wydaniami (0.4 scalilo SO-100 i
+SO-101 w `lerobot.robots.so_follower`, wczesniej byl osobny `so101_follower`,
+a jeszcze wczesniej caly pakiet siedzial pod `lerobot.common`). Zamiast zakladac
+jedna wersje, szukamy klas po kolei we wszystkich znanych lokalizacjach.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import importlib
+import logging
+from typing import Any
+
+from ..config import AppConfig, JOINT_NAMES
+from .base import RobotBackend, RobotInfo
+
+logger = logging.getLogger(__name__)
+
+#: Kolejne lokalizacje klas SO-follower - od najnowszej do najstarszej.
+_MODULE_CANDIDATES: tuple[str, ...] = (
+    "lerobot.robots.so_follower",
+    "lerobot.robots.so101_follower",
+    "lerobot.robots.so100_follower",
+    "lerobot.common.robots.so101_follower",
+    "lerobot.common.robots.so100_follower",
+)
+
+
+class LeRobotArm(RobotBackend):
+    """Adapter na `SO101Follower` / `SO100Follower` z LeRobot."""
+
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self._robot: Any = None
+        self._connected = False
+        kind = cfg.robot.kind.lower()
+        if kind not in ("so101", "so100"):
+            raise ValueError(f"Nieznany typ ramienia: {cfg.robot.kind!r} (so101|so100)")
+        self._kind = kind
+        self.info = RobotInfo(
+            name=f"{kind.upper()} (LeRobot)",
+            description=f"port {cfg.robot.port}",
+            simulated=False,
+        )
+
+    # ------------------------------------------------------------- importy
+    @staticmethod
+    def _resolve_classes(kind: str) -> tuple[Any, Any, str]:
+        """Znajduje (klasa_robota, klasa_konfiguracji, nazwa_modulu) w LeRobot."""
+        robot_names = [f"{kind.upper()}Follower", "SOFollower"]
+        config_names = [f"{kind.upper()}FollowerConfig", "SOFollowerRobotConfig", "SOFollowerConfig"]
+
+        errors: list[str] = []
+        for module_name in _MODULE_CANDIDATES:
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError as exc:
+                errors.append(f"{module_name}: {exc}")
+                continue
+
+            robot_cls = next((getattr(module, n) for n in robot_names if hasattr(module, n)), None)
+            config_cls = next((getattr(module, n) for n in config_names if hasattr(module, n)), None)
+            if robot_cls is not None and config_cls is not None:
+                return robot_cls, config_cls, module_name
+            errors.append(f"{module_name}: brak klas {robot_names} / {config_names}")
+
+        raise ImportError(
+            "Nie znalazlem klas SO-follower w zainstalowanej wersji LeRobot.\n"
+            "Zainstaluj biblioteke:  pip install 'lerobot[feetech]'\n"
+            "Szczegoly prob importu:\n  " + "\n  ".join(errors)
+        )
+
+    def _build_config(self, config_cls: Any) -> Any:
+        """Sklada obiekt konfiguracji, pomijajac pola nieznane danej wersji."""
+        rc = self.cfg.robot
+        if not rc.port:
+            raise ValueError(
+                "Nie podano portu szeregowego ramienia. Uzyj --port /dev/ttyACM0 "
+                "(Linux), /dev/tty.usbmodem* (macOS) albo COM5 (Windows)."
+            )
+
+        wanted: dict[str, Any] = {
+            "port": rc.port,
+            "id": rc.robot_id,
+            "use_degrees": rc.use_degrees,
+            "max_relative_target": rc.max_relative_target,
+        }
+        if rc.calibration_dir:
+            from pathlib import Path
+
+            wanted["calibration_dir"] = Path(rc.calibration_dir)
+
+        available = {f.name for f in dataclasses.fields(config_cls)}
+        kwargs = {k: v for k, v in wanted.items() if k in available}
+        skipped = sorted(set(wanted) - set(kwargs))
+        if skipped:
+            logger.warning(
+                "Ta wersja LeRobot nie obsluguje pol %s - pomijam. "
+                "Sprawdz, czy jednostki stawow zgadzaja sie z konfiguracja.",
+                skipped,
+            )
+        return config_cls(**kwargs)
+
+    # ------------------------------------------------------------ polaczenie
+    def connect(self) -> None:
+        robot_cls, config_cls, module_name = self._resolve_classes(self._kind)
+        logger.info("Uzywam klas LeRobot z modulu %s", module_name)
+
+        config = self._build_config(config_cls)
+        self._robot = robot_cls(config)
+        logger.info("Lacze z ramieniem na porcie %s ...", self.cfg.robot.port)
+        self._robot.connect()
+        self._connected = True
+
+        motors = self.motor_names()
+        missing = [n for n in JOINT_NAMES if n not in motors]
+        if missing:
+            logger.warning(
+                "Robot nie raportuje stawow %s - beda pomijane przy wysylaniu.", missing
+            )
+        logger.info("Polaczono. Stawy: %s", ", ".join(motors))
+
+    def motor_names(self) -> list[str]:
+        """Nazwy stawow zgloszone przez LeRobot (kolejnosc jak w sterowniku)."""
+        if self._robot is None:
+            return list(JOINT_NAMES)
+        try:
+            return [key.removesuffix(".pos") for key in self._robot.action_features]
+        except Exception:  # pragma: no cover - zalezne od wersji LeRobot
+            return list(JOINT_NAMES)
+
+    def disconnect(self) -> None:
+        if self._robot is not None and self._connected:
+            try:
+                self._robot.disconnect()
+            except Exception:  # pragma: no cover - rozlaczenie nie moze wysypac aplikacji
+                logger.exception("Blad przy rozlaczaniu robota")
+        self._connected = False
+        self._robot = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # ------------------------------------------------------------- wymiana IO
+    def read_joints(self) -> dict[str, float]:
+        if self._robot is None:
+            raise RuntimeError("Robot nie jest polaczony")
+        observation = self._robot.get_observation()
+        return {
+            key.removesuffix(".pos"): float(value)
+            for key, value in observation.items()
+            if key.endswith(".pos")
+        }
+
+    def send_joints(self, targets: dict[str, float]) -> dict[str, float]:
+        if self._robot is None:
+            raise RuntimeError("Robot nie jest polaczony")
+        known = set(self.motor_names())
+        action = {f"{name}.pos": float(value) for name, value in targets.items() if name in known}
+        sent = self._robot.send_action(action)
+        return {
+            key.removesuffix(".pos"): float(value)
+            for key, value in (sent or action).items()
+            if key.endswith(".pos")
+        }
