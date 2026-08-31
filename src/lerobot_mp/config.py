@@ -350,11 +350,12 @@ class RobotConfig:
     #: standardowym montazu SO-101 sklada sie je wysrodkowane, czyli na 2048.
     center_ticks: int = 2048
     #: Zakres szczeki chwytaka w tikach: 0 w skali aplikacji to `closed`,
-    #: 100 to `open`. Domyslne wartosci sa CELOWO ciasne - lepiej, zeby chwytak
-    #: nie domykal sie do konca, niz zeby napieral na wlasny mechanizm.
-    #: Zmierz swoje: rozewrzyj szczeke reka i odczytaj `Present_Position`.
-    gripper_closed_ticks: int = 2048
-    gripper_open_ticks: int = 2700
+    #: 100 to `open`. Wartosci pochodza z limitow, ktore serwo chwytaka mialo
+    #: zapisane u siebie w EEPROM-ie - czyli ze skoku szczeki zmierzonego na
+    #: prawdziwym ramieniu, a nie z oszacowania.
+    #: Sprawdz swoje: rozewrzyj szczeke reka i odczytaj `Present_Position`.
+    gripper_closed_ticks: int = 1986
+    gripper_open_ticks: int = 2670
     #: Wylaczenie momentu przy wyjsciu. Domyslnie NIE, bo wiotkie ramie opada
     #: pod wlasnym ciezarem - wlacz tylko, gdy wiesz, ze jest podparte.
     torque_off_on_exit: bool = False
