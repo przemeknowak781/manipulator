@@ -22,10 +22,12 @@ from .control.safety import SafetyState, SafetySupervisor
 from .robot import create_backend
 from .robot.base import RobotBackend
 from .ui.arm_view import compose, draw_arm_view
-from .ui.hud import HudData, draw_hand_skeleton, draw_hud
+from .ui.hud import HudData, draw_arm_skeleton, draw_hand_skeleton, draw_hud
 from .utils.rate import FpsMeter, LoopRate
+from .vision.arm_features import ArmFeatures, extract_arm_features, pick_arm
 from .vision.camera import CameraStream
 from .vision.features import HandFeatures, extract_features
+from .vision.pose import PoseTracker
 from .vision.tracker import HandTracker
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,10 @@ class TeleopApp:
 
         self._features = HandFeatures.absent()
         self._features_time = 0.0
+        self._arm = ArmFeatures.absent()
+        self._arm_time = 0.0
+        self._pose: PoseTracker | None = None
+        self._pose_sample = None
         self._last_frame_index = -1
         self._last_hands: list = []
         self._measured: dict[str, float] = {}
@@ -87,6 +93,27 @@ class TeleopApp:
             model, size=(self.cfg.ui.preview_width, max(height, 240))
         )
 
+    def _ensure_pose_tracker(self) -> bool:
+        """Tworzy tracker sylwetki przy pierwszym wejsciu w tryb `arm`."""
+        if self._pose is not None:
+            return True
+        try:
+            self._pose = PoseTracker(self.cfg.arm, self.cfg.tracker.running_mode)
+        except Exception as exc:
+            logger.error("Tryb `arm` niedostepny: %s", exc)
+            self._notify("Nie moge uruchomic sledzenia sylwetki", 4.0)
+            return False
+        return True
+
+    @property
+    def _arm_mode(self) -> bool:
+        return self.cfg.mapping.mode.lower() == "arm"
+
+    @property
+    def _wants_hand(self) -> bool:
+        """Czy w ogole potrzebujemy sledzenia dloni w biezacym trybie."""
+        return not self._arm_mode or self.cfg.arm.use_hand
+
     # ------------------------------------------------------------------- run
     def run(self) -> int:
         camera = CameraStream(self.cfg.camera)
@@ -101,6 +128,8 @@ class TeleopApp:
             )
 
             tracker = HandTracker(self.cfg.tracker)
+            if self._arm_mode:
+                self._ensure_pose_tracker()
             self._setup_preview()
 
             backend.connect()
@@ -148,12 +177,16 @@ class TeleopApp:
                 self._process_frame(frame, tracker)
 
             features = self._current_features(now)
-            output = self.mapper.update(features, self.supervisor.command, dt)
+            arm = self._current_arm(now)
+            output = self.mapper.update(features, self.supervisor.command, dt, arm=arm)
 
+            # Watchdog pilnuje OPERATORA: w trybie `arm` liczy sie ramie,
+            # bo dlon moze chwilowo wypasc z kadru bez utraty sterowania.
+            present = arm.present if self._arm_mode else features.present
             command, report = self.supervisor.step(
                 output.targets,
                 dt,
-                hand_present=features.present,
+                hand_present=present,
                 engaged=output.engaged,
             )
             backend.send_joints(command)
@@ -173,23 +206,52 @@ class TeleopApp:
     # --------------------------------------------------------------- wizja
     def _process_frame(self, frame, tracker: HandTracker) -> None:
         started = time.perf_counter()
-        result = tracker.process(frame.image, frame.timestamp)
+        height, width = frame.image.shape[:2]
+
+        if self._wants_hand:
+            self._detect_hand(tracker, frame, (width, height))
+        else:
+            self._last_hands = []
+            self._features = HandFeatures.absent()
+
+        if self._arm_mode and self._pose is not None:
+            self._detect_arm(frame, (width, height))
+
         self._latency_ms = (time.perf_counter() - started) * 1000.0
 
+    def _detect_hand(self, tracker: HandTracker, frame, size: tuple[int, int]) -> None:
+        result = tracker.process(frame.image, frame.timestamp)
         self._last_hands = result.hands
+
         hand = result.pick(self.cfg.tracker.preferred_hand)
         if hand is None:
             self._features = HandFeatures.absent()
             return
 
-        height, width = frame.image.shape[:2]
         self._features = extract_features(
             hand,
-            (width, height),
+            size,
             previous=self._features if self._features.present else None,
             curl_threshold=self.cfg.clutch.curl_threshold,
         )
         self._features_time = time.monotonic()
+
+    def _detect_arm(self, frame, size: tuple[int, int]) -> None:
+        assert self._pose is not None
+        sample = self._pose.process(frame.image, frame.timestamp)
+        self._pose_sample = sample
+        if sample is None:
+            self._arm = ArmFeatures.absent()
+            return
+
+        side = pick_arm(sample, self.cfg.arm.side, self.cfg.arm.min_visibility)
+        if side is None:
+            self._arm = ArmFeatures.absent()
+            return
+
+        self._arm = extract_arm_features(sample, side, size, self.cfg.arm.min_visibility)
+        if self._arm.present:
+            self._arm_time = time.monotonic()
 
     def _current_features(self, now: float) -> HandFeatures:
         """Cechy dloni z kontrola swiezosci - stara detekcja to brak dloni."""
@@ -198,6 +260,14 @@ class TeleopApp:
         if now - self._features_time > self.cfg.safety.hold_timeout_s:
             return HandFeatures.absent()
         return self._features
+
+    def _current_arm(self, now: float) -> ArmFeatures:
+        """Katy ramienia z kontrola swiezosci - stara detekcja to brak ramienia."""
+        if not self._arm_mode or not self._arm.present:
+            return ArmFeatures.absent()
+        if now - self._arm_time > self.cfg.safety.hold_timeout_s:
+            return ArmFeatures.absent()
+        return self._arm
 
     def _refresh_measured(self, backend: RobotBackend, now: float) -> None:
         """Odczyt faktycznej pozycji stawow - rzadziej niz petla sterowania."""
@@ -223,6 +293,7 @@ class TeleopApp:
         canvas = frame.copy()
 
         if self.cfg.ui.draw_skeleton:
+            draw_arm_skeleton(canvas, output.arm, output.engaged)
             for hand in self._last_hands:
                 draw_hand_skeleton(canvas, hand, output.engaged)
 
@@ -269,6 +340,7 @@ class TeleopApp:
             hand_present=output.hand_present,
             reason=output.reason,
             features=output.features,
+            arm=output.arm,
             command=command,
             measured=self._measured,
             report=report,
@@ -358,9 +430,7 @@ class TeleopApp:
             else:
                 self._notify("Pokaz dlon, zanim skalibrujesz chwytak")
         elif char == "m":
-            self.cfg.mapping.mode = "ik" if self.cfg.mapping.mode == "direct" else "direct"
-            self.mapper.release_anchor()
-            self._notify(f"Tryb mapowania: {self.cfg.mapping.mode}")
+            self._cycle_mode()
         elif char == "v":
             self._preview.enabled = not self._preview.enabled
             self._notify(f"Podglad ramienia: {'wl.' if self._preview.enabled else 'wyl.'}")
@@ -373,6 +443,20 @@ class TeleopApp:
             self.cfg.safety.velocity_scale = min(2.0, self.cfg.safety.velocity_scale + 0.1)
             self._notify(f"Limit predkosci: {self.cfg.safety.velocity_scale:.1f}x")
         return True
+
+    def _cycle_mode(self) -> None:
+        """Przelacza mapowanie: direct -> ik -> arm -> direct."""
+        order = ("direct", "ik", "arm")
+        current = self.cfg.mapping.mode.lower()
+        nxt = order[(order.index(current) + 1) % len(order)] if current in order else "direct"
+
+        if nxt == "arm" and not self._ensure_pose_tracker():
+            nxt = "direct"  # sledzenie sylwetki niedostepne - wracamy na poczatek
+
+        self.cfg.mapping.mode = nxt
+        self.mapper.release_anchor()
+        self._arm = ArmFeatures.absent()
+        self._notify(f"Tryb mapowania: {nxt}")
 
     def _move_camera(self, char: str) -> None:
         renderer = self._preview.renderer
@@ -412,6 +496,7 @@ class TeleopApp:
             ("robot", backend.disconnect),
             ("kamera", camera.close),
             ("tracker", tracker.close if tracker else lambda: None),
+            ("sylwetka", self._pose.close if self._pose else lambda: None),
         ):
             try:
                 close()

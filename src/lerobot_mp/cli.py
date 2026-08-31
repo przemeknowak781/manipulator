@@ -15,6 +15,7 @@ Sterowanie ramieniem LeRobot 101 (SO-101) gestami dloni (MediaPipe).
 Przyklady:
   lerobot-mp                                  # symulator + kamera 0
   lerobot-mp --camera 1 --mode ik             # inna kamera, sterowanie kartezjanskie
+  lerobot-mp --mode arm                       # sterowanie calym ramieniem, z lokciem
   lerobot-mp --robot lerobot --port /dev/ttyACM0
   lerobot-mp --source demo.mp4 --no-view      # bez kamery i bez okna
 """
@@ -30,6 +31,9 @@ Klawisze w oknie podgladu:
 
 Gest pauzy: zwin trzy ostatnie palce (srodkowy, serdeczny, maly) - robot stanie
 w miejscu, a dlon mozna przelozyc, jak przy podnoszeniu myszy z podkladki.
+
+Tryb `arm` sledzi cale ramie: Twoj bark, lokiec i nadgarstek steruja trzema
+pierwszymi stawami robota, a dlon nadal obraca nadgarstek i zaciska chwytak.
 """
 
 
@@ -58,7 +62,26 @@ def build_parser() -> argparse.ArgumentParser:
     robot.add_argument("--arm", choices=("so101", "so100"), help="typ ramienia")
 
     control = parser.add_argument_group("sterowanie")
-    control.add_argument("--mode", choices=("direct", "ik"), help="sposob mapowania dloni")
+    control.add_argument(
+        "--mode",
+        choices=("direct", "ik", "arm"),
+        help="mapowanie: direct (os dloni -> staw), ik (kartezjanskie), arm (cale ramie)",
+    )
+    control.add_argument(
+        "--arm-side",
+        choices=("auto", "Left", "Right"),
+        help="ktore ramie operatora steruje robotem w trybie arm",
+    )
+    control.add_argument(
+        "--no-arm-hand",
+        action="store_true",
+        help="tryb arm bez sledzenia dloni (bez obrotu nadgarstka i chwytaka)",
+    )
+    control.add_argument(
+        "--gripper",
+        choices=("pinch", "none"),
+        help="co steruje szczeka chwytaka",
+    )
     control.add_argument(
         "--hand", choices=("any", "Left", "Right"), help="ktora dlon steruje ramieniem"
     )
@@ -118,6 +141,14 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         mapping["mode"] = args.mode
     if args.absolute:
         mapping["relative"] = False
+    if args.gripper:
+        mapping["gripper_source"] = args.gripper
+
+    arm: dict[str, Any] = {}
+    if args.arm_side:
+        arm["side"] = args.arm_side
+    if args.no_arm_hand:
+        arm["use_hand"] = False
 
     tracker: dict[str, Any] = {}
     if args.hand:
@@ -155,6 +186,7 @@ def overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         ("camera", camera),
         ("robot", robot),
         ("mapping", mapping),
+        ("arm", arm),
         ("tracker", tracker),
         ("clutch", clutch),
         ("safety", safety),

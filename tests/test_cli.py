@@ -83,3 +83,15 @@ def test_bad_config_file_reports_error(capsys, tmp_path):
 def test_help_lists_the_keyboard_shortcuts():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--help"])
+
+
+def test_arm_mode_flags():
+    cfg, _ = build_config(["--mode", "arm", "--arm-side", "Left", "--no-arm-hand"])
+    assert cfg.mapping.mode == "arm"
+    assert cfg.arm.side == "Left"
+    assert cfg.arm.use_hand is False
+
+
+def test_gripper_source_flag():
+    assert build_config(["--gripper", "none"])[0].mapping.gripper_source == "none"
+    assert build_config([])[0].mapping.gripper_source == "pinch"

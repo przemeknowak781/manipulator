@@ -20,28 +20,33 @@ from .landmarks import HandSample, TrackResult
 logger = logging.getLogger(__name__)
 
 
-def ensure_model(cfg: TrackerConfig) -> Path:
+def download_model(model_path: str, url: str, label: str = "MediaPipe") -> Path:
     """Zwraca sciezke do modelu `.task`, pobierajac go przy pierwszym uzyciu."""
-    path = Path(cfg.model_path).expanduser()
+    path = Path(model_path).expanduser()
     if path.is_file() and path.stat().st_size > 0:
         return path
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Pobieram model MediaPipe do %s ...", path)
+    logger.info("Pobieram model %s do %s ...", label, path)
     tmp = path.with_suffix(path.suffix + ".part")
     try:
-        with urllib.request.urlopen(cfg.model_url, timeout=60) as response:  # noqa: S310
+        with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
             tmp.write_bytes(response.read())
         tmp.replace(path)
     except Exception as exc:  # pragma: no cover - zalezne od sieci
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
-            f"Nie udalo sie pobrac modelu MediaPipe ({exc}).\n"
+            f"Nie udalo sie pobrac modelu {label} ({exc}).\n"
             f"Pobierz go recznie i zapisz jako {path}:\n"
-            f"  curl -L -o {path} {cfg.model_url}"
+            f"  curl -L -o {path} {url}"
         ) from exc
     logger.info("Model pobrany (%.1f MB).", path.stat().st_size / 1e6)
     return path
+
+
+def ensure_model(cfg: TrackerConfig) -> Path:
+    """Sciezka do modelu dloni (pobierana przy pierwszym uzyciu)."""
+    return download_model(cfg.model_path, cfg.model_url, "dloni")
 
 
 class _TasksBackend:

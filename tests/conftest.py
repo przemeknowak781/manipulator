@@ -8,6 +8,19 @@ import numpy as np
 import pytest
 
 from lerobot_mp.config import AppConfig, load_config
+from lerobot_mp.vision.pose import (
+    LEFT_ELBOW,
+    LEFT_HIP,
+    LEFT_SHOULDER,
+    LEFT_WRIST,
+    NOSE,
+    NUM_POSE_LANDMARKS,
+    RIGHT_ELBOW,
+    RIGHT_HIP,
+    RIGHT_SHOULDER,
+    RIGHT_WRIST,
+    PoseSample,
+)
 from lerobot_mp.vision.landmarks import (
     INDEX_MCP,
     INDEX_TIP,
@@ -96,3 +109,69 @@ def cfg() -> AppConfig:
 @pytest.fixture
 def frame_size() -> tuple[int, int]:
     return (1280, 720)
+
+
+def make_pose(
+    elevation_deg: float = -90.0,
+    azimuth_deg: float = 0.0,
+    elbow_deg: float = 0.0,
+    side: str = "Right",
+    visibility: float = 1.0,
+    upper_arm: float = 0.30,
+    forearm: float = 0.26,
+) -> PoseSample:
+    """Buduje syntetyczna sylwetke o zadanych katach ramienia.
+
+    Operator stoi twarza do kamery. Uklad MediaPipe: X w prawo obrazu, Y w dol,
+    Z w glab sceny - wiec strona LEWA operatora jest po prawej stronie obrazu,
+    a bark jest nad biodrem, czyli ma MNIEJSZE Y.
+
+    Katy sa zadane w tym samym ukladzie tulowia, ktorego uzywa
+    `extract_arm_features`, wiec test moze porownac wejscie z wyjsciem.
+    """
+    world = np.zeros((NUM_POSE_LANDMARKS, 3), dtype=np.float32)
+    world[LEFT_HIP] = (0.10, 0.0, 0.0)
+    world[RIGHT_HIP] = (-0.10, 0.0, 0.0)
+    world[LEFT_SHOULDER] = (0.20, -0.50, 0.0)
+    world[RIGHT_SHOULDER] = (-0.20, -0.50, 0.0)
+    world[NOSE] = (0.0, -0.70, -0.10)
+
+    up = np.array([0.0, -1.0, 0.0])
+    right = np.array([-1.0, 0.0, 0.0])       # w prawo OPERATORA
+    forward = np.cross(up, right)            # w strone kamery
+    outward = right if side == "Right" else -right
+
+    elevation = math.radians(elevation_deg)
+    azimuth = math.radians(azimuth_deg)
+    upper_dir = (
+        math.sin(elevation) * up
+        + math.cos(elevation) * math.cos(azimuth) * outward
+        + math.cos(elevation) * math.sin(azimuth) * forward
+    )
+
+    # Przedramie zgiete o `elbow_deg` - obracamy je wokol osi prostopadlej
+    # do ramienia, wybranej tak, zeby zgiecie szlo "do przodu" jak u czlowieka.
+    axis = np.cross(upper_dir, forward)
+    if np.linalg.norm(axis) < 1e-6:
+        axis = np.cross(upper_dir, up)
+    axis = axis / np.linalg.norm(axis)
+    angle = math.radians(elbow_deg)
+    fore_dir = (
+        upper_dir * math.cos(angle)
+        + np.cross(axis, upper_dir) * math.sin(angle)
+        + axis * np.dot(axis, upper_dir) * (1 - math.cos(angle))
+    )
+
+    shoulder_i = RIGHT_SHOULDER if side == "Right" else LEFT_SHOULDER
+    elbow_i = RIGHT_ELBOW if side == "Right" else LEFT_ELBOW
+    wrist_i = RIGHT_WRIST if side == "Right" else LEFT_WRIST
+    world[elbow_i] = world[shoulder_i] + upper_dir * upper_arm
+    world[wrist_i] = world[elbow_i] + fore_dir * forearm
+
+    # Punkty obrazu sa tu tylko po to, zeby HUD mial co rysowac.
+    image = np.zeros((NUM_POSE_LANDMARKS, 3), dtype=np.float32)
+    image[:, 0] = 0.5 + world[:, 0] * 0.4
+    image[:, 1] = 0.5 + world[:, 1] * 0.4
+
+    vis = np.full(NUM_POSE_LANDMARKS, visibility, dtype=np.float32)
+    return PoseSample(image, world, vis)

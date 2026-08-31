@@ -14,6 +14,7 @@ import numpy as np
 
 from ..config import AppConfig, JOINT_NAMES
 from ..control.safety import SafetyReport, SafetyState
+from ..vision.arm_features import ArmFeatures
 from ..vision.features import HandFeatures
 from ..vision.landmarks import HAND_CONNECTIONS, HandSample
 from .theme import ACCENT, DANGER, OK, STATE_COLORS, TEXT, TEXT_DIM, WARN, bar, panel, text
@@ -34,6 +35,7 @@ class HudData:
     hand_present: bool = False
     reason: str = ""
     features: HandFeatures = field(default_factory=HandFeatures.absent)
+    arm: ArmFeatures = field(default_factory=ArmFeatures.absent)
     command: dict[str, float] = field(default_factory=dict)
     measured: dict[str, float] = field(default_factory=dict)
     report: SafetyReport = field(default_factory=SafetyReport)
@@ -44,6 +46,20 @@ class HudData:
     mode: str = "direct"
     message: str = ""
     ik_clamped: bool = False
+
+
+def draw_arm_skeleton(image: np.ndarray, arm: ArmFeatures, active: bool) -> None:
+    """Rysuje bark -> lokiec -> nadgarstek operatora (tryb `arm`)."""
+    if not arm.present or len(arm.points_px) < 3:
+        return
+    color = OK if active else WARN
+    points = [tuple(int(v) for v in p) for p in arm.points_px]
+    for a, b in zip(points, points[1:]):
+        cv2.line(image, a, b, color, 4, cv2.LINE_AA)
+    for i, point in enumerate(points):
+        cv2.circle(image, point, 8 if i == 1 else 6, TEXT, -1, cv2.LINE_AA)
+    # Lokiec jest tu bohaterem - podpisujemy jego kat.
+    text(image, f"{arm.elbow:.0f}", (points[1][0] + 12, points[1][1] - 10), 0.5, color, 2)
 
 
 def draw_hand_skeleton(image: np.ndarray, hand: HandSample, active: bool) -> None:
@@ -67,6 +83,8 @@ def draw_hud(image: np.ndarray, data: HudData, cfg: AppConfig) -> None:
     _draw_status_bar(image, data, w)
     _draw_joint_panel(image, data, cfg, w, h)
     _draw_hand_panel(image, data, h)
+    if data.arm.present:
+        _draw_arm_panel(image, data, h)
     _draw_footer(image, data, w, h)
 
 
@@ -134,7 +152,14 @@ def _draw_hand_panel(image: np.ndarray, data: HudData, h: int) -> None:
     text(image, title, (x0 + 12, y0 + 22), 0.46, TEXT if data.hand_present else TEXT_DIM)
 
     if not data.hand_present:
-        text(image, "pokaz dlon kamerze", (x0 + 12, y0 + 48), 0.42, TEXT_DIM)
+        # W trybie `arm` dlon jest dodatkiem, a nie warunkiem sterowania -
+        # komunikat "pokaz dlon" bylby tam myleniem operatora.
+        hint = (
+            "nadgarstek i chwytak stoja"
+            if data.mode.lower() == "arm"
+            else "pokaz dlon kamerze"
+        )
+        text(image, hint, (x0 + 12, y0 + 48), 0.42, TEXT_DIM)
         return
 
     text(image, "chwytak", (x0 + 12, y0 + 46), 0.4, TEXT_DIM)
@@ -154,6 +179,29 @@ def _draw_hand_panel(image: np.ndarray, data: HudData, h: int) -> None:
         0.4,
         TEXT_DIM,
     )
+
+
+def _draw_arm_panel(image: np.ndarray, data: HudData, h: int) -> None:
+    """Panel z katami ramienia operatora - widoczny tylko w trybie `arm`."""
+    panel_w, panel_h = 250, 96
+    x0, y0 = 12, 174
+    panel(image, x0, y0, panel_w, panel_h)
+    arm = data.arm
+
+    side = "prawe" if arm.side == "Right" else "lewe"
+    text(image, f"RAMIE: {side} ({arm.visibility:.0%})", (x0 + 12, y0 + 22), 0.46, TEXT)
+
+    rows = (
+        ("uniesienie", arm.elevation, -90.0, 90.0),
+        ("kierunek", arm.azimuth, -90.0, 90.0),
+        ("lokiec", arm.elbow, 0.0, 150.0),
+    )
+    for i, (label, value, low, high) in enumerate(rows):
+        y = y0 + 42 + i * 18
+        text(image, label, (x0 + 12, y + 8), 0.4, TEXT_DIM)
+        fraction = (value - low) / (high - low) if high > low else 0.0
+        bar(image, x0 + 96, y, 96, 11, fraction, ACCENT)
+        text(image, f"{value:+5.0f}", (x0 + 200, y + 8), 0.4, TEXT)
 
 
 def _draw_footer(image: np.ndarray, data: HudData, w: int, h: int) -> None:

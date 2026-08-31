@@ -64,13 +64,12 @@ z tej samej kalibracji (`--robot-id` wskazuje jej plik).
 | szczypnięcie kciuk–wskazujący | chwytak `gripper` |
 | **zwinięcie trzech ostatnich palców** | **pauza** — ramię stoi, dłoń można przełożyć |
 
+To jest tryb `direct`. Są jeszcze dwa — `ik` i `arm` — opisane niżej.
+
 Gest pauzy działa jak podniesienie myszy z podkładki: zwijasz środkowy,
 serdeczny i mały palec, przenosisz rękę w wygodne miejsce, prostujesz palce —
 i jedziesz dalej. Robot nigdy nie przeskakuje, bo ruch liczy się od pozycji
 z chwili załączenia, a nie od bezwzględnego położenia dłoni w kadrze.
-
-Kciuk i wskazujący są celowo **wyłączone** z rozpoznawania pauzy — dzięki temu
-szczypanie chwytakiem nie jest mylone z zaciskaniem pięści.
 
 ### Klawisze
 
@@ -78,7 +77,7 @@ szczypanie chwytakiem nie jest mylone z zaciskaniem pięści.
 |---|---|---|---|
 | `SPACJA` | włącz/wyłącz sterowanie | `H` | powrót do pozycji domowej |
 | `X` | stop awaryjny i jego kasowanie | `C` | nowe zaczepienie dłoni |
-| `O` / `P` | kalibracja chwytaka: otwarty / zamknięty | `M` | tryb mapowania `direct` ⇄ `ik` |
+| `O` / `P` | kalibracja chwytaka: otwarty / zamknięty | `M` | tryb mapowania: `direct` → `ik` → `arm` |
 | `J` `L` `I` `K` | obrót kamery podglądu | `,` `.` | przybliżenie |
 | `-` / `=` | limit prędkości | `V` | podgląd ramienia wł./wył. |
 | `Q` / `ESC` | wyjście | | |
@@ -88,7 +87,9 @@ i naciśnij `O`, złącz je i naciśnij `P`.
 
 ---
 
-## Dwa tryby mapowania
+## Trzy tryby mapowania
+
+Przełączasz je klawiszem `M` albo flagą `--mode`.
 
 **`direct`** (domyślny) — każda oś dłoni steruje jednym stawem. Nie wymaga
 znajomości wymiarów ramienia, więc działa poprawnie przy dowolnej kalibracji.
@@ -98,9 +99,59 @@ Zacznij od niego.
 odwrotna kinematyka. Ruch jest bardziej „kartezjański": dłoń w bok przesuwa
 chwytak w bok, a nie obraca całe ramię wokół podstawy.
 
+**`arm`** — śledzi **całe Twoje ramię**, nie samą dłoń. MediaPipe Pose podaje
+bark, łokieć i nadgarstek; aplikacja liczy z nich trzy kąty i przekłada je
+wprost na trzy pierwsze stawy robota:
+
+| Twój ruch | Staw robota |
+|---|---|
+| unosisz rękę | `shoulder_lift` |
+| przenosisz ją w bok / do przodu | `shoulder_pan` |
+| **zginasz łokieć** | **`elbow_flex`** |
+| obracasz dłoń | `wrist_roll` |
+| szczypiesz palcami | `gripper` |
+
+Domyślne przełożenie to **1:1** — zginasz łokieć o 60°, robot zgina o 60°.
+
 ```bash
-lerobot-mp --mode ik
+lerobot-mp --mode arm
+lerobot-mp --mode arm --arm-side Right     # wymuś konkretną rękę
+lerobot-mp --mode arm --no-arm-hand        # bez śledzenia dłoni (szybciej)
 ```
+
+Kąty liczą się w **układzie Twojego tułowia**, a nie kamery: obrócenie się
+bokiem albo przechylenie na krześle nie zmienia zadanej pozy robota, bo
+geometrycznie ramię wobec tułowia się nie zmieniło.
+
+W tym trybie dłoń jest **dodatkiem**, a nie warunkiem — kiedy wypadnie z kadru,
+nadgarstek i chwytak po prostu stoją, a bark z łokciem jadą dalej. Zniknięcie
+całego ramienia zatrzymuje wszystko, tak jak zniknięcie dłoni w pozostałych
+trybach.
+
+Dwie rzeczy zmierzone, nie założone:
+
+* po ustabilizowaniu śledzenia ten sam obraz daje **0,4° rozrzutu na łokciu**
+  (model `lite`, 17 ms/klatkę) albo **0,2°** (`pose_landmarker_full`, 22 ms) —
+  znacznie poniżej tego, co ma znaczenie przy prowadzeniu ręką;
+* MediaPipe jest trenowane na ludziach mniej więcej pionowych. Przechylenie do
+  ±10° kosztuje kilka stopni błędu, ale przy ±25° estymata psuje się mocno
+  (kilkadziesiąt stopni). Trzymaj się z grubsza prosto.
+
+Oba modele śledzenia naraz to około 30 ms na klatkę, czyli ~20 FPS wizji.
+Pętla sterowania i tak tyka niezależnie z 30 Hz, więc ramię jedzie płynnie —
+po to jest to rozdzielenie.
+
+### Czym steruje się szczęką chwytaka
+
+`mapping.gripper_source` (albo `--gripper`):
+
+* `pinch` (domyślnie) — odległość kciuk–wskazujący, znormalizowana rozmiarem
+  dłoni, więc niezależna od odległości od kamery. Działa we wszystkich trzech
+  trybach, także w `arm`.
+* `none` — chwytak nie rusza się sam.
+
+Kciuk i wskazujący są celowo **wyłączone** z gestu pauzy, żeby szczypanie nie
+było mylone z zaciskaniem pięści.
 
 ---
 
@@ -194,6 +245,8 @@ Najczęściej strojone rzeczy:
 | wyczuwalne opóźnienie | `filters.*.beta` w górę |
 | ramię rusza się za szybko | `safety.velocity_scale: 0.5` |
 | pauza włącza się przypadkiem | `clutch.curl_threshold` w dół |
+| tryb `arm` gubi rękę | `arm.min_visibility` w dół |
+| tryb `arm` reaguje za mocno | `arm.pan_gain` / `lift_gain` / `elbow_gain` |
 
 Uwaga na jednostki `gain`: dla `shoulder_pan`, `shoulder_lift` i `elbow_flex`
 to **stopnie na jednostkę znormalizowaną** (ruch dłoni przez pół kadru ≈ 0,5),
@@ -219,7 +272,7 @@ src/lerobot_mp/
 ├── config.py              parametry + wczytywanie YAML
 ├── app.py                 pętla główna
 ├── cli.py                 wiersz poleceń
-├── vision/                kamera, MediaPipe, cechy sterujące
+├── vision/                kamera, MediaPipe (dłoń + sylwetka), cechy sterujące
 ├── control/               filtry, kinematyka, mapowanie, nadzór
 ├── robot/                 symulator i adapter LeRobot
 ├── preview/               model 3D i renderer programowy
@@ -245,9 +298,14 @@ ten sam format, więc działa na obu wersjach.
 pip install pytest && pytest -q
 ```
 
-133 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
-nadzór), zgodność modelu 3D ze źródłem oraz cały łańcuch od cech dłoni do
-symulowanego ramienia.
+168 testów pokrywa matematykę sterowania (filtry, kinematyka, mapowanie,
+nadzór), kąty ramienia w układzie tułowia, zgodność modelu 3D ze źródłem oraz
+cały łańcuch od cech dłoni do symulowanego ramienia.
+
+Kilka z nich sprawdza **skutek fizyczny, a nie wartość stawu** — i to nie jest
+formalność: w kalibracji SO-101 rosnący `shoulder_lift` *opuszcza* ramię, więc
+test „wartość rośnie" przepuszczał odwrócony kierunek. Test liczący wysokość
+końcówki go nie przepuszcza.
 
 ---
 

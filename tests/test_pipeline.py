@@ -69,16 +69,28 @@ def test_arm_reaches_home_then_follows_the_hand():
     assert rig.arm.read_joints()["shoulder_pan"] > centred + 5.0
 
 
-def test_hand_up_and_down_moves_the_shoulder_both_ways():
+def tip_height(rig) -> float:
+    """Wysokosc koncowki chwytaka - mierzymy skutek, nie wartosc stawu."""
+    from lerobot_mp.control.kinematics import ArmKinematics
+
+    joints = rig.arm.read_joints()
+    return ArmKinematics(rig.cfg.geometry).forward(
+        joints["shoulder_pan"], joints["shoulder_lift"], joints["elbow_flex"], joints["wrist_flex"]
+    )[2]
+
+
+def test_hand_up_and_down_raises_and_lowers_the_tip():
+    """Reka w gore ma PODNIESC koncowke - w tej kalibracji `shoulder_lift`
+    rosnie przy opuszczaniu, wiec test na samej liczbie mierzylby znak, a nie ruch."""
     rig = Rig()
     rig.run(HandFeatures.absent(), seconds=0.6)
     rig.run(hand(center=(0.5, 0.5)), seconds=1.0)
-    middle = rig.arm.read_joints()["shoulder_lift"]
+    middle = tip_height(rig)
 
     rig.run(hand(center=(0.5, 0.25)), seconds=2.0)
-    up = rig.arm.read_joints()["shoulder_lift"]
+    up = tip_height(rig)
     rig.run(hand(center=(0.5, 0.75)), seconds=3.0)
-    down = rig.arm.read_joints()["shoulder_lift"]
+    down = tip_height(rig)
     assert up > middle > down
 
 
@@ -156,3 +168,79 @@ def test_ik_mode_runs_the_whole_chain():
     centred = rig.arm.read_joints()["shoulder_pan"]
     rig.run(hand(center=(0.8, 0.5)), seconds=2.0)
     assert abs(rig.arm.read_joints()["shoulder_pan"] - centred) > 3.0
+
+
+# --------------------------------------------------------------------------
+# Tryb `arm` - caly lancuch z sylwetka operatora
+# --------------------------------------------------------------------------
+
+from conftest import make_pose  # noqa: E402
+from lerobot_mp.vision.arm_features import ArmFeatures, extract_arm_features  # noqa: E402
+
+
+def arm(**kwargs) -> ArmFeatures:
+    return extract_arm_features(make_pose(**kwargs), kwargs.get("side", "Right"), FRAME)
+
+
+class ArmRig(Rig):
+    """Rig karmiony sylwetka zamiast sama dlonia."""
+
+    def run(self, arm_features, hand_features=None, seconds: float = 1.0):
+        hand_features = hand_features if hand_features is not None else HandFeatures.absent()
+        for _ in range(int(seconds / DT)):
+            output = self.mapper.update(
+                hand_features, self.supervisor.command, DT, arm=arm_features
+            )
+            command, self.report = self.supervisor.step(
+                output.targets, DT, hand_present=arm_features.present, engaged=output.engaged
+            )
+            self.arm.send_joints(command)
+            self.arm.step(DT)
+            self.check_invariants(command)
+        return self.arm.read_joints()
+
+
+def test_arm_mode_drives_the_robot_end_to_end():
+    rig = ArmRig(mapping={"mode": "arm"})
+    rig.run(ArmFeatures.absent(), seconds=0.6)
+    rig.run(arm(elevation_deg=-60.0), seconds=1.5)
+    low = tip_height(rig)
+    rig.run(arm(elevation_deg=-10.0), seconds=2.5)
+    assert tip_height(rig) > low + 0.02
+
+
+def test_losing_the_arm_freezes_the_robot():
+    rig = ArmRig(mapping={"mode": "arm"})
+    rig.run(ArmFeatures.absent(), seconds=0.6)
+    rig.run(arm(elevation_deg=-40.0, azimuth_deg=20.0), seconds=1.5)
+    frozen = rig.arm.read_joints()
+
+    rig.run(ArmFeatures.absent(), seconds=1.0)
+    assert rig.supervisor.state is SafetyState.HOLDING
+    for name in JOINT_NAMES:
+        assert rig.arm.read_joints()[name] == pytest.approx(frozen[name], abs=1.5)
+
+
+def test_arm_mode_keeps_the_gripper_on_the_pinch():
+    rig = ArmRig(mapping={"mode": "arm"})
+    rig.run(ArmFeatures.absent(), seconds=0.6)
+    steady = arm(elevation_deg=-40.0)
+    rig.run(steady, hand(pinch=1.0), seconds=1.5)
+    assert rig.arm.read_joints()["gripper"] > 80.0
+    rig.run(steady, hand(pinch=0.05), seconds=1.5)
+    assert rig.arm.read_joints()["gripper"] < 20.0
+
+
+def test_arm_mode_respects_velocity_limits_on_a_sudden_move():
+    rig = ArmRig(mapping={"mode": "arm"})
+    rig.run(ArmFeatures.absent(), seconds=0.6)
+    rig.run(arm(elevation_deg=-80.0, azimuth_deg=-60.0), seconds=1.0)
+    previous = rig.supervisor.command
+
+    jump = arm(elevation_deg=60.0, azimuth_deg=80.0, elbow_deg=140.0)
+    for _ in range(30):
+        output = rig.mapper.update(HandFeatures.absent(), rig.supervisor.command, DT, arm=jump)
+        command, _ = rig.supervisor.step(output.targets, DT, hand_present=True, engaged=True)
+        for name in JOINT_NAMES:
+            assert abs(command[name] - previous[name]) <= rig.cfg.joint(name).max_vel * DT + 1e-6
+        previous = command

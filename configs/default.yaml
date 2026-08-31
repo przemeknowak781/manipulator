@@ -40,7 +40,11 @@ filters:
   gripper_ema: 0.5
 
 mapping:
-  mode: direct         # direct (kazda os dloni -> jeden staw) | ik (kartezjanskie)
+  # direct - kazda os dloni steruje jednym stawem
+  # ik     - pozycja dloni wyznacza punkt, katy liczy odwrotna kinematyka
+  # arm    - sledzimy cale ramie operatora: bark, lokiec i nadgarstek
+  mode: direct
+  gripper_source: pinch  # pinch (kciuk-wskazujacy) | none (tylko klawiszami)
   relative: true       # ruch liczony od chwili zalaczenia sprzegla
   deadzone: 0.012
   depth_gain: 1.5      # jak mocno rozmiar dloni w kadrze steruje glebokoscia
@@ -49,6 +53,21 @@ mapping:
   gripper_invert: false
   x_scale: 1.0
   y_scale: 1.0
+
+# Tryb `arm`: sledzenie calego ramienia operatora (MediaPipe Pose).
+# Katy licza sie w ukladzie TULOWIA, wiec przechylenie sie na krzesle albo
+# obrot bokiem do kamery nie zmienia zadanej pozy robota.
+arm:
+  side: auto           # auto | Left | Right - strona OPERATORA
+  min_visibility: 0.6  # ponizej tego progu ramie uznajemy za niewidoczne
+  pan_gain: 1.0        # przelozenia bezwymiarowe: 1.0 = ruch 1:1
+  lift_gain: 1.0
+  elbow_gain: 1.0
+  use_hand: true       # nadgarstek i chwytak nadal ze sledzenia dloni
+  model_path: models/pose_landmarker_lite.task
+  min_detection_confidence: 0.5
+  min_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
 
 clutch:
   mode: gesture        # gesture (zwiniete palce = pauza) | key | always

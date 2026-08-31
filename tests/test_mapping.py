@@ -89,18 +89,97 @@ def test_hand_moving_right_turns_the_base(cfg):
     assert moved.targets["shoulder_pan"] > 5.0
 
 
+def tip(cfg, targets):
+    """Polozenie koncowki dla zadanych katow - testujemy SKUTEK, nie liczby."""
+    from lerobot_mp.control.kinematics import ArmKinematics
+
+    kin = ArmKinematics(cfg.geometry)
+    return kin.forward(
+        targets["shoulder_pan"], targets["shoulder_lift"], targets["elbow_flex"], targets["wrist_flex"]
+    )
+
+
 def test_hand_moving_up_lifts_the_arm(cfg):
+    """Podniesienie dloni ma PODNIESC koncowke.
+
+    Sprawdzamy wysokosc koncowki, a nie wartosc stawu: w kalibracji SO-101
+    rosnacy `shoulder_lift` opuszcza ramie, wiec test na samej liczbie
+    przepuscilby odwrocony kierunek.
+    """
     mapper = engaged_mapper(cfg)
-    drive(mapper, features(center=(0.5, 0.5)), zeros())
-    moved = drive(mapper, features(center=(0.5, 0.25)), zeros())
-    assert moved.targets["shoulder_lift"] > 5.0
+    home = dict(cfg.safety.home)
+    middle = drive(mapper, features(center=(0.5, 0.5)), home)
+    up = drive(mapper, features(center=(0.5, 0.25)), home)
+    down = drive(mapper, features(center=(0.5, 0.75)), home)
+    assert tip(cfg, up.targets)[2] > tip(cfg, middle.targets)[2] > tip(cfg, down.targets)[2]
 
 
-def test_hand_closer_to_camera_extends_the_elbow(cfg):
+def unfolding(cfg, targets):
+    """Jak bardzo ramie jest rozprostowane: odleglosc barku od koncowki."""
+    from lerobot_mp.control.kinematics import ArmKinematics
+
+    points = ArmKinematics(cfg.geometry).chain_points(
+        targets["shoulder_lift"], targets["elbow_flex"], targets["wrist_flex"]
+    )
+    return math.dist(points[1], points[4])
+
+
+def test_hand_closer_to_camera_unfolds_the_arm(cfg):
+    """Przyblizenie dloni do kamery ma ROZPROSTOWAC ramie, a nie je zlozyc.
+
+    W trybie `direct` glebokosc steruje jednym stawem - lokciem - wiec skutkiem
+    jest rozprostowanie lancucha, a nie ruch po prostej do przodu. Od tego jest
+    tryb `ik`; ten test pilnuje wlasnie tej, wezszej obietnicy.
+    """
     mapper = engaged_mapper(cfg)
-    drive(mapper, features(scale=0.10), zeros())
-    closer = drive(mapper, features(scale=0.18), zeros())
-    assert closer.targets["elbow_flex"] > 5.0
+    home = dict(cfg.safety.home)
+    far = drive(mapper, features(scale=0.10), home)
+    near = drive(mapper, features(scale=0.18), home)
+    assert unfolding(cfg, near.targets) > unfolding(cfg, far.targets) + 0.01
+
+
+def test_ik_mode_moves_the_tip_forward_with_depth(cfg):
+    """A tryb `ik` obiecuje wiecej: glebokosc dloni to ruch koncowki do przodu."""
+    cfg_ik = load_config(overrides={"mapping": {"mode": "ik"}, "clutch": {"mode": "always"}})
+    mapper = HandToJointMapper(cfg_ik)
+    home = dict(cfg_ik.safety.home)
+    far = drive(mapper, features(scale=0.10), home)
+    near = drive(mapper, features(scale=0.18), home)
+    assert tip(cfg_ik, near.targets)[0] > tip(cfg_ik, far.targets)[0] + 0.01
+
+
+def test_direct_and_ik_move_the_tip_the_same_way(cfg):
+    """Oba tryby maja reagowac tak samo na ten sam ruch reki.
+
+    Porownujemy przemieszczenie KONCOWKI w przestrzeni. Poprzednia wersja
+    tego testu patrzyla tylko na `shoulder_pan` i przez to nie zauwazyla,
+    ze `direct` i `ik` rozjezdzaja sie na osi pionowej i na glebokosci.
+    """
+    # Glebokosci tu nie ma celowo: w `direct` steruje ona stawem lokcia,
+    # a w `ik` polozeniem koncowki - to sa rozne obietnice, sprawdzane osobno.
+    moves = {
+        "w gore": dict(center=(0.5, 0.28)),
+        "w dol": dict(center=(0.5, 0.72)),
+        "w bok": dict(center=(0.78, 0.5)),
+    }
+    for label, move in moves.items():
+        shifts = {}
+        for mode in ("direct", "ik"):
+            cfg_mode = load_config(
+                overrides={"mapping": {"mode": mode}, "clutch": {"mode": "always"}}
+            )
+            mapper = HandToJointMapper(cfg_mode)
+            home = dict(cfg_mode.safety.home)
+            base = drive(mapper, features(center=(0.5, 0.5), scale=0.12), home)
+            moved = drive(mapper, features(**{"center": (0.5, 0.5), "scale": 0.12, **move}), home)
+            a, b = tip(cfg_mode, base.targets), tip(cfg_mode, moved.targets)
+            shifts[mode] = [b[i] - a[i] for i in range(3)]
+
+        for axis, name in enumerate("XYZ"):
+            direct, ik = shifts["direct"][axis], shifts["ik"][axis]
+            if max(abs(direct), abs(ik)) < 0.01:
+                continue  # os praktycznie nietknieta przez ten ruch
+            assert direct * ik > 0, f"{label}: os {name} rozjezdza sie {shifts}"
 
 
 def test_wrist_rotation_is_geared_one_to_one(cfg):
@@ -231,3 +310,142 @@ def test_unknown_clutch_mode_is_an_error(cfg):
     cfg.clutch.mode = "telepathy"
     with pytest.raises(ValueError):
         HandToJointMapper(cfg).update(features(), zeros(), DT)
+
+
+# --------------------------------------------------------------------------
+# Tryb `arm` - sterowanie calym ramieniem operatora
+# --------------------------------------------------------------------------
+
+from conftest import make_pose  # noqa: E402
+from lerobot_mp.vision.arm_features import ArmFeatures, extract_arm_features  # noqa: E402
+
+
+def arm(**kwargs) -> ArmFeatures:
+    side = kwargs.pop("side", "Right")
+    return extract_arm_features(make_pose(side=side, **kwargs), side, FRAME)
+
+
+def arm_mapper(cfg, **overrides) -> HandToJointMapper:
+    cfg.mapping.mode = "arm"
+    cfg.clutch.mode = "always"
+    for key, value in overrides.items():
+        setattr(cfg.arm, key, value)
+    return HandToJointMapper(cfg)
+
+
+def drive_arm(mapper, arm_features, hand_features=None, joints=None, steps=60):
+    hand_features = hand_features if hand_features is not None else HandFeatures.absent()
+    joints = joints if joints is not None else zeros()
+    output = None
+    for _ in range(steps):
+        output = mapper.update(hand_features, joints, DT, arm=arm_features)
+    return output
+
+
+def test_arm_mode_needs_the_arm_not_the_hand(cfg):
+    """Sama dlon nie wystarczy - w tym trybie prowadzi sylwetka."""
+    mapper = arm_mapper(cfg)
+    only_hand = drive_arm(mapper, ArmFeatures.absent(), features())
+    assert only_hand.targets is None
+    assert "ramien" in only_hand.reason
+
+    assert drive_arm(mapper, arm(elevation_deg=-40.0)).targets is not None
+
+
+def test_arm_mode_works_without_a_visible_hand(cfg):
+    """Reka moze wypasc z kadru - ramie dalej steruje trzema stawami."""
+    mapper = arm_mapper(cfg)
+    output = drive_arm(mapper, arm(elevation_deg=-40.0))
+    assert set(output.targets) >= {"shoulder_pan", "shoulder_lift", "elbow_flex"}
+    assert "wrist_roll" not in output.targets  # nadgarstek bez dloni stoi
+    assert "gripper" not in output.targets
+
+
+def test_raising_your_arm_raises_the_tip(cfg):
+    """Podnosisz reke - koncowka robota idzie w gore."""
+    mapper = arm_mapper(cfg)
+    home = dict(cfg.safety.home)
+    low = drive_arm(mapper, arm(elevation_deg=-60.0), joints=home)
+    high = drive_arm(mapper, arm(elevation_deg=-10.0), joints=home)
+    assert tip(cfg, _full(cfg, high.targets))[2] > tip(cfg, _full(cfg, low.targets))[2] + 0.02
+
+
+def test_bending_your_elbow_folds_the_robot_elbow(cfg):
+    """Zginasz lokiec - robot sklada ramie."""
+    mapper = arm_mapper(cfg)
+    home = dict(cfg.safety.home)
+    straight = drive_arm(mapper, arm(elevation_deg=-30.0, elbow_deg=10.0), joints=home)
+    bent = drive_arm(mapper, arm(elevation_deg=-30.0, elbow_deg=90.0), joints=home)
+    assert unfolding(cfg, _full(cfg, bent.targets)) < unfolding(cfg, _full(cfg, straight.targets))
+
+
+def test_elbow_mapping_is_one_to_one_by_default(cfg):
+    """Domyslne przelozenie 1:1 - 60 stopni u operatora to 60 u robota."""
+    mapper = arm_mapper(cfg)
+    home = dict(cfg.safety.home)
+    base = drive_arm(mapper, arm(elevation_deg=-30.0, elbow_deg=20.0), joints=home, steps=120)
+    moved = drive_arm(mapper, arm(elevation_deg=-30.0, elbow_deg=80.0), joints=home, steps=120)
+    delta = moved.targets["elbow_flex"] - base.targets["elbow_flex"]
+    assert delta == pytest.approx(60.0, abs=6.0)
+
+
+def test_arm_gain_scales_the_motion(cfg):
+    def travel(gain: float) -> float:
+        cfg_local = load_config(
+            overrides={"mapping": {"mode": "arm"}, "clutch": {"mode": "always"},
+                       "arm": {"elbow_gain": gain}}
+        )
+        mapper = HandToJointMapper(cfg_local)
+        home = dict(cfg_local.safety.home)
+        base = drive_arm(mapper, arm(elbow_deg=20.0), joints=home, steps=120)
+        moved = drive_arm(mapper, arm(elbow_deg=80.0), joints=home, steps=120)
+        return abs(moved.targets["elbow_flex"] - base.targets["elbow_flex"])
+
+    assert travel(0.5) == pytest.approx(travel(1.0) / 2.0, rel=0.15)
+
+
+def test_arm_mode_starts_from_the_current_pose(cfg):
+    """Zalaczenie nie moze dac przeskoku - cel startuje z pozycji robota."""
+    mapper = arm_mapper(cfg)
+    start = dict(zeros(), shoulder_pan=25.0, elbow_flex=15.0)
+    output = drive_arm(mapper, arm(elevation_deg=-40.0), joints=start)
+    assert output.targets["shoulder_pan"] == pytest.approx(25.0, abs=1.5)
+    assert output.targets["elbow_flex"] == pytest.approx(15.0, abs=1.5)
+
+
+def test_hand_appearing_later_adds_the_wrist_without_a_jump(cfg):
+    """Dlon wraca do kadru - nadgarstek dolacza plynnie, od biezacej pozycji."""
+    mapper = arm_mapper(cfg)
+    home = dict(cfg.safety.home)
+    drive_arm(mapper, arm(elevation_deg=-40.0), joints=home)
+    with_hand = drive_arm(mapper, arm(elevation_deg=-40.0), features(roll_deg=20.0), home, steps=5)
+    assert with_hand.targets["wrist_roll"] == pytest.approx(home["wrist_roll"], abs=3.0)
+
+
+def test_gripper_still_follows_the_pinch_in_arm_mode(cfg):
+    mapper = arm_mapper(cfg)
+    home = dict(cfg.safety.home)
+    wide = drive_arm(mapper, arm(elevation_deg=-40.0), features(pinch=1.0), home)
+    tight = drive_arm(mapper, arm(elevation_deg=-40.0), features(pinch=0.05), home)
+    assert wide.targets["gripper"] > 80.0
+    assert tight.targets["gripper"] < 20.0
+
+
+def test_gripper_source_none_leaves_the_jaw_alone(cfg):
+    cfg.mapping.gripper_source = "none"
+    mapper = arm_mapper(cfg)
+    output = drive_arm(mapper, arm(elevation_deg=-40.0), features(pinch=1.0), dict(cfg.safety.home))
+    assert "gripper" not in output.targets
+
+
+def test_losing_the_arm_releases_the_anchor(cfg):
+    mapper = arm_mapper(cfg)
+    drive_arm(mapper, arm(elevation_deg=-40.0))
+    assert mapper.anchored
+    mapper.update(HandFeatures.absent(), zeros(), DT, arm=ArmFeatures.absent())
+    assert not mapper.anchored
+
+
+def _full(cfg, targets: dict) -> dict:
+    """Uzupelnia brakujace stawy poza domowa - do liczenia kinematyki."""
+    return {**cfg.safety.home, **targets}

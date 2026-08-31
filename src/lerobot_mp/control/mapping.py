@@ -20,6 +20,7 @@ import math
 from dataclasses import dataclass, field
 
 from ..config import AppConfig, JOINT_NAMES
+from ..vision.arm_features import ArmFeatures
 from ..vision.features import HandFeatures
 from .filters import AngleUnwrapper, ExponentialFilter, OneEuroFilter
 from .kinematics import ArmKinematics, IKResult
@@ -35,6 +36,8 @@ class ControlOutput:
     hand_present: bool = False
     #: Wygladzone cechy dloni (do rysowania na HUD).
     features: HandFeatures = field(default_factory=HandFeatures.absent)
+    #: Wygladzone katy ramienia operatora (tryb `arm`).
+    arm: ArmFeatures = field(default_factory=ArmFeatures.absent)
     #: Zadany punkt koncowki [m] - tylko w trybie `ik`.
     ee_target: tuple[float, float, float] | None = None
     ik: IKResult | None = None
@@ -67,6 +70,13 @@ class HandToJointMapper:
         self._gripper_ema = ExponentialFilter(f.gripper_ema)
         self._roll_unwrap = AngleUnwrapper()
 
+        # Tryb `arm`: katy sa juz w stopniach, wiec filtrujemy je tak samo
+        # jak katy dloni, tylko w innej jednostce.
+        self._f_azimuth = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
+        self._f_elevation = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
+        self._f_elbow = OneEuroFilter(f.angle.min_cutoff, f.angle.beta, f.angle.d_cutoff)
+        self._azimuth_unwrap = AngleUnwrapper(period=360.0)
+
         self._engaged = cfg.clutch.engaged_on_start
         self._key_engaged = cfg.clutch.engaged_on_start
         self._pending_gesture: bool | None = None
@@ -74,6 +84,7 @@ class HandToJointMapper:
         self._elapsed = 0.0
 
         self._anchor: HandFeatures | None = None
+        self._anchor_arm: ArmFeatures | None = None
         self._anchor_joints: dict[str, float] = {}
         self._anchor_ee: tuple[float, float, float] | None = None
         self._prev_features: HandFeatures | None = None
@@ -89,6 +100,9 @@ class HandToJointMapper:
 
     @property
     def anchored(self) -> bool:
+        """Czy mamy punkt odniesienia. W trybie `arm` decyduje o tym ramie."""
+        if self.arm_mode:
+            return self._anchor_arm is not None
         return self._anchor is not None
 
     def toggle_key_clutch(self) -> bool:
@@ -103,25 +117,40 @@ class HandToJointMapper:
         if not engaged:
             self.release_anchor()
 
+    @property
+    def arm_mode(self) -> bool:
+        return self.cfg.mapping.mode.lower() == "arm"
+
     def release_anchor(self) -> None:
         """Zrywa zaczepienie - kolejne zalaczenie zacznie od nowej pozycji dloni."""
         self._anchor = None
+        self._anchor_arm = None
         self._anchor_joints = {}
         self._anchor_ee = None
 
-    def _update_clutch(self, features: HandFeatures, dt: float) -> bool:
-        """Wyznacza stan sprzegla wg trybu z konfiguracji (z debouncingiem)."""
+    def _update_clutch(self, features: HandFeatures, dt: float, present: bool) -> bool:
+        """Wyznacza stan sprzegla wg trybu z konfiguracji (z debouncingiem).
+
+        `present` to obecnosc OPERATORA - w trybie `arm` decyduje o niej
+        widocznosc ramienia, a nie dloni.
+        """
         mode = self.cfg.clutch.mode.lower()
         self._elapsed += dt
 
         if mode == "always":
-            desired = features.present
+            desired = present
         elif mode == "key":
-            desired = self._key_engaged and features.present
+            desired = self._key_engaged and present
         elif mode == "gesture":
             # Zwiniete trzy ostatnie palce = pauza. Klawisz dziala jako
             # dodatkowy wylacznik (spacja moze zablokowac sterowanie calkiem).
-            desired = features.present and not features.curled and self._key_engaged
+            if features.present:
+                desired = present and not features.curled and self._key_engaged
+            else:
+                # W trybie `arm` dlon bywa chwilowo niewidoczna, chociaz ramie
+                # jest sledzone. Zamiast zgadywac gest, zostawiamy stan bez
+                # zmiany - od zatrzymania sa spacja, klawisz X i watchdog.
+                desired = self._engaged and present and self._key_engaged
         else:
             raise ValueError(f"Nieznany tryb sprzegla: {self.cfg.clutch.mode!r}")
 
@@ -160,10 +189,34 @@ class HandToJointMapper:
             palm_px=features.palm_px,
         )
 
+    def _smooth_arm(self, arm: ArmFeatures, dt: float) -> ArmFeatures:
+        if not arm.present:
+            return arm
+        azimuth = self._azimuth_unwrap(arm.azimuth)
+        return ArmFeatures(
+            present=True,
+            side=arm.side,
+            elevation=self._f_elevation(arm.elevation, dt),
+            azimuth=self._f_azimuth(azimuth, dt),
+            elbow=self._f_elbow(arm.elbow, dt),
+            visibility=arm.visibility,
+            points_px=arm.points_px,
+        )
+
     def _reset_filters(self) -> None:
-        for flt in (self._fx, self._fy, self._fscale, self._froll, self._fpitch):
+        for flt in (
+            self._fx,
+            self._fy,
+            self._fscale,
+            self._froll,
+            self._fpitch,
+            self._f_azimuth,
+            self._f_elevation,
+            self._f_elbow,
+        ):
             flt.reset()
         self._roll_unwrap.reset()
+        self._azimuth_unwrap.reset()
         self._gripper_ema.reset()
 
     # ------------------------------------------------------------------- krok
@@ -172,6 +225,7 @@ class HandToJointMapper:
         features: HandFeatures,
         joints_now: dict[str, float],
         dt: float,
+        arm: ArmFeatures | None = None,
     ) -> ControlOutput:
         """Liczy zadane pozycje stawow dla biezacej klatki.
 
@@ -179,43 +233,65 @@ class HandToJointMapper:
             features: surowe cechy dloni z `extract_features` (moze byc "absent").
             joints_now: aktualnie zadane/zmierzone pozycje stawow robota.
             dt: czas od poprzedniej klatki [s].
+            arm: katy ramienia operatora - wymagane w trybie `arm`.
         """
-        if not features.present:
+        arm = arm or ArmFeatures.absent()
+        arm_mode = self.arm_mode
+        # W trybie `arm` to ramie decyduje o obecnosci operatora; dlon jest
+        # dodatkiem (nadgarstek i chwytak) i moze chwilowo zniknac.
+        present = arm.present if arm_mode else features.present
+
+        if not present:
             self._reset_filters()
-            self._update_clutch(features, dt)
+            self._update_clutch(HandFeatures.absent(), dt, present=False)
             self.release_anchor()
             self._prev_features = None
             return ControlOutput(
-                targets=None, engaged=False, hand_present=False, reason="brak dloni"
+                targets=None,
+                engaged=False,
+                hand_present=False,
+                reason="nie widze ramienia" if arm_mode else "brak dloni",
             )
 
-        smooth = self._smooth(features, dt)
-        self._prev_features = smooth
-        engaged = self._update_clutch(smooth, dt)
+        smooth = self._smooth(features, dt) if features.present else features
+        smooth_arm = self._smooth_arm(arm, dt)
+        if features.present:
+            self._prev_features = smooth
+        engaged = self._update_clutch(smooth, dt, present=True)
 
         if not engaged:
             return ControlOutput(
                 targets=None,
                 engaged=False,
-                hand_present=True,
+                hand_present=features.present,
                 features=smooth,
+                arm=smooth_arm,
                 reason=self._clutch_reason(smooth),
             )
 
-        if self._anchor is None:
-            self._capture_anchor(smooth, joints_now)
+        if not self.anchored:
+            self._capture_anchor(smooth, joints_now, smooth_arm)
+        elif self._anchor is None and features.present:
+            # Dlon pojawila sie dopiero teraz - zaczepiamy ja bez zrywania
+            # zaczepienia ramienia, zeby robot nie drgnal.
+            self._anchor = smooth
 
-        if self.cfg.mapping.mode.lower() == "ik":
+        if arm_mode:
+            targets, ee, ik = self._map_arm(smooth, smooth_arm), None, None
+        elif self.cfg.mapping.mode.lower() == "ik":
             targets, ee, ik = self._map_ik(smooth)
         else:
             targets, ee, ik = self._map_direct(smooth), None, None
 
-        targets["gripper"] = self._map_gripper(smooth)
+        if self.cfg.mapping.gripper_source.lower() == "pinch" and features.present:
+            targets["gripper"] = self._map_gripper(smooth)
+
         return ControlOutput(
             targets=targets,
             engaged=True,
-            hand_present=True,
+            hand_present=features.present,
             features=smooth,
+            arm=smooth_arm,
             ee_target=ee,
             ik=ik,
         )
@@ -227,12 +303,20 @@ class HandToJointMapper:
             return "nacisnij SPACJE, aby wlaczyc sterowanie"
         if features.curled:
             return "palce zwiniete - pauza (wyprostuj, aby wznowic)"
+        if self.arm_mode and not features.present:
+            return "nie widze dloni - nadgarstek i chwytak stoja"
         return "sprzeglo rozlaczone"
 
-    def _capture_anchor(self, features: HandFeatures, joints_now: dict[str, float]) -> None:
-        """Zapamietuje punkt odniesienia dloni i robota w chwili zalaczenia."""
+    def _capture_anchor(
+        self,
+        features: HandFeatures,
+        joints_now: dict[str, float],
+        arm: ArmFeatures | None = None,
+    ) -> None:
+        """Zapamietuje punkt odniesienia operatora i robota w chwili zalaczenia."""
+        self._anchor_arm = arm if (arm and arm.present) else None
         if self.cfg.mapping.relative:
-            self._anchor = features
+            self._anchor = features if features.present else None
             self._anchor_joints = {n: float(joints_now.get(n, 0.0)) for n in JOINT_NAMES}
         else:
             # Tryb bezwzgledny: srodek kadru odpowiada pozycji domowej.
@@ -275,27 +359,84 @@ class HandToJointMapper:
         dpitch = math.degrees(f.pitch - a.pitch)
         return dx, dy, depth, droll, dpitch
 
-    def _joint_target(self, name: str, base: float, delta: float) -> float:
+    def _joint_target(
+        self, name: str, base: float, delta: float, gain: float | None = None
+    ) -> float:
+        """Cel stawu = punkt odniesienia + wzmocniona roznica (z korekta znaku).
+
+        `gain` pozwala podac przelozenie spoza `joints` - korzysta z tego tryb
+        `arm`, ktory ma wlasne, bezwymiarowe przelozenia.
+        """
         jc = self.cfg.joint(name)
         sign = -1.0 if jc.invert else 1.0
-        return base + sign * jc.gain * delta + jc.offset
+        return base + sign * (jc.gain if gain is None else gain) * delta + jc.offset
 
     # ------------------------------------------------------------ tryb direct
     def _map_direct(self, f: HandFeatures) -> dict[str, float]:
         dx, dy, depth, droll, dpitch = self._deltas(f)
         base = self._anchor_joints
+        # ZNAKI. Nie sa dobrane "zeby wygladalo dobrze" - wynikaja z geometrii
+        # SO-101 zmierzonej w `scripts/derive_geometry.py`. W tej kalibracji
+        # *rosnacy* `shoulder_lift` OPUSZCZA ramie, a rosnacy `elbow_flex`
+        # je CHOWA, wiec intuicyjne kierunki wymagaja minusow. Test
+        # `test_direct_and_ik_move_the_tip_the_same_way` pilnuje, zeby oba
+        # tryby mapowania zgadzaly sie co do skutku, a nie co do liczb.
         return {
             # Dlon w lewo/prawo -> obrot podstawy.
             "shoulder_pan": self._joint_target("shoulder_pan", base["shoulder_pan"], dx),
-            # Dlon w gore -> ramie w gore (os Y obrazu rosnie w dol, stad minus).
-            "shoulder_lift": self._joint_target("shoulder_lift", base["shoulder_lift"], -dy),
-            # Dlon blizej kamery -> wysuniecie przedramienia.
-            "elbow_flex": self._joint_target("elbow_flex", base["elbow_flex"], depth),
-            # Pochylenie dloni -> pochylenie nadgarstka (1:1 przy gain = 1.0).
-            "wrist_flex": self._joint_target("wrist_flex", base["wrist_flex"], dpitch),
+            # Dlon w gore -> koncowka w gore (os Y obrazu rosnie w dol).
+            "shoulder_lift": self._joint_target("shoulder_lift", base["shoulder_lift"], dy),
+            # Dlon blizej kamery -> ramie wysuwa sie do przodu.
+            "elbow_flex": self._joint_target("elbow_flex", base["elbow_flex"], -depth),
+            # Pochylenie dloni -> pochylenie narzedzia w te sama strone.
+            "wrist_flex": self._joint_target("wrist_flex", base["wrist_flex"], -dpitch),
             # Obrot dloni -> obrot nadgarstka.
             "wrist_roll": self._joint_target("wrist_roll", base["wrist_roll"], droll),
         }
+
+    # --------------------------------------------------------------- tryb arm
+    def _map_arm(self, hand: HandFeatures, arm: ArmFeatures) -> dict[str, float]:
+        """Ramie operatora -> ramie robota, staw w staw.
+
+        ZNAKI wynikaja z geometrii SO-101 (`scripts/derive_geometry.py`):
+        rosnacy `shoulder_lift` OPUSZCZA ramie, a rosnacy `shoulder_pan`
+        obraca je w prawo robota, podczas gdy rosnacy azymut operatora to
+        ruch reki do przodu, czyli w druga strone. Stad dwa minusy.
+        """
+        assert self._anchor_arm is not None
+        base = self._anchor_joints
+        anchor = self._anchor_arm
+        settings = self.cfg.arm
+
+        d_azimuth = arm.azimuth - anchor.azimuth
+        d_elevation = arm.elevation - anchor.elevation
+        d_elbow = arm.elbow - anchor.elbow
+
+        targets = {
+            "shoulder_pan": self._joint_target(
+                "shoulder_pan", base["shoulder_pan"], -d_azimuth, settings.pan_gain
+            ),
+            "shoulder_lift": self._joint_target(
+                "shoulder_lift", base["shoulder_lift"], -d_elevation, settings.lift_gain
+            ),
+            # Zgiecie lokcia przeklada sie wprost: operator zgina, robot zgina.
+            "elbow_flex": self._joint_target(
+                "elbow_flex", base["elbow_flex"], d_elbow, settings.elbow_gain
+            ),
+        }
+
+        # Nadgarstek nadal ze sledzenia dloni - sylwetka nie niesie obrotu
+        # nadgarstka z uzyteczna dokladnoscia.
+        if hand.present and self._anchor is not None:
+            droll = math.degrees(hand.roll - self._anchor.roll)
+            dpitch = math.degrees(hand.pitch - self._anchor.pitch)
+            targets["wrist_flex"] = self._joint_target(
+                "wrist_flex", base["wrist_flex"], -dpitch
+            )
+            targets["wrist_roll"] = self._joint_target(
+                "wrist_roll", base["wrist_roll"], droll
+            )
+        return targets
 
     # ---------------------------------------------------------------- tryb ik
     def _map_ik(

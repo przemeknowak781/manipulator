@@ -193,8 +193,16 @@ class WorkspaceConfig:
 
 @dataclass
 class MappingConfig:
-    #: "direct" (kazda os dloni -> jeden staw) albo "ik" (kartezjanskie + IK).
+    #: Sposob mapowania ruchu operatora na stawy:
+    #:   "direct" - kazda os dloni steruje jednym stawem,
+    #:   "ik"     - pozycja dloni wyznacza punkt, katy liczy odwrotna kinematyka,
+    #:   "arm"    - sledzimy CALE ramie operatora (bark, lokiec, nadgarstek)
+    #:              i przekladamy je wprost na ramie robota.
     mode: str = "direct"
+    #: Co steruje szczeka chwytaka:
+    #:   "pinch" - odleglosc kciuk-wskazujacy (wymaga sledzenia dloni),
+    #:   "none"  - chwytak nie rusza sie sam, tylko klawiszami.
+    gripper_source: str = "pinch"
     #: Tryb wzgledny: ruch liczony od pozycji zaczepienia (jak podnoszenie myszy).
     relative: bool = True
     #: Martwa strefa wokol punktu zaczepienia (w jednostkach znormalizowanych cech).
@@ -209,6 +217,44 @@ class MappingConfig:
     #: Skalowanie osi obrazu -> cechy (mnozniki przed wzmocnieniem stawu).
     x_scale: float = 1.0
     y_scale: float = 1.0
+
+
+@dataclass
+class ArmTrackingConfig:
+    """Tryb `arm`: sledzenie ramienia operatora przez MediaPipe Pose.
+
+    Katy licza sie w ukladzie TULOWIA, a nie obrazu, wiec dzialaja tak samo,
+    gdy operator stoi bokiem albo przechyla sie na krzesle. Przelozenia sa
+    bezwymiarowe: 1.0 znaczy, ze ramie robota powtarza ruch 1:1.
+    """
+
+    #: "auto" (to ramie, ktore lepiej widac) | "Left" | "Right" - strona OPERATORA.
+    side: str = "auto"
+    #: Ponizej tej wiarygodnosci punktow (visibility) ramie uznajemy za niewidoczne.
+    #: Bez tego progu zaslonieta reka dawalaby zgadniete katy i losowy ruch robota.
+    min_visibility: float = 0.6
+
+    #: Przelozenia poszczegolnych osi (1.0 = ruch 1:1 z ramieniem operatora).
+    pan_gain: float = 1.0
+    lift_gain: float = 1.0
+    elbow_gain: float = 1.0
+
+    #: Nadgarstek i chwytak nadal ze sledzenia dloni. Wylaczenie oszczedza
+    #: czas procesora, ale zabiera obrot nadgarstka i sterowanie chwytakiem.
+    use_hand: bool = True
+
+    #: Wariant `lite` jest szybszy (ok. 17 ms wobec 22 ms) i po ustabilizowaniu
+    #: sledzenia daje 0,4 stopnia rozrzutu na lokciu - grubo ponizej tego, co
+    #: ma znaczenie przy prowadzeniu reka. Zamiana na `pose_landmarker_full`
+    #: w obu polach ponizej daje 0,2 stopnia kosztem kilku milisekund.
+    model_path: str = "models/pose_landmarker_lite.task"
+    model_url: str = (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    )
+    min_detection_confidence: float = 0.5
+    min_presence_confidence: float = 0.5
+    min_tracking_confidence: float = 0.5
 
 
 @dataclass
@@ -307,6 +353,7 @@ class AppConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
     mapping: MappingConfig = field(default_factory=MappingConfig)
+    arm: ArmTrackingConfig = field(default_factory=ArmTrackingConfig)
     clutch: ClutchConfig = field(default_factory=ClutchConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
