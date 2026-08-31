@@ -38,6 +38,11 @@ INST_WRITE = 0x03
 INST_SYNC_WRITE = 0x83
 BROADCAST_ID = 0xFE
 
+#: Wlasne limity kata serwa, zapisane w jego EEPROM-ie. Serwo przycina do nich
+#: KAZDY rozkaz po cichu, wiec aplikacja, ktora ich nie zna, zadaje pozy
+#: niewykonalne i nie ma jak sie o tym dowiedziec.
+ADDR_MIN_ANGLE_LIMIT = 9
+ADDR_MAX_ANGLE_LIMIT = 11
 ADDR_TORQUE_ENABLE = 40
 ADDR_GOAL_POSITION = 42
 ADDR_PRESENT_POSITION = 56
@@ -164,6 +169,8 @@ class FeetechArm(RobotBackend):
         self.ids = dict(DEFAULT_IDS)
         self._connected = False
         self._positions: dict[str, float] = {}
+        #: Limity odczytane z serw [tiki]. Pusty wpis = serwo nie ogranicza.
+        self.servo_limits: dict[str, tuple[int, int]] = {}
         self.info = RobotInfo(
             name="SO-101 (feetech)",
             description=f"port {rc.port} @ {rc.baudrate} bd",
@@ -206,6 +213,7 @@ class FeetechArm(RobotBackend):
             )
 
         self._check_power()
+        self._read_servo_limits()
 
         ticks = {name: self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2) for name, dev_id in self.ids.items()}
         if any(value is None for value in ticks.values()):
@@ -228,6 +236,40 @@ class FeetechArm(RobotBackend):
             self.cfg.robot.port,
             ", ".join(f"{name}={value:.1f}" for name, value in self._positions.items()),
         )
+
+    def _read_servo_limits(self) -> None:
+        """Odczytuje wlasne limity serw i mowi glosno, gdy sa ciasniejsze niz konfiguracja.
+
+        Bez tego aplikacja zadaje pozy, ktorych serwo nie wykona: przycina je
+        po cichu do swojego zakresu i wraca w zupelnie inne miejsce. Widac to
+        wtedy jako "staw nie slucha rozkazu", chociaz rozkaz doszedl poprawnie.
+        """
+        self.servo_limits = {}
+        conflicts: list[str] = []
+        for name, dev_id in self.ids.items():
+            low = self.bus.read(dev_id, ADDR_MIN_ANGLE_LIMIT, 2)
+            high = self.bus.read(dev_id, ADDR_MAX_ANGLE_LIMIT, 2)
+            if low is None or high is None or low >= high:
+                continue
+            if low <= TICK_MIN and high >= TICK_MAX:
+                continue  # pelny zakres = serwo niczego nie ogranicza
+            self.servo_limits[name] = (low, high)
+
+            jc = self.cfg.joint(name)
+            servo_lo, servo_hi = self._to_units(name, low), self._to_units(name, high)
+            if servo_lo > jc.min + 1.0 or servo_hi < jc.max - 1.0:
+                conflicts.append(
+                    f"{name}: serwo {servo_lo:.0f}..{servo_hi:.0f}, "
+                    f"konfiguracja {jc.min:.0f}..{jc.max:.0f}"
+                )
+
+        if conflicts:
+            logger.warning(
+                "Serwa maja WLASNE limity kata, ciasniejsze niz `joints` w konfiguracji. "
+                "Rozkazy poza nimi zostana przyciete przez serwo, a staw zatrzyma sie "
+                "wczesniej, niz aplikacja zaklada:\n  %s",
+                "\n  ".join(conflicts),
+            )
 
     def _check_power(self) -> None:
         """Ostrzega, gdy ramie odpowiada, ale nie ma z czego ruszyc."""
@@ -285,7 +327,18 @@ class FeetechArm(RobotBackend):
                 continue
             jc = self.cfg.joint(name)
             value = min(max(float(targets[name]), jc.min), jc.max)
-            ticks[self.ids[name]] = self._to_ticks(name, value)
+            tick = self._to_ticks(name, value)
+
+            # Serwo i tak przytnie rozkaz do swojego zakresu. Robiac to tutaj,
+            # zwracamy wyzej wartosc, ktora NAPRAWDE pojechala - inaczej reszta
+            # aplikacji (limity predkosci, HUD, podglad 3D) liczylaby na pozycji,
+            # ktorej ramie nigdy nie osiagnelo.
+            limits = self.servo_limits.get(name)
+            if limits is not None:
+                tick = min(max(tick, limits[0]), limits[1])
+                value = self._to_units(name, tick)
+
+            ticks[self.ids[name]] = tick
             sent[name] = value
         self.bus.sync_write(ADDR_GOAL_POSITION, 2, ticks)
         return sent

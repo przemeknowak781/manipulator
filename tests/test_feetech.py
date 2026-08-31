@@ -13,6 +13,8 @@ import pytest
 from lerobot_mp.config import JOINT_NAMES, load_config
 from lerobot_mp.robot.feetech import (
     ADDR_GOAL_POSITION,
+    ADDR_MAX_ANGLE_LIMIT,
+    ADDR_MIN_ANGLE_LIMIT,
     ADDR_PRESENT_POSITION,
     ADDR_TORQUE_ENABLE,
     ADDR_PRESENT_VOLTAGE,
@@ -39,6 +41,8 @@ class FakeBusLink:
                 ADDR_GOAL_POSITION: 3000,  # celowo INNY niz pozycja biezaca
                 ADDR_PRESENT_POSITION: start_ticks,
                 ADDR_PRESENT_VOLTAGE: 119,
+                ADDR_MIN_ANGLE_LIMIT: 0,
+                ADDR_MAX_ANGLE_LIMIT: 4095,
             }
             for dev_id in ids
         }
@@ -267,6 +271,35 @@ def test_voltage_below_the_sane_threshold_is_reported(arm_cfg, caplog):
     with caplog.at_level("WARNING"):
         connected(arm_cfg, link)
     assert "zasilacz" in caplog.text.lower()
+
+
+def test_servo_limits_are_read_and_reported(arm_cfg, caplog):
+    """Serwo przycina rozkaz do wlasnego zakresu po cichu - to musi wyjsc na jaw."""
+    link = FakeBusLink()
+    link.registers[2][ADDR_MIN_ANGLE_LIMIT] = 2025  # shoulder_lift: tylko -2 stopnie w dol
+    link.registers[2][ADDR_MAX_ANGLE_LIMIT] = 3006
+    with caplog.at_level("WARNING"):
+        arm, _ = connected(arm_cfg, link)
+    assert arm.servo_limits["shoulder_lift"] == (2025, 3006)
+    assert "shoulder_lift" in caplog.text
+
+
+def test_targets_below_the_servo_limit_are_reported_as_clipped(arm_cfg):
+    """Aplikacja ma dostac pozycje, ktora POJECHALA, a nie te, o ktora prosila."""
+    link = FakeBusLink()
+    link.registers[2][ADDR_MIN_ANGLE_LIMIT] = 2025
+    link.registers[2][ADDR_MAX_ANGLE_LIMIT] = 3006
+    arm, link = connected(arm_cfg, link)
+
+    sent = arm.send_joints({"shoulder_lift": -23.3})
+    assert link.registers[2][ADDR_GOAL_POSITION] == 2025
+    assert sent["shoulder_lift"] == pytest.approx(arm._to_units("shoulder_lift", 2025), abs=0.1)
+    assert sent["shoulder_lift"] > -23.3
+
+
+def test_a_servo_with_the_full_range_is_not_treated_as_limited(arm_cfg):
+    arm, _ = connected(arm_cfg)
+    assert arm.servo_limits == {}
 
 
 def test_backend_needs_a_port(arm_cfg):
