@@ -108,7 +108,7 @@ ui:
   draw_arm_view: true
   preview_3d: true          # prawdziwe zlozenie SO-101 zamiast schematu
   preview_asset: null       # domyslnie assets/so101_preview.npz
-  preview_hz: 15.0
+  preview_hz: 30.0        # gorny limit; render chodzi w osobnym watku
   preview_width: 360
   display_scale: 1.0
   record_path: null         # np. demo.mp4 - zapis podgladu do pliku

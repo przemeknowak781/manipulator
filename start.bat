@@ -153,7 +153,24 @@ exit /b 0
 :run_real
 echo.
 echo   %C_DIM%Porty szeregowe widoczne w systemie:%C_OFF%
-powershell -NoProfile -Command "[System.IO.Ports.SerialPort]::GetPortNames() | ForEach-Object { '     ' + $_ }" 2>nul
+rem Pusta lista to najczestszy powod "aplikacja nie widzi ramienia" - lepiej
+rem powiedziec to wprost niz pokazac nic i poprosic o nazwe portu.
+set "FOUND="
+for /f "usebackq delims=" %%p in (`powershell -NoProfile -Command "[System.IO.Ports.SerialPort]::GetPortNames()" 2^>nul`) do (
+    echo      %%p
+    set "FOUND=1"
+)
+if not defined FOUND (
+    echo      %C_ERR%brak - system nie widzi zadnego portu COM%C_OFF%
+    echo.
+    echo   %C_DIM%Ramie zglasza sie jako przejsciowka USB-serial. Kiedy portu nie ma:%C_OFF%
+    echo   %C_DIM%  - kabel USB musi byc do danych, nie sam do ladowania,%C_OFF%
+    echo   %C_DIM%  - moze brakowac sterownika przejsciowki (CH340, CP210x, FTDI),%C_OFF%
+    echo   %C_DIM%  - na maszynie wirtualnej albo zdalnej trzeba przepuscic to%C_OFF%
+    echo   %C_DIM%    urzadzenie do systemu goszczonego - inaczej nigdy nie dotrze.%C_OFF%
+    echo.
+    exit /b 0
+)
 echo.
 set "PORT="
 set /p "PORT=  Port ramienia [np. COM5]: "

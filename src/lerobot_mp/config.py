@@ -331,9 +331,10 @@ class UIConfig:
     preview_3d: bool = True
     #: Sciezka do modelu 3D; None = domyslna `assets/so101_preview.npz`.
     preview_asset: str | None = None
-    #: Ile razy na sekunde odswiezac podglad 3D. Rysowanie ~20 tys. trojkatow
-    #: kosztuje kilkanascie milisekund, a podglad nie musi nadazac za sterowaniem.
-    preview_hz: float = 15.0
+    #: Gorny limit odswiezania podgladu 3D. Rysuje go osobny watek, wiec nie
+    #: zabiera czasu petli sterowania - na wolniejszej maszynie render sam
+    #: zejdzie ponizej tej wartosci, zamiast opoznic ruch ramienia.
+    preview_hz: float = 30.0
     #: Szerokosc panelu podgladu w pikselach.
     preview_width: int = 360
     #: Skalowanie okna podgladu.

@@ -50,6 +50,46 @@ z tej samej kalibracji (`--robot-id` wskazuje jej plik).
 > **Zanim podłączysz robota:** zrób wokół niego miejsce. Sterowanie rusza
 > dopiero po naciśnięciu **SPACJI**, a **X** to zatrzymanie awaryjne.
 
+### Kiedy system nie widzi ramienia
+
+Ramię nie jest urządzeniem USB samo w sobie — zgłasza się jako **przejściówka
+USB-serial** na płytce sterownika (najczęściej CH340, rzadziej CP210x lub FTDI)
+i dopiero ona tworzy port COM. Aplikacja nie ma jak go „poszukać": jeśli portu
+nie ma w systemie, nie ma czego otworzyć.
+
+Sprawdzenie, co widzi system:
+
+```bash
+python -c "import serial.tools.list_ports as l; print([p.device for p in l.comports()] or 'BRAK')"
+```
+
+Pusta lista oznacza jedną z trzech rzeczy, w tej kolejności prawdopodobieństwa:
+
+1. **Kabel** — sporo kabli USB ma tylko żyły zasilania. Ramię się zaświeci,
+   a portu nie będzie. Zamień kabel na taki, o którym wiesz, że przenosi dane.
+2. **Sterownik przejściówki** — układ dotarł do systemu, ale bez sterownika
+   siedzi w Menedżerze urządzeń jako nieznane urządzenie zamiast portu COM.
+   W Menedżerze urządzeń szukaj pozycji z żółtym wykrzyknikiem, sprawdź jej
+   `VID`/`PID` i doinstaluj sterownik: `1A86:7523` to CH340, `10C4:EA60` to
+   CP210x, `0403:6001` to FTDI.
+3. **Maszyna wirtualna albo pulpit zdalny** — urządzenie wpięte do fizycznego
+   komputera **nie trafia** do systemu goszczonego samo z siebie. Trzeba je
+   jawnie przepuścić:
+
+| Środowisko | Gdzie to włączyć |
+|---|---|
+| Shadow / Blade | w kliencie Shadow: menu urządzeń USB → zaznacz przejściówkę ramienia |
+| VirtualBox | Urządzenia → USB → wybierz urządzenie (plus Extension Pack) |
+| VMware | VM → Removable Devices → urządzenie → Connect |
+| Hyper-V | brak przekierowania USB — użyj trybu rozszerzonej sesji albo `usbipd-win` |
+| WSL2 | `usbipd bind --busid <id>` i `usbipd attach --wsl --busid <id>` |
+| Pulpit zdalny (RDP) | w kliencie: Zasoby lokalne → Więcej → zaznacz urządzenie |
+
+Ta sama zasada dotyczy kamery. Jeśli w systemie goszczonym kamera jest
+widoczna, ale nie oddaje żadnej klatki (OpenCV otwiera ją i zaraz dostaje
+`ERROR_OPERATION_ABORTED`), to zwykle nie jest wina sterownika — to samo
+przekierowanie USB, które trzeba włączyć.
+
 ---
 
 ## Jak się tym steruje
@@ -275,7 +315,7 @@ src/lerobot_mp/
 ├── vision/                kamera, MediaPipe (dłoń + sylwetka), cechy sterujące
 ├── control/               filtry, kinematyka, mapowanie, nadzór
 ├── robot/                 symulator i adapter LeRobot
-├── preview/               model 3D i renderer programowy
+├── preview/               model 3D, renderer programowy i jego wątek
 └── ui/                    HUD i podgląd schematyczny
 ```
 
@@ -284,9 +324,13 @@ częstotliwością niezależnie od tego, czy kamera zdążyła z nową klatką. 
 temu limity prędkości i watchdog działają tak samo, gdy detekcja chwilowo
 zwolni — ramię dojeżdża, zamiast szarpać.
 
-Podgląd 3D odświeża się rzadziej (domyślnie 15 Hz) niż sterowanie (30 Hz),
-bo rysowanie ~22 tys. trójkątów kosztuje kilkanaście milisekund, a robot ma
-priorytet.
+Podgląd 3D rysuje **osobny wątek**. Złożenie ~22 tys. trójkątów kosztuje ok.
+30 ms, więc robiony wprost w pętli sterowania zabierał jej ten czas co drugą
+iterację — pętla zadana na 30 Hz schodziła do 20 Hz, a model i tak przeskakiwał.
+Teraz pętla zostawia rendererowi najnowszą pozę i zabiera ostatnią gotową
+klatkę, nigdy na niego nie czekając. Poz pośrednich nie odrabiamy, więc
+zaległości nie narastają: przy wolnym rysowaniu podgląd gubi klatki, a ramię
+i tak jedzie równo.
 
 MediaPipe ma dwa niekompatybilne API — nowe `tasks` (1.x) i stare `solutions`
 (0.10.x). Aplikacja wykrywa dostępne automatycznie i w obu przypadkach zwraca
@@ -298,9 +342,9 @@ ten sam format, więc działa na obu wersjach.
 pip install pytest && pytest -q
 ```
 
-168 testów pokrywa matematykę sterowania (filtry, kinematyka, mapowanie,
-nadzór), kąty ramienia w układzie tułowia, zgodność modelu 3D ze źródłem oraz
-cały łańcuch od cech dłoni do symulowanego ramienia.
+174 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
+nadzór), kąty ramienia w układzie tułowia, wątek podglądu 3D i zgodność modelu
+ze źródłem oraz cały łańcuch od cech dłoni do symulowanego ramienia.
 
 Kilka z nich sprawdza **skutek fizyczny, a nie wartość stawu** — i to nie jest
 formalność: w kalibracji SO-101 rosnący `shoulder_lift` *opuszcza* ramię, więc

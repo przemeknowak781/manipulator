@@ -39,15 +39,13 @@ ESC = 27
 class _Preview:
     """Podglad ramienia - model 3D albo rysunek schematyczny."""
 
-    renderer: object | None = None
+    stream: object | None = None
     model: object | None = None
-    image: np.ndarray | None = None
-    last_render: float = 0.0
     enabled: bool = True
 
     @property
     def is_3d(self) -> bool:
-        return self.renderer is not None
+        return self.stream is not None
 
 
 class TeleopApp:
@@ -83,15 +81,22 @@ class TeleopApp:
             return
         from .preview.model import load_model
         from .preview.render import Renderer3D
+        from .preview.stream import PreviewStream
 
         model = load_model(self.cfg.ui.preview_asset)
         if model is None:
             return
         height = int(self.cfg.camera.height)
+        renderer = Renderer3D(model, size=(self.cfg.ui.preview_width, max(height, 240)))
         self._preview.model = model
-        self._preview.renderer = Renderer3D(
-            model, size=(self.cfg.ui.preview_width, max(height, 240))
-        )
+        self._preview.stream = PreviewStream(renderer, model, hz=self.cfg.ui.preview_hz)
+
+    def _start_preview(self) -> None:
+        """Rusza watek podgladu od faktycznej pozycji startowej ramienia."""
+        if self._preview.stream is None:
+            return
+        pose = self._preview.model.from_lerobot(self.supervisor.command)  # type: ignore[union-attr]
+        self._preview.stream.start(pose)  # type: ignore[union-attr]
 
     def _ensure_pose_tracker(self) -> bool:
         """Tworzy tracker sylwetki przy pierwszym wejsciu w tryb `arm`."""
@@ -135,6 +140,7 @@ class TeleopApp:
             backend.connect()
             self.supervisor.start(backend.read_joints())
             self._measured = backend.read_joints()
+            self._start_preview()
 
             if self.cfg.ui.show:
                 cv2.namedWindow(self.cfg.ui.window_name, cv2.WINDOW_AUTOSIZE)
@@ -300,7 +306,7 @@ class TeleopApp:
         if self.cfg.ui.draw_hud:
             draw_hud(canvas, self._hud_data(output, command, report, now), self.cfg)
 
-        panel = self._preview_panel(command, output, now)
+        panel = self._preview_panel(command, output)
         if panel is not None:
             canvas = compose(canvas, panel)
 
@@ -354,9 +360,14 @@ class TeleopApp:
         )
 
     def _preview_panel(
-        self, command: dict[str, float], output: ControlOutput, now: float
+        self, command: dict[str, float], output: ControlOutput
     ) -> np.ndarray | None:
-        """Panel podgladu; model 3D odswiezamy rzadziej niz petle sterowania."""
+        """Panel podgladu.
+
+        Model 3D rysuje watek `PreviewStream` - tutaj tylko zostawiamy mu
+        najnowsza poze i zabieramy ostatnia gotowa klatke. Petla sterowania
+        nigdy nie czeka na rysowanie.
+        """
         if not self._preview.enabled:
             return None
 
@@ -369,16 +380,10 @@ class TeleopApp:
                 ee_target=output.ee_target,
             )
 
-        period = 1.0 / max(self.cfg.ui.preview_hz, 1.0)
-        if self._preview.image is None or now - self._preview.last_render >= period:
-            renderer = self._preview.renderer
-            model = self._preview.model
-            self._preview.image = renderer.render(  # type: ignore[union-attr]
-                model.from_lerobot(command),  # type: ignore[union-attr]
-                ee_target=output.ee_target,
-            )
-            self._preview.last_render = now
-        return self._preview.image
+        stream = self._preview.stream
+        model = self._preview.model
+        stream.submit(model.from_lerobot(command), output.ee_target)  # type: ignore[union-attr]
+        return stream.image  # type: ignore[union-attr]
 
     def _backend_label(self) -> str:
         return "symulator" if self.cfg.robot.backend == "sim" else self.cfg.robot.backend
@@ -459,23 +464,21 @@ class TeleopApp:
         self._notify(f"Tryb mapowania: {nxt}")
 
     def _move_camera(self, char: str) -> None:
-        renderer = self._preview.renderer
-        if renderer is None:
+        stream = self._preview.stream
+        if stream is None:
             return
-        camera = renderer.camera  # type: ignore[attr-defined]
         if char == "j":
-            camera.orbit(-8.0, 0.0)
+            stream.orbit(-8.0, 0.0)  # type: ignore[attr-defined]
         elif char == "l":
-            camera.orbit(8.0, 0.0)
+            stream.orbit(8.0, 0.0)  # type: ignore[attr-defined]
         elif char == "i":
-            camera.orbit(0.0, 5.0)
+            stream.orbit(0.0, 5.0)  # type: ignore[attr-defined]
         elif char == "k":
-            camera.orbit(0.0, -5.0)
+            stream.orbit(0.0, -5.0)  # type: ignore[attr-defined]
         elif char == ",":
-            camera.zoom(1.1)
+            stream.zoom(1.1)  # type: ignore[attr-defined]
         elif char == ".":
-            camera.zoom(1 / 1.1)
-        self._preview.image = None  # wymus przerysowanie
+            stream.zoom(1 / 1.1)  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------ zamkniecie
     def _shutdown(
@@ -492,11 +495,13 @@ class TeleopApp:
             self._writer = None
             logger.info("Nagranie zapisane: %s", self.cfg.ui.record_path)
 
+        stream = self._preview.stream
         for name, close in (
             ("robot", backend.disconnect),
             ("kamera", camera.close),
             ("tracker", tracker.close if tracker else lambda: None),
             ("sylwetka", self._pose.close if self._pose else lambda: None),
+            ("podglad 3D", stream.close if stream else lambda: None),  # type: ignore[attr-defined]
         ):
             try:
                 close()
