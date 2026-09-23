@@ -25,3 +25,9 @@ recordings/
 # Lokalne nadpisania konfiguracji
 configs/local*.yaml
 .DS_Store
+
+# Lokalne stanowisko blizniaka: kalibracja kamer, pozycja stolu (per biurko)
+workspace/
+
+# Ostrzezenia MuJoCo zapisywane przy kompilacji scen
+MUJOCO_LOG.TXT

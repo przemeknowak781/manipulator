@@ -22,11 +22,14 @@ robot = ["lerobot[feetech]>=0.3.0"]
 feetech = ["pyserial>=3.5"]
 # Most COM <-> TCP - potrzebny tylko na maszynie, do ktorej wpiete jest ramie.
 bridge = ["pyserial>=3.5"]
+# Cyfrowy blizniak: symulacja, srodowisko RL i panel webowy.
+twin = ["mujoco>=3.3", "gymnasium>=1.0", "viser>=1.0", "pyserial>=3.5"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]
 lerobot-mp = "lerobot_mp.cli:main"
 lerobot-mp-bridge = "lerobot_mp.robot.serial_bridge:main"
+lerobot-twin = "lerobot_mp.twin.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -76,12 +76,13 @@ class SafetySupervisor:
         return max(self.cfg.joint(name).max_vel * self.cfg.safety.velocity_scale, 1e-3)
 
     # ------------------------------------------------------------------ start
-    def start(self, measured: dict[str, float]) -> None:
+    def start(self, measured: dict[str, float], go_home: bool = True) -> None:
         """Inicjalizuje nadzor aktualna, *zmierzona* pozycja robota.
 
         Startujemy dokladnie tam, gdzie ramie faktycznie stoi, i dopiero stamtad
         plynnie jedziemy do pozycji domowej - inaczej pierwszy rozkaz bylby
-        skokiem o kilkadziesiat stopni.
+        skokiem o kilkadziesiat stopni. `go_home=False` zostawia ramie tam,
+        gdzie stoi - panel blizniaka laczy sie bez ruchu i ma osobny przycisk.
         """
         self._command = {}
         self._limiters = {}
@@ -96,6 +97,10 @@ class SafetySupervisor:
         self._ramp_t = 0.0
         self._no_hand_for = 0.0
         self._was_active = False
+        if not go_home:
+            self.state = SafetyState.IDLE
+            logger.info("Nadzor wystartowal - ramie zostaje tam, gdzie stoi.")
+            return
         self.state = SafetyState.STARTING
         logger.info("Nadzor wystartowal, plynne dojscie do pozycji domowej (%.1f s).", self._ramp_duration)
 
