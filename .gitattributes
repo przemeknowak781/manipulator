@@ -2,3 +2,4 @@
 *.bat text eol=crlf
 *.npz binary
 *.task binary
+*.stl binary
