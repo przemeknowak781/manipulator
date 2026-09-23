@@ -1,0 +1,1085 @@
+{
+ "ms_per_ik": 410.40199500000904,
+ "rows": [
+  {
+   "r": 0.1,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    false,
+    4.4,
+    3.0
+   ],
+   "side_radial": [
+    false,
+    34.5,
+    73.8
+   ],
+   "side_radial_roll90": [
+    false,
+    18.0,
+    75.5
+   ],
+   "side_tangent": [
+    false,
+    3.7,
+    81.9
+   ]
+  },
+  {
+   "r": 0.1,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    1.4,
+    35.2
+   ],
+   "side_radial_roll90": [
+    false,
+    3.6,
+    77.5
+   ],
+   "side_tangent": [
+    false,
+    2.1,
+    66.6
+   ]
+  },
+  {
+   "r": 0.1,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    12.6,
+    2.0
+   ],
+   "top_close_radial": [
+    false,
+    27.8,
+    1.4
+   ],
+   "side_radial": [
+    false,
+    56.7,
+    59.9
+   ],
+   "side_radial_roll90": [
+    false,
+    40.1,
+    62.3
+   ],
+   "side_tangent": [
+    false,
+    20.5,
+    83.4
+   ]
+  },
+  {
+   "r": 0.1,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    2.3,
+    0.3
+   ],
+   "top_close_radial": [
+    false,
+    10.0,
+    0.8
+   ],
+   "side_radial": [
+    false,
+    1.4,
+    35.2
+   ],
+   "side_radial_roll90": [
+    false,
+    18.2,
+    25.0
+   ],
+   "side_tangent": [
+    false,
+    2.1,
+    66.6
+   ]
+  },
+  {
+   "r": 0.1,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    77.9,
+    32.9
+   ],
+   "top_close_radial": [
+    false,
+    128.0,
+    73.5
+   ],
+   "side_radial": [
+    false,
+    67.8,
+    42.3
+   ],
+   "side_radial_roll90": [
+    false,
+    55.9,
+    43.5
+   ],
+   "side_tangent": [
+    false,
+    80.1,
+    92.7
+   ]
+  },
+  {
+   "r": 0.1,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    44.2,
+    106.9
+   ],
+   "top_close_radial": [
+    false,
+    52.8,
+    60.0
+   ],
+   "side_radial": [
+    false,
+    9.9,
+    31.6
+   ],
+   "side_radial_roll90": [
+    false,
+    18.3,
+    25.1
+   ],
+   "side_tangent": [
+    false,
+    2.1,
+    66.6
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    18.7,
+    75.7
+   ],
+   "side_radial_roll90": [
+    false,
+    17.2,
+    70.7
+   ],
+   "side_tangent": [
+    false,
+    5.4,
+    86.6
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    15.8,
+    70.0
+   ],
+   "side_radial_roll90": [
+    false,
+    15.2,
+    65.5
+   ],
+   "side_tangent": [
+    false,
+    3.6,
+    86.1
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    17.7,
+    71.1
+   ],
+   "side_radial_roll90": [
+    false,
+    20.7,
+    67.9
+   ],
+   "side_tangent": [
+    false,
+    11.9,
+    87.5
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    20.4,
+    67.9
+   ],
+   "side_radial_roll90": [
+    false,
+    19.6,
+    63.3
+   ],
+   "side_tangent": [
+    false,
+    4.8,
+    85.5
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    22.8,
+    10.5
+   ],
+   "top_close_radial": [
+    false,
+    30.2,
+    14.0
+   ],
+   "side_radial": [
+    false,
+    12.8,
+    56.1
+   ],
+   "side_radial_roll90": [
+    false,
+    17.8,
+    55.6
+   ],
+   "side_tangent": [
+    false,
+    21.4,
+    91.2
+   ]
+  },
+  {
+   "r": 0.15,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    15.7,
+    8.1
+   ],
+   "top_close_radial": [
+    false,
+    19.4,
+    10.0
+   ],
+   "side_radial": [
+    false,
+    21.3,
+    58.1
+   ],
+   "side_radial_roll90": [
+    false,
+    20.1,
+    53.1
+   ],
+   "side_tangent": [
+    false,
+    6.2,
+    83.8
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    4.5,
+    49.3
+   ],
+   "side_radial_roll90": [
+    false,
+    5.1,
+    44.8
+   ],
+   "side_tangent": [
+    false,
+    1.4,
+    91.7
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    4.0,
+    32.5
+   ],
+   "side_radial_roll90": [
+    false,
+    5.1,
+    27.2
+   ],
+   "side_tangent": [
+    false,
+    4.5,
+    83.0
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    15.3,
+    52.0
+   ],
+   "side_radial_roll90": [
+    false,
+    13.8,
+    47.3
+   ],
+   "side_tangent": [
+    false,
+    1.5,
+    91.7
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    11.5,
+    45.4
+   ],
+   "side_radial_roll90": [
+    false,
+    10.5,
+    40.5
+   ],
+   "side_tangent": [
+    false,
+    3.3,
+    84.5
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    5.8,
+    4.2
+   ],
+   "top_close_radial": [
+    false,
+    6.6,
+    4.6
+   ],
+   "side_radial": [
+    false,
+    19.9,
+    45.0
+   ],
+   "side_radial_roll90": [
+    false,
+    17.7,
+    40.2
+   ],
+   "side_tangent": [
+    false,
+    2.1,
+    91.5
+   ]
+  },
+  {
+   "r": 0.2,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    5.0,
+    4.1
+   ],
+   "top_close_radial": [
+    false,
+    5.0,
+    4.0
+   ],
+   "side_radial": [
+    false,
+    17.8,
+    40.1
+   ],
+   "side_radial_roll90": [
+    false,
+    16.0,
+    34.9
+   ],
+   "side_tangent": [
+    false,
+    5.4,
+    83.7
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    9.9,
+    25.4
+   ],
+   "side_radial_roll90": [
+    false,
+    7.8,
+    22.0
+   ],
+   "side_tangent": [
+    false,
+    1.3,
+    91.0
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    10.7,
+    23.4
+   ],
+   "side_radial_roll90": [
+    false,
+    8.5,
+    19.5
+   ],
+   "side_tangent": [
+    false,
+    3.6,
+    83.8
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    5.1,
+    17.5
+   ],
+   "side_radial_roll90": [
+    false,
+    3.7,
+    14.1
+   ],
+   "side_tangent": [
+    false,
+    1.4,
+    90.5
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.0
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    5.8,
+    16.7
+   ],
+   "side_radial_roll90": [
+    false,
+    4.2,
+    12.4
+   ],
+   "side_tangent": [
+    false,
+    2.7,
+    83.3
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    5.7,
+    6.6
+   ],
+   "top_close_radial": [
+    false,
+    4.7,
+    5.1
+   ],
+   "side_radial": [
+    true,
+    0.4,
+    2.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.3,
+    3.2
+   ],
+   "side_tangent": [
+    false,
+    1.8,
+    89.4
+   ]
+  },
+  {
+   "r": 0.25,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    6.1,
+    7.9
+   ],
+   "top_close_radial": [
+    false,
+    5.2,
+    6.4
+   ],
+   "side_radial": [
+    true,
+    0.2,
+    7.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.1,
+    4.0
+   ],
+   "side_tangent": [
+    false,
+    1.3,
+    82.4
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.1
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.0
+   ],
+   "side_radial": [
+    false,
+    9.4,
+    12.2
+   ],
+   "side_radial_roll90": [
+    false,
+    6.8,
+    10.1
+   ],
+   "side_tangent": [
+    false,
+    1.3,
+    89.9
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.0,
+    0.7
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial": [
+    false,
+    7.2,
+    9.9
+   ],
+   "side_radial_roll90": [
+    false,
+    4.8,
+    6.9
+   ],
+   "side_tangent": [
+    false,
+    4.1,
+    84.2
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    1.0,
+    2.3
+   ],
+   "top_close_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial": [
+    false,
+    4.5,
+    6.7
+   ],
+   "side_radial_roll90": [
+    false,
+    2.5,
+    4.8
+   ],
+   "side_tangent": [
+    false,
+    1.7,
+    90.1
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    1.7,
+    5.3
+   ],
+   "top_close_radial": [
+    true,
+    1.0,
+    2.4
+   ],
+   "side_radial": [
+    false,
+    2.5,
+    6.6
+   ],
+   "side_radial_roll90": [
+    true,
+    0.6,
+    3.4
+   ],
+   "side_tangent": [
+    false,
+    3.1,
+    84.0
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    false,
+    6.6,
+    14.1
+   ],
+   "top_close_radial": [
+    false,
+    6.2,
+    11.4
+   ],
+   "side_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.6
+   ],
+   "side_tangent": [
+    false,
+    1.8,
+    90.5
+   ]
+  },
+  {
+   "r": 0.3,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    false,
+    6.0,
+    16.1
+   ],
+   "top_close_radial": [
+    false,
+    6.0,
+    13.6
+   ],
+   "side_radial": [
+    true,
+    0.1,
+    5.8
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    3.3
+   ],
+   "side_tangent": [
+    false,
+    1.8,
+    83.6
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.02,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.3,
+    13.2
+   ],
+   "top_close_radial": [
+    true,
+    0.2,
+    8.9
+   ],
+   "side_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.2
+   ],
+   "side_tangent": [
+    true,
+    0.3,
+    90.5
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.02,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.4,
+    17.2
+   ],
+   "top_close_radial": [
+    true,
+    0.3,
+    13.3
+   ],
+   "side_radial": [
+    true,
+    0.1,
+    4.9
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.8
+   ],
+   "side_tangent": [
+    false,
+    1.0,
+    84.5
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.05,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.4,
+    16.3
+   ],
+   "top_close_radial": [
+    true,
+    0.2,
+    12.2
+   ],
+   "side_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.2
+   ],
+   "side_tangent": [
+    true,
+    0.3,
+    90.6
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.05,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.4,
+    20.1
+   ],
+   "top_close_radial": [
+    true,
+    0.4,
+    16.3
+   ],
+   "side_radial": [
+    true,
+    0.1,
+    4.9
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.8
+   ],
+   "side_tangent": [
+    false,
+    1.2,
+    84.5
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.1,
+   "phi": 0.0,
+   "top_close_tangent": [
+    true,
+    0.5,
+    23.9
+   ],
+   "top_close_radial": [
+    false,
+    2.1,
+    20.8
+   ],
+   "side_radial": [
+    true,
+    0.0,
+    0.1
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.2
+   ],
+   "side_tangent": [
+    true,
+    0.6,
+    90.9
+   ]
+  },
+  {
+   "r": 0.35,
+   "z": 0.1,
+   "phi": 45.0,
+   "top_close_tangent": [
+    true,
+    0.6,
+    27.4
+   ],
+   "top_close_radial": [
+    true,
+    0.5,
+    23.6
+   ],
+   "side_radial": [
+    true,
+    0.1,
+    4.9
+   ],
+   "side_radial_roll90": [
+    true,
+    0.0,
+    2.8
+   ],
+   "side_tangent": [
+    true,
+    0.9,
+    84.5
+   ]
+  }
+ ]
+}

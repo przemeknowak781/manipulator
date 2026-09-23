@@ -179,11 +179,21 @@ Kawałki istnieją; brakuje polecenia i intrynsyk.
 
 ### 5.4 Rekonstrukcja 3D z biurka i dobór chwytu
 
-Rozpoznanie (modele Mety: SAM 3, SAM 3D, VGGT, MapAnything; chwyty dla szczęki
-SO-101) było w toku w chwili zapisu tego pliku. Jeśli zdążyło, leży w
-`docs/RESEARCH_3D.md` (osobny commit); jeśli tego pliku nie ma — do powtórzenia
-na Sparku. Znane z góry: pozy kamer mamy, więc rekonstrukcja nie musi ich
-zgadywać; obiekty trafią do sceny przez `MjSpec` (siatka + dekompozycja wypukła).
+Raport: **[docs/RESEARCH_3D.md](docs/RESEARCH_3D.md)**, prototypy z pomiarami:
+[`research/3d/`](research/3d/). Najważniejsze:
+
+- **Pierwszy krok bez sieci neuronowych, na CPU**: maski z różnicy względem
+  pustego stołu + render ramienia z bliźniaka → wspólna otoczka wizualna ze
+  znanych póz kamer (1,3–2,3 s, 94–100% pokrycia bryły) → CoACD → obiekt
+  w scenie → chwyt analityczny sprawdzony w MuJoCo.
+- **Piksele ramienia to „nie wiem", nie tło** — inaczej otoczka gubi do 85% obiektu.
+- **SO-101 chwyta tylko w pionowej płaszczyźnie przez oś podstawy** (5 osi);
+  z góry dla r = 15–30 cm, z boku dopiero od 25 cm. Szczęka na zawiasie:
+  klocek 60 mm chwycony w środku wypada, przesunięty na stałą szczękę — trzyma.
+- Z Mety: SAM 3.1 (maski z tekstu), MapAnything (jedyny, który bierze nasze
+  pozy kamer i daje skalę; wariant wag na Apache), SAM 3D Objects (domykanie
+  kształtu, ≥ 32 GB — na Sparku, ale kaolin trzeba zbudować pod sm_121).
+- Do rozstrzygnięcia: komercyjność projektu (połowa modeli ma licencje NC).
 
 ### 5.5 Drobniejsze
 

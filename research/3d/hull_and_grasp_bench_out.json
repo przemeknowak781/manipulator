@@ -1,0 +1,184 @@
+{
+ "gemm_fp32_gflops": null,
+ "build_scene_empty_s": 1.168,
+ "build_scene_4_objects_s": 0.265,
+ "convex_parts_total": 22,
+ "recompile_after_adding_object_s": 0.154,
+ "sim_steps_per_s": 6484,
+ "sim_realtime_factor": 32.4,
+ "timestep_s": 0.005,
+ "ncon_resting": 22,
+ "tip_gap_mm": {
+  "0": 4.1,
+  "25": 40.3,
+  "50": 76.3,
+  "75": 107.9,
+  "100": 133.4
+ },
+ "seg_render_per_cam_ms": 40.1,
+ "joint_hull_4cams_2.5mm": {
+  "ideal_arm_hidden": {
+   "voxels": 1647360,
+   "carve_s": 2.31,
+   "mug": {
+    "hull_over_true_volume": 4.99,
+    "recall_true_inside_hull": 0.988,
+    "precision": 0.198
+   },
+   "box": {
+    "hull_over_true_volume": 1.22,
+    "recall_true_inside_hull": 0.999,
+    "precision": 0.817
+   },
+   "can": {
+    "hull_over_true_volume": 1.17,
+    "recall_true_inside_hull": 1.0,
+    "precision": 0.855
+   },
+   "pen": {
+    "hull_over_true_volume": 1.08,
+    "recall_true_inside_hull": 0.943,
+    "precision": 0.871
+   },
+   "block": {
+    "hull_over_true_volume": 1.37,
+    "recall_true_inside_hull": 0.999,
+    "precision": 0.729
+   }
+  },
+  "arm_at_home_robot_unknown": {
+   "voxels": 1647360,
+   "carve_s": 1.27,
+   "mug": {
+    "hull_over_true_volume": 5.94,
+    "recall_true_inside_hull": 0.99,
+    "precision": 0.166
+   },
+   "box": {
+    "hull_over_true_volume": 1.37,
+    "recall_true_inside_hull": 0.999,
+    "precision": 0.729
+   },
+   "can": {
+    "hull_over_true_volume": 1.2,
+    "recall_true_inside_hull": 1.0,
+    "precision": 0.832
+   },
+   "pen": {
+    "hull_over_true_volume": 1.59,
+    "recall_true_inside_hull": 0.943,
+    "precision": 0.594
+   },
+   "block": {
+    "hull_over_true_volume": 2.56,
+    "recall_true_inside_hull": 0.999,
+    "precision": 0.391
+   }
+  },
+  "arm_at_home_robot_as_background": {
+   "voxels": 1647360,
+   "carve_s": 1.46,
+   "mug": {
+    "hull_over_true_volume": 0.42,
+    "recall_true_inside_hull": 0.145,
+    "precision": 0.346
+   },
+   "box": {
+    "hull_over_true_volume": 0.68,
+    "recall_true_inside_hull": 0.55,
+    "precision": 0.812
+   },
+   "can": {
+    "hull_over_true_volume": 0.93,
+    "recall_true_inside_hull": 0.785,
+    "precision": 0.847
+   },
+   "pen": {
+    "hull_over_true_volume": 1.08,
+    "recall_true_inside_hull": 0.943,
+    "precision": 0.871
+   },
+   "block": {
+    "hull_over_true_volume": 1.33,
+    "recall_true_inside_hull": 0.976,
+    "precision": 0.732
+   }
+  }
+ },
+ "grasp_trials": {
+  "block60_tcp_at_centre_open100": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 0.0,
+   "lifted_mm": 0.0,
+   "success": false,
+   "ik_s": 0.03,
+   "sim_s": 0.099,
+   "sim_steps": 820
+  },
+  "block60_fixed_jaw_offset_open100": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 44.6,
+   "lifted_mm": 35.6,
+   "success": true,
+   "ik_s": 0.03,
+   "sim_s": 0.116,
+   "sim_steps": 820
+  },
+  "block60_fixed_jaw_offset_open60": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 44.7,
+   "lifted_mm": 33.9,
+   "success": true,
+   "ik_s": 0.03,
+   "sim_s": 0.138,
+   "sim_steps": 820
+  },
+  "block40_fixed_jaw_offset_open45": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 25.9,
+   "lifted_mm": 37.6,
+   "success": true,
+   "ik_s": 0.03,
+   "sim_s": 0.135,
+   "sim_steps": 820
+  },
+  "block60_offset_open60_flipped_side": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 44.8,
+   "lifted_mm": 35.7,
+   "success": true,
+   "ik_s": 0.03,
+   "sim_s": 0.126,
+   "sim_steps": 820
+  },
+  "pen_offset_open30": {
+   "ik_ok": true,
+   "rot_err_deg": 0.0,
+   "gripper_after_close_0_100": 0.0,
+   "lifted_mm": 0.2,
+   "success": false,
+   "ik_s": 0.06,
+   "sim_s": 0.081,
+   "sim_steps": 820
+  },
+  "mug_wall_grasp_2cm_below_rim": {
+   "ik_ok": false,
+   "ik_s": 1.12,
+   "pos_err_mm": [
+    9.8,
+    2.2,
+    9.8
+   ],
+   "rot_err_deg": [
+    17.6,
+    16.3,
+    17.6
+   ]
+  }
+ }
+}
