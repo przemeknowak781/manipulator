@@ -1,0 +1,13 @@
+{
+  "opis": "Oryginalne limity kata (EEPROM, rejestry Min/Max_Angle_Limit 9/11) serw ramienia nr 1 SPRZED rozszerzenia do 0..4095 w dniu 2026-08-31. Odtworzone z logu sesji - plik kopii zapasowej z katalogu tymczasowego nie przetrwal. Przywrocenie: dla kazdego serwa Lock=0, zapis min/max, Lock=1 (patrz HANDOFF.md).",
+  "ramie": "SO-101, przejsciowka CH343 USB\\VID_1A86&PID_55D3\\5AAF219949 (wtedy COM11)",
+  "tiki_na_obrot": 4096,
+  "limity": {
+    "1": {"staw": "shoulder_pan", "min": 942, "max": 2977},
+    "2": {"staw": "shoulder_lift", "min": 2025, "max": 3006},
+    "3": {"staw": "elbow_flex", "min": 0, "max": 4095},
+    "4": {"staw": "wrist_flex", "min": 2025, "max": 2858},
+    "5": {"staw": "wrist_roll", "min": 0, "max": 4095},
+    "6": {"staw": "gripper", "min": 1986, "max": 2670}
+  }
+}

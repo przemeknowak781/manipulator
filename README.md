@@ -16,6 +16,12 @@ gestów, zanim cokolwiek podłączysz.
                             └──────────────────────┘
 ```
 
+> **Nowe: cyfrowy bliźniak stanowiska.** Symulacja MuJoCo z kamerami
+> skalibrowanymi na prawdziwym biurku (karta z tagami w chwytaku, wiele kamer
+> naraz, 0,15 mm w symulacji), mapa stołu z wielu kamer i fundament pod
+> środowisko RL. Instrukcja: **[docs/TWIN.md](docs/TWIN.md)**, stan prac
+> i następne kroki: **[HANDOFF.md](HANDOFF.md)**.
+
 ---
 
 ## Szybki start
