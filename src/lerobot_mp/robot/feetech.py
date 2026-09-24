@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 INST_PING = 0x01
 INST_READ = 0x02
 INST_WRITE = 0x03
+INST_SYNC_READ = 0x82
 INST_SYNC_WRITE = 0x83
 BROADCAST_ID = 0xFE
 
@@ -89,7 +90,15 @@ class FeetechBus:
                 "Backend `feetech` wymaga biblioteki pyserial. "
                 'Zainstaluj:  pip install -e ".[feetech]"'
             ) from exc
-        self._link = serial.Serial(self.port, self.baudrate, timeout=self.timeout, write_timeout=1.0)
+        if "://" in self.port:
+            # `socket://adres:5555` - most `lerobot-mp-bridge` na maszynie przy ramieniu.
+            # Maszyna zdalna (np. Shadow) nie potrzebuje wtedy sterownika wirtualnego
+            # portu COM. Limit odpowiedzi rosnie o czas przebiegu przez siec.
+            self.timeout = max(self.timeout, 0.25)
+            self._link = serial.serial_for_url(self.port, baudrate=self.baudrate, timeout=self.timeout,
+                                               write_timeout=1.0)
+        else:
+            self._link = serial.Serial(self.port, self.baudrate, timeout=self.timeout, write_timeout=1.0)
         self._link.reset_input_buffer()
         self._link.reset_output_buffer()
 
@@ -137,6 +146,22 @@ class FeetechBus:
         self._send(dev_id, INST_WRITE, bytes([addr]) + value.to_bytes(length, "little"))
         self._receive(dev_id)
 
+    def sync_read(self, addr: int, length: int, ids: list[int]) -> dict[int, int]:
+        """Jeden pakiet, odpowiedz kazdego serwa po kolei - {id: wartosc} dla tych, ktore odpowiedzialy.
+
+        Przez most sieciowy to jeden przebieg tam i z powrotem zamiast szesciu:
+        przy 20 ms RTT odczyt ramienia kosztuje 20 ms, a nie 120.
+        """
+        params = bytes([addr, length, *ids])
+        self._send(BROADCAST_ID, INST_SYNC_READ, params)
+        out: dict[int, int] = {}
+        for dev_id in ids:
+            data = self._receive(dev_id)
+            if data is None or len(data) < length:
+                break                       # kolejne odpowiedzi i tak sie przesunely - reszte odrzucamy
+            out[dev_id] = int.from_bytes(data[:length], "little")
+        return out
+
     def sync_write(self, addr: int, length: int, values: dict[int, int]) -> None:
         """Jeden pakiet dla wszystkich serw naraz - bez odpowiedzi, wiec bez czekania.
 
@@ -171,6 +196,8 @@ class FeetechArm(RobotBackend):
         self._positions: dict[str, float] = {}
         #: Limity odczytane z serw [tiki]. Pusty wpis = serwo nie ogranicza.
         self.servo_limits: dict[str, tuple[int, int]] = {}
+        self._sync_read_ok = True
+        self._sync_misses = 0
         self.info = RobotInfo(
             name="SO-101 (feetech)",
             description=f"port {rc.port} @ {rc.baudrate} bd",
@@ -309,6 +336,17 @@ class FeetechArm(RobotBackend):
     def read_joints(self) -> dict[str, float]:
         if not self._connected:
             raise RuntimeError("Ramie nie jest polaczone")
+        if self._sync_read_ok:
+            got = self.bus.sync_read(ADDR_PRESENT_POSITION, 2, list(self.ids.values()))
+            if len(got) == len(self.ids):
+                for name, dev_id in self.ids.items():
+                    self._positions[name] = self._to_units(name, got[dev_id])
+                return dict(self._positions)
+            self._sync_misses += 1
+            if self._sync_misses >= 3:
+                # Starsze wersje firmware'u nie znaja SYNC READ - wtedy zostajemy przy odczytach po kolei.
+                self._sync_read_ok = False
+                logger.info("Serwa nie odpowiadaja na SYNC READ - odczyt po kolei.")
         for name, dev_id in self.ids.items():
             ticks = self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2)
             if ticks is not None:

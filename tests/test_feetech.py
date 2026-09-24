@@ -21,6 +21,7 @@ from lerobot_mp.robot.feetech import (
     BROADCAST_ID,
     INST_PING,
     INST_READ,
+    INST_SYNC_READ,
     INST_SYNC_WRITE,
     INST_WRITE,
     FeetechArm,
@@ -33,6 +34,9 @@ REST_TICKS = 2048
 
 class FakeBusLink:
     """Szesc serw na jednej magistrali - tyle protokolu, ile backend uzywa."""
+
+    #: Starszy firmware nie zna SYNC READ i po prostu milczy.
+    knows_sync_read = True
 
     def __init__(self, ids=(1, 2, 3, 4, 5, 6), start_ticks: int = REST_TICKS):
         self.registers = {
@@ -99,6 +103,14 @@ class FakeBusLink:
             self.registers[dev_id][addr] = value
             self.log.append(("write", dev_id, addr, value))
             self._reply(dev_id, b"")
+        elif instruction == INST_SYNC_READ:
+            assert dev_id == BROADCAST_ID, "sync read musi isc rozgloszeniowo"
+            addr, size = params[0], params[1]
+            self.log.append(("syncread", None, addr, tuple(params[2:])))
+            if self.knows_sync_read:
+                for target in params[2:]:
+                    if target in self.registers:
+                        self._reply(target, self.registers[target].get(addr, 0).to_bytes(size, "little"))
         elif instruction == INST_SYNC_WRITE:
             assert dev_id == BROADCAST_ID, "sync write musi isc rozgloszeniowo"
             addr, size = params[0], params[1]
@@ -246,6 +258,51 @@ def test_a_lost_reply_keeps_the_previous_position(arm_cfg):
 
     link.read = drop_first
     assert arm.read_joints()["shoulder_pan"] == pytest.approx(before)
+
+
+def test_joints_are_read_with_one_sync_read_packet(arm_cfg):
+    """Przez most sieciowy kazda transakcja to przebieg tam i z powrotem - jeden zamiast szesciu."""
+    arm, link = connected(arm_cfg)
+    link.registers[3][ADDR_PRESENT_POSITION] = 2048 + 256
+    link.log.clear()
+    positions = arm.read_joints()
+    assert len(link.ops("syncread")) == 1
+    assert link.ops("read") == []
+    assert positions["elbow_flex"] == pytest.approx(22.5)
+
+
+def test_old_firmware_without_sync_read_falls_back_to_single_reads(arm_cfg):
+    link = FakeBusLink()
+    link.knows_sync_read = False
+    arm, _ = connected(arm_cfg, link)
+    link.registers[2][ADDR_PRESENT_POSITION] = 2048 - 512
+    for _ in range(4):
+        positions = arm.read_joints()
+        assert positions["shoulder_lift"] == pytest.approx(-45.0)
+    link.log.clear()
+    arm.read_joints()
+    assert link.ops("syncread") == []                   # po kilku ciszach juz nie probuje
+    assert len(link.ops("read")) == 6
+
+
+def test_socket_url_opens_through_pyserial_url_handler(monkeypatch):
+    """`socket://adres:port` (most lerobot-mp-bridge) - bez sterownika wirtualnego COM."""
+    serial = pytest.importorskip("serial")
+    seen = {}
+
+    class Link:
+        def reset_input_buffer(self): ...
+        def reset_output_buffer(self): ...
+
+    def fake_for_url(url, **kw):
+        seen["url"], seen["timeout"] = url, kw["timeout"]
+        return Link()
+
+    monkeypatch.setattr(serial, "serial_for_url", fake_for_url)
+    bus = FeetechBus("socket://10.0.0.5:5555")
+    bus.open()
+    assert seen["url"] == "socket://10.0.0.5:5555"
+    assert seen["timeout"] >= 0.25
 
 
 def test_disconnect_leaves_the_arm_holding_by_default(arm_cfg):
