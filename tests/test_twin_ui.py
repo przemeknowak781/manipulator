@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -480,15 +481,15 @@ def test_sysid_fit_survives_stop_and_reconnect_and_fixed_params_are_not_called_f
 
     go = threading.Event()
 
-    def slow_fit(rec, on_progress=None):
+    def slow_fit(rec, on_progress=None, **kw):
         go.wait(10.0)
         dyn = Dynamics(damping=0.9, armature=1.2, delay=0.5, source="test", fit_deg=0.4)
         if hasattr(dyn, "fitted"):
             dyn.fitted = ("damping", "armature", "delay")
-        return dyn, 1.5
+        return SimpleNamespace(dyn=dyn, base=1.5, band={"damping": 0.08, "armature": 0.1, "delay": 0.004})
 
     monkeypatch.setattr(sysid, "record", lambda twin, plan, **kw: "nagranie")
-    monkeypatch.setattr(sysid, "fit", slow_fit)
+    monkeypatch.setattr(sysid, "identify", slow_fit)
     app.twin.connect("sim", threaded=False)
     app._take_arm(jobs.SYSID_OWNER, preempt=app.sysid_job.stop)
     app.sysid_job.start(lambda job: jobs.run_sysid(job, app.twin))
@@ -505,10 +506,11 @@ def test_sysid_fit_survives_stop_and_reconnect_and_fixed_params_are_not_called_f
     assert app.sysid_job.wait(10.0) and app.sysid_job.state == jobs.DONE
     app._tick_training()
     txt = app.dyn_res.content
-    assert app.dyn_keep.visible and "Dopasowano: " in txt
+    assert app.dyn_keep.visible and not app.dyn_keep.disabled and "Dopasowano: " in txt
     fitted, fixed = txt.split("z modelu")
-    assert "tlumienie x0.90" in fitted and "armatura x1.20" in fitted and "kp" not in fitted
+    assert "tlumienie x0.90 (+-8%)" in fitted and "armatura x1.20 (+-10%)" in fitted and "kp" not in fitted
     assert "kp x1.00" in fixed and "tarcie x1.00" in fixed
+    assert "Nagrane na: **sim**" in txt and "nic nie wyjasnia" not in txt
 
 
 def test_sysid_stopped_during_recording_ends_as_cancelled_and_says_so(app, monkeypatch):
@@ -523,7 +525,7 @@ def test_sysid_stopped_during_recording_ends_as_cancelled_and_says_so(app, monke
         return "nagranie"                                        # nagranie skonczone w chwili STOP
 
     monkeypatch.setattr(sysid, "record", record)
-    monkeypatch.setattr(sysid, "fit", lambda rec, on_progress=None: fits.append(1))
+    monkeypatch.setattr(sysid, "identify", lambda rec, on_progress=None, **kw: fits.append(1))
     app.twin.connect("sim", threaded=False)
     app.sysid_job.start(lambda job: jobs.run_sysid(job, app.twin))
     time.sleep(0.05)
@@ -615,3 +617,176 @@ def test_status_bar_shows_arm_warnings(app, monkeypatch):
     st.warnings = ["chwytak: kalibracja LeRobota rozni sie od blizniaka o 60 tikow"]
     monkeypatch.setattr(app.twin, "status", st)
     assert "Uwaga:** chwytak: kalibracja" in app._status_text()
+
+
+# ------------------------------------------------------------------ runda 3b
+@pytest.mark.parametrize("action", ["stop", "home", "home_twin", "halt", "reconnect"])
+def test_stop_home_or_halt_while_the_policy_loads_never_lets_it_drive(app, monkeypatch, action):
+    """STOP/Dom 0,1 s po Uruchom trafialy w okno ladowania polityki (108-142 ms): STOP szedl do
+    starego runnera, nowa polityka brala ramie pod STOP-em, a po Skasuj STOP jechala - 83,7 st.
+    ruchu stawu (verify2, s15d); Dom byl przerywany przez `claim` polityki (s15c)."""
+    from lerobot_mp.twin.rl import policy as P
+
+    app.twin.connect("sim", threaded=False)
+    app._refresh_policies()
+    app.pol_pick.value = next(o for o in app.pol_pick.options if "reach" in o)
+    real = P.Policy.load
+    press = {"stop": lambda: app._emergency_stop(None), "home": lambda: app._go_home(),
+             "home_twin": lambda: app.twin.home(), "halt": lambda: app._halt_policy(),
+             "reconnect": lambda: app._connect("sim", None, threaded=False)}[action]
+
+    def load(path, device="cpu"):
+        pol = real(path, device)
+        press()                                             # operator klika w trakcie ladowania
+        return pol
+    monkeypatch.setattr(P.Policy, "load", staticmethod(load))
+    with pytest.raises(RuntimeError, match="aktywny STOP|w trakcie startu"):
+        app._start_policy(_Event())
+    assert app.twin.owner is None and not app.runner.status.running and not app.twin._engaged
+    assert "nie ruszyla" in app.runner.status.stopped_because
+    if action == "stop":
+        app.twin.clear_estop()                              # Skasuj STOP
+    start = dict(app.twin.joints())
+    for _ in range(100):
+        app.twin.step(0.02)
+    assert app.twin.owner is None and not app.runner.status.running
+    if action.startswith("home"):                           # Dom jedzie swoja rampa - polityka jej nie przerwala
+        assert app.twin.safety_state.value in ("HOMING", "IDLE")
+    else:
+        assert max(abs(app.twin.joints()[k] - start[k]) for k in start) < 1.0
+    # To samo dla fali i identyfikacji (`_take_arm` z chwila startu).
+    mark = app._motion_mark()
+    press()
+    if action == "stop":
+        app.twin.clear_estop()
+    with pytest.raises(RuntimeError, match="w trakcie startu"):
+        app._take_arm(jobs.SYSID_OWNER, mark=mark)
+    assert app.twin.owner is None
+
+
+def _record_until_stopped(twin, plan, should_stop=None, **kw):
+    t_end = time.monotonic() + 5.0
+    while not should_stop() and time.monotonic() < t_end:
+        time.sleep(0.01)
+    raise RuntimeError("identyfikacja przerwana")            # jak `sysid.record` po `should_stop`
+
+
+@pytest.mark.parametrize("how", ["stop", "home", "fault"])
+def test_sysid_recording_stopped_by_the_operator_is_cancelled_not_an_error(app, monkeypatch, how):
+    """STOP albo Dom w nagraniu dawaly "**Blad**: RuntimeError: identyfikacja przerwana" (verify2, s6);
+    STOP od bledu serwa zostaje bledem - z powodem."""
+    import lerobot_mp.twin.rl.sysid as sysid
+
+    monkeypatch.setattr(sysid, "record", _record_until_stopped)
+    app.twin.connect("sim", threaded=False)
+    app._take_arm(jobs.SYSID_OWNER, preempt=app.sysid_job.stop)
+    app.sysid_job.start(lambda job: jobs.run_sysid(job, app.twin))
+    time.sleep(0.05)
+    {"stop": lambda: app._emergency_stop(None), "home": app._go_home,
+     "fault": lambda: app.twin.estop("elbow_flex (serwo 3): przegrzanie")}[how]()
+    try:
+        assert app.sysid_job.wait(5.0)
+        app._tick_training()
+        txt = app.dyn_res.content
+        if how == "fault":
+            assert app.sysid_job.state == jobs.FAILED and "przegrzanie" in app.sysid_job.error
+            assert txt.startswith("**Blad**") and "przegrzanie" in txt
+        else:
+            assert app.sysid_job.state == jobs.CANCELLED
+            assert txt.startswith("**Przerwane**") and ("STOP z panelu" if how == "stop" else "pozycja domowa") in txt
+        assert not app.dyn_keep.visible
+    finally:
+        app.twin.clear_estop()
+
+
+def test_wave_stopped_by_the_operator_is_cancelled_not_an_error(app, monkeypatch):
+    """STOP w trakcie fali: "**blad**: RuntimeError: fala przerwana - ramie odebrane (STOP z panelu)" (s8)."""
+    import lerobot_mp.twin.calib.session as session_mod
+
+    home = dict(app.ws.spec().home)
+    app.twin.connect("sim", threaded=False)
+
+    class StoppedSession:
+        def __init__(self, robot, *a, **kw):
+            self.robot, self.done = robot, False
+
+        def step(self):
+            app._emergency_stop(None)                        # operator: STOP miedzy przejazdami
+            self.robot.move(home, 0.2)
+
+    monkeypatch.setattr(session_mod, "Session", StoppedSession)
+    app._take_arm(jobs.CALIB_OWNER, preempt=app.calib_job.stop)
+    app.calib_job.start(lambda job: jobs.run_card_calibration(job, app.twin, [], quick=True))
+    try:
+        assert app.calib_job.wait(60.0)
+        assert app.calib_job.state == jobs.CANCELLED and app.calib_job.result is None
+        app._tick_calibration()
+        assert app.calib_md.content.startswith("**Przerwane**: STOP z panelu")
+    finally:
+        app.twin.clear_estop()
+
+
+def test_a_fit_that_explains_nothing_shows_its_band_and_needs_a_confirmation_to_save(app, monkeypatch):
+    """Panel proponowal "Zapisz" dla dopasowania 0,55 -> 0,51 st. z armatura +-inf, pasma nie pokazywal,
+    a trening centrowal sie potem na armaturze x0,45 przy prawdzie 1,0 (verify2, s6)."""
+    import lerobot_mp.twin.rl.sysid as sysid
+    from lerobot_mp.twin.rl.randomize import Dynamics
+    from lerobot_mp.twin.ui import guide as gd
+
+    def identify(rec, on_progress=None, **kw):
+        dyn = Dynamics(damping=1.25, armature=0.45, delay=0.02, fit_deg=0.51,
+                       source="identyfikacja 2026-09-24T10:00:00 (sim); niepewnosc: x")
+        dyn.fitted = ("damping", "armature", "delay")
+        return SimpleNamespace(dyn=dyn, base=0.55, band={"damping": 0.6, "armature": float("inf"),
+                                                         "delay": float("inf")})
+
+    monkeypatch.setattr(sysid, "record", lambda twin, plan, **kw: SimpleNamespace(meta={"backend": "sim"}))
+    monkeypatch.setattr(sysid, "identify", identify)
+    app.ws.dynamics = {}
+    app.twin.connect("sim", threaded=False)
+    app._take_arm(jobs.SYSID_OWNER, preempt=app.sysid_job.stop)
+    app.sysid_job.start(lambda job: jobs.run_sysid(job, app.twin))
+    try:
+        assert app.sysid_job.wait(10.0) and app.sysid_job.state == jobs.DONE
+        app._tick_training()
+        txt = app.dyn_res.content
+        assert "tlumienie x1.25 (+-60%)" in txt and "armatura x0.45 (+-inf)" in txt
+        assert "nic nie wyjasnia" in txt and "Nagrane na: **sim**" in txt
+        assert app.dyn_keep.visible and app.dyn_keep.disabled and app.dyn_force.visible
+        assert "nic nie wyjasnia" in gd.build(app._guide_snapshot()).now
+        ev = _click(app, "Zapisz jako dynamike stanowiska")
+        assert ev.client.notes and "nic nie wyjasnia" in ev.client.notes[-1][1] and app.ws.dynamics == {}
+        app.dyn_force.value = True                          # operator potwierdza swiadomie
+        _click(app, "Zapisz jako dynamike stanowiska")
+        assert gd.USELESS_MARK in app.ws.dynamics["source"]
+        assert "nic nie wyjasnia" in app.dyn_md.content
+        steps = gd.build(app._guide_snapshot()).steps
+        assert steps[5].status != gd.DONE and "nic nie wyjasnia" in steps[5].detail
+    finally:
+        app.ws.dynamics = {}
+        app._show_dynamics()
+        app.dyn_force.value = app.dyn_force.visible = app.dyn_keep.visible = False
+
+
+def test_cube_tracker_gets_the_gripper_command_really_sent(app, monkeypatch):
+    """Restart z kostka w szczekach: tracker dostawal `runner.q_cmd[5]` = zmierzony kat szczeki,
+    nie widzial "sciska" i nie bral kostki "w dloni" (verify2, perception 3b)."""
+    import copy
+
+    from lerobot_mp.twin.rl import task as tk
+
+    seen = []
+    monkeypatch.setattr(app.cube_tracker, "update", lambda det, T, q, cmd, closed, now: seen.append(cmd))
+    kin = app._kin_vision
+    home = dict(app.ws.spec().home)
+    st = copy.copy(app.twin.status)
+    st.measured, st.command = dict(home, gripper=30.0), dict(home, gripper=5.0)
+    monkeypatch.setattr(app.twin, "status", st)
+    old = app.runner
+    try:
+        lim = tk.Limits.of(kin)
+        app.runner = SimpleNamespace(limits=lim, q_cmd=kin.to_q(st.measured))   # runner od pomiaru
+        app._vision_cube()
+        assert seen[-1] == pytest.approx(kin.to_q(dict(home, gripper=5.0))[5])
+    finally:
+        app.runner = old

@@ -206,6 +206,36 @@ class _CameraSubset:
 #: Wlasciciele ramienia (`Twin.claim`) zadan w tle.
 CALIB_OWNER, SYSID_OWNER = "kalibracja", "identyfikacja"
 
+#: Powody odebrania ramienia, ktore sa decyzja operatora (panel: STOP, Pozycja domowa,
+#: Polacz, Rozlacz) - zadanie jest wtedy PRZERWANE, a nie zakonczone bledem.
+DELIBERATE = ("STOP z panelu", "pozycja domowa", "ponowne laczenie", "rozlaczenie")
+
+
+def interrupted_by_operator(job: Job, twin, owner: str) -> str:
+    """Powod, gdy zadanie przerwal operator; "" = przerwal je blad (serwo, rozjazd, petla padla).
+
+    Zmierzone (verify2, s6/s8): STOP albo Dom w trakcie nagrania identyfikacji albo fali
+    konczyly zadanie jako "**Blad**: RuntimeError: identyfikacja przerwana" - operator, ktory
+    sam je zatrzymal, widzial awarie. Odebranie ramienia woluje `job.stop` (preempt), wiec
+    `cancel` jest ustawiony takze przy STOP-ie od bledu serwa - wtedy decyduje powod.
+    """
+    if not job.cancel.is_set():
+        return ""
+    reason = str(getattr(twin, "preempt_reason", "") or "")
+    if any(reason.startswith(d) for d in DELIBERATE):
+        return reason
+    if not reason or getattr(twin, "owner", None) == owner:
+        return "przerwane z panelu"                      # Przerwij / stop zadania przed odebraniem ramienia
+    return ""
+
+
+def _explain(exc: RuntimeError, twin) -> RuntimeError:
+    """Blad przerwanego zadania z powodem odebrania ramienia, gdy go w tresci nie ma."""
+    reason = str(getattr(twin, "preempt_reason", "") or "")
+    if reason and reason not in str(exc):
+        return RuntimeError(f"{exc} ({reason})")
+    return exc
+
 
 class _OwnedArm:
     """Ramie dla sesji kalibracji: kazdy przejazd tylko, gdy fala WCIAZ ma ramie.
@@ -271,6 +301,7 @@ def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False
                           nominal, checker, cfg, seed=int(time.time()) % 10_000)
         while not session.done:
             if job.cancel.is_set():
+                job.message = interrupted_by_operator(job, twin, CALIB_OWNER) or "fala przerwana"
                 return None
             rep = session.step()
             need = [min(o / cfg.min_obs, p / cfg.min_poses, s / cfg.min_spread) for o, p, s in rep.progress.values()]
@@ -280,6 +311,13 @@ def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False
                 f"{c} widzi {len(t)} tag." for c, t in rep.seen.items()) + (f" - {rep.note}" if rep.note else "")
         job.message = "dopasowanie"
         return session.solve()
+    except RuntimeError as exc:
+        # STOP, Dom, Polacz albo Przerwij w trakcie przejazdu - przerwane, nie blad.
+        why = interrupted_by_operator(job, twin, CALIB_OWNER)
+        if not why:
+            raise _explain(exc, twin) from exc
+        job.message = why
+        return None
     finally:
         if twin.owner == CALIB_OWNER:
             try:
@@ -287,6 +325,8 @@ def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False
                 # `job.stop`, ktory oznaczylby udana fale jako przerwana. Wiec bez niego.
                 twin.claim(CALIB_OWNER, preempt=None)
                 twin.home()
+            except RuntimeError:                           # np. aktywny STOP - ramie i tak stoi
+                logger.warning("Fala: bez jazdy do domu na koniec", exc_info=True)
             finally:
                 twin.release(CALIB_OWNER)
         if simulated:
@@ -331,17 +371,28 @@ def run_sysid(job: Job, twin) -> Any:
 
     Po nagraniu zadanie jest chronione (`Job.protect`): STOP, "Polacz" i "Rozlacz"
     przerywaja tylko nagranie - gotowe nagranie dopasowuje sie do konca i wynik
-    trafia do panelu. Przerwane przed koncem nagrania - wynik None ("przerwane").
+    trafia do panelu. Przerwane przed koncem nagrania - wynik None ("przerwane") z powodem
+    w `job.message`, gdy przerwal operator (STOP, Dom, Polacz); blad serwa - blad.
+
+    W `job.data` dla panelu: "base" (blad modelu nominalnego), "band" (niepewnosc dopasowanych
+    parametrow), "useful" i "useless_why" (`fit_verdict`), "backend" (na czym nagrano).
     """
-    from ..rl.sysid import excitation, fit, record
+    from ..rl.sysid import excitation, identify, record
 
     job.message = "ruch pobudzajacy (ramie sie rusza)"
+    job.data["backend"] = str(getattr(twin.status, "backend", "") or "")
     home = dict(twin.workspace.spec().home)
     try:
         # take=False: ramie wzial panel przed startem zadania; odebrane w tym czasie
         # (Dom, STOP, Polacz) nie jest brane z powrotem.
         rec = record(twin, excitation(home), on_tick=lambda p: setattr(job, "progress", 0.4 * p),
                      should_stop=job.cancel.is_set, take=False)
+    except RuntimeError as exc:
+        why = interrupted_by_operator(job, twin, SYSID_OWNER)
+        if not why:
+            raise _explain(exc, twin) from exc
+        job.message = f"{why} - nagranie odrzucone"
+        return None
     finally:
         # Sprawdzenie wlasciciela i sprzeglo razem, pod blokada wlasnosci w `Twin` - patrz `sysid.record`.
         twin.set_engaged(False, owner=SYSID_OWNER)
@@ -350,14 +401,50 @@ def run_sysid(job: Job, twin) -> Any:
         job.message = "przerwane w trakcie nagrania - nagranie odrzucone"
         return None
     job.data["recording"] = rec
+    meta = getattr(rec, "meta", None)
+    if isinstance(meta, dict) and meta.get("backend"):
+        job.data["backend"] = str(meta["backend"])
     job.message = "dopasowanie symulacji do nagrania (ramie juz wolne)"
 
     def prog(n, c):
         job.progress = min(0.99, 0.4 + 0.6 * n / 610)          # identify: ok. 609 symulacji
         job.message = f"dopasowanie: {n} symulacji, blad {c:.3f} st."
-    dyn, base = fit(rec, on_progress=prog)
-    job.data["base"] = base
-    return dyn
+    res = identify(rec, on_progress=prog)
+    useful, why = fit_verdict(res)
+    job.data.update(base=float(res.base), band=dict(getattr(res, "band", None) or {}), useful=useful,
+                    useless_why=why)
+    return res.dyn
+
+
+#: Dopasowanie "nic nie wyjasnia", gdy blad symulacji spada mniej niz do tylu razy bledu
+#: modelu nominalnego. Zmierzone (verify2, s6): 0,55 -> 0,51 st. i 0,34 -> 0,34 st. przy
+#: armaturze +-inf - panel i tak proponowal zapis, a trening centrowal sie na x0,45.
+MIN_FIT_GAIN = 0.8
+
+
+def fit_verdict(res) -> tuple[bool, str]:
+    """(czy wynik identyfikacji jest przydatny, dlaczego nie) - `FitResult.useful`, gdy jest (kontrakt E2).
+
+    Bez tego pola (identyfikacja sprzed E2): te same reguly tutaj - kazdy dopasowany parametr
+    z niepewnoscia `guide.MAX_BAND` lub mniej i blad dopasowania ponizej `MIN_FIT_GAIN` bledu modelu.
+    """
+    from .guide import MAX_BAND
+
+    dyn = res.dyn
+    band = dict(getattr(res, "band", None) or getattr(dyn, "band", None) or {})
+    why = []
+    wide = [n for n in (getattr(dyn, "fitted", None) or ()) if n in band and not float(band[n]) <= MAX_BAND]
+    if wide:
+        why.append("niepewnosc ponad {:.0f}%: {}".format(100 * MAX_BAND, ", ".join(wide)))
+    base, got = getattr(res, "base", None), getattr(dyn, "fit_deg", None)
+    if base is not None and got is not None and np.isfinite(base) and got > MIN_FIT_GAIN * base:
+        why.append(f"blad symulacji {base:.2f} -> {got:.2f} st. - niewiele lepiej niz model")
+    useful = getattr(res, "useful", None)
+    if useful is None:
+        return not why, "; ".join(why)
+    if useful:
+        return True, ""
+    return False, "; ".join(why) or "identyfikacja uznala wynik za nieprzydatny"
 
 
 def run_eval(job: Job, policy_path: str, workspace, episodes: int = 50) -> Any:

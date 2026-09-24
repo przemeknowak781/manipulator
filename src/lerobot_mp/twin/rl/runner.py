@@ -171,16 +171,27 @@ class PolicyRunner:
         return obs[0].astype(np.float32)
 
     # ------------------------------------------------------------------ petla
-    def start(self, *, threaded: bool = True) -> None:
-        """Bierze ramie i rusza. `threaded=False`: bez watku - takty robi `step_once`."""
+    def start(self, *, threaded: bool = True, gen: int | None = None,
+              guard: Callable[[], bool] | None = None) -> None:
+        """Bierze ramie i rusza. `threaded=False`: bez watku - takty robi `step_once`.
+
+        `gen` (`Twin.preempt_gen` sprzed ladowania polityki) i `guard` (np. licznik ruchu
+        panelu) ida do `Twin.claim`: STOP albo Dom wcisniete w trakcie startu (108-142 ms
+        ladowania) nie moga zostac nadpisane przez polityke, ktora dopiero bierze ramie.
+        """
         if not self.twin.connected:
             raise RuntimeError("ramie blizniaka nie jest polaczone")
         self.stop()
-        # Najpierw wlasnosc: fala albo identyfikacja w toku -> RuntimeError, nic nie rusza.
-        self.twin.claim(OWNER, preempt=self._preempted)
+        # Najpierw wlasnosc: fala albo identyfikacja w toku, aktywny STOP albo odebranie
+        # w trakcie startu -> RuntimeError, nic nie rusza.
+        kw = {k: v for k, v in (("gen", gen), ("guard", guard)) if v is not None}
+        self.twin.claim(OWNER, preempt=self._preempted, **kw)
         measured = self.twin.joints() if self.twin.status.simulated else dict(self.twin.status.measured)
         self._hw_lo, self._hw_hi = self._hardware_limits()
         self.q_cmd = np.clip(self.kin.to_q(measured), self._hw_lo, self._hw_hi)
+        grip = self._squeezing_grip_cmd(measured)
+        if grip is not None:
+            self.q_cmd[5] = grip
         self.prev_action = np.zeros(6)
         self.status = RunnerStatus(running=True, goal_clamped=self.status.goal_clamped)
         self._cube, self._cube_src = None, None
@@ -201,6 +212,23 @@ class PolicyRunner:
             th = threading.Thread(target=self._loop, name="polityka", daemon=True)
             self._thread = th
             th.start()
+
+    def _squeezing_grip_cmd(self, measured: dict[str, float]) -> float | None:
+        """Kat rozkazu chwytaka [rad] z `Twin.status.command`, gdy chwytak SCISKA (rozkaz ciasniej niz pomiar).
+
+        Start od zmierzonego kata szczeki to zerowa sila: ponowne Uruchom z kostka w szczekach
+        (po STOP, Dom, Zatrzymaj) puszczalo chwyt pierwsza akcja, a `_jaw_holding` nigdy nie
+        widzial szczeki "szerzej niz rozkaz" - sukces lift nie mogl sie policzyc. W treningu
+        q_cmd trzymanej kostki tez jest ciasniejszy od pomiaru. Inne stawy - jak dotad, od pomiaru.
+        """
+        name = self.kin.spec.gripper
+        cmd = (getattr(self.twin.status, "command", None) or {}).get(name)
+        if cmd is None or name not in measured:
+            return None
+        q_cmd = float(self.kin.to_q({**measured, name: float(cmd)})[5])
+        if float(self.kin.to_q(measured)[5]) - q_cmd <= self.grip_block_margin:
+            return None
+        return float(np.clip(q_cmd, self._hw_lo[5], self._hw_hi[5]))
 
     def _hardware_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """Limity treningu przeciete z limitami, ktore naprawde obowiazuja na ramieniu (`Twin.joint_limits`).

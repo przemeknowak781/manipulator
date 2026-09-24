@@ -281,3 +281,29 @@ def test_policy_target_stays_inside_the_servo_limits(twin, monkeypatch):
     k = SO101.joints.index("wrist_flex")
     assert np.degrees(runner.q_cmd[k]) <= 88.0 + 1e-6
     assert max(s["wrist_flex"] for s in arm.sent) <= 88.0 + 1e-6
+
+
+# ------------------------------------------------------------ runda 3b: ponowny start z kostka w szczekach
+def test_restart_with_the_cube_in_the_jaws_keeps_the_squeeze_and_can_succeed(twin, monkeypatch):
+    """Uruchom po STOP/Dom z kostka w szczekach: runner startowal od ZMIERZONEGO kata szczeki (30),
+    pierwszy cel puszczal chwyt (zerowa sila), a `_jaw_holding` nigdy nie widzial szczeki szerzej
+    niz rozkaz - sukces lift nie mogl sie policzyc (verify2, s1: restart z kostka 3,3 cm w dloni)."""
+    arm = holding_arm()
+    connect_fake(twin, monkeypatch, arm)
+    twin.claim("panel")                                    # chwyt z poprzedniego epizodu
+    twin.set_engaged(True, owner="panel")
+    twin.set_target({"gripper": 5.0}, owner="panel")
+    drive(twin, PolicyRunner(twin, constant_policy(tk.make_task("reach"))), 1.0)
+    twin.set_engaged(False, owner="panel")
+    twin.release("panel")
+    assert twin.status.command["gripper"] == pytest.approx(5.0)
+    n = len(arm.sent)
+    runner = PolicyRunner(twin, constant_policy(tk.make_task("lift"), {5: -1.0}),   # polityka dalej zamyka
+                          cube_provider=lambda: (np.array([0.2, 0.0, 0.015 + 0.08]), np.eye(3)),
+                          cube_source=lambda: "w dloni")
+    runner.start(threaded=False)
+    grip = SO101.joints.index("gripper")
+    assert runner.q_cmd[grip] == pytest.approx(runner.kin.to_q(dict(twin.status.measured, gripper=5.0))[grip])
+    drive(twin, runner, 2.0)
+    assert max(s["gripper"] for s in arm.sent[n:]) <= 5.0 + 0.5
+    assert runner.status.stopped_because == "zadanie wykonane"

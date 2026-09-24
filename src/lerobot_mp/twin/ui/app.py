@@ -183,18 +183,35 @@ def fitted_names(dyn, sysid_default: bool = False) -> tuple[str, ...]:
     return tuple(names or ())
 
 
-def dynamics_parts(dyn, fitted) -> tuple[list[str], list[str]]:
-    """(dopasowane, z modelu) jako teksty "tlumienie x0.95", "opoznienie 25 ms".
+def band_text(name: str, width) -> str:
+    """Niepewnosc parametru jak w `FitResult.band`: mnozniki wzglednie (0,6 -> "+-60%"), opoznienie w s."""
+    try:
+        w = float(width)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(w):
+        return "+-inf"
+    return f"+-{1000 * w:.0f} ms" if name == "delay" else f"+-{100 * w:.0f}%"
+
+
+def dynamics_parts(dyn, fitted, band: dict | None = None) -> tuple[list[str], list[str]]:
+    """(dopasowane, z modelu) jako teksty "tlumienie x0.95 (+-8%)", "opoznienie 25 ms".
 
     Panel pisal "Dopasowano: kp x1.00 ... tarcie x1.00" takze dla parametrow, ktorych
     identyfikacja NIE ruszala (kp i tarcie zostaja z modelu) - wygladalo to jak
     pomiar "kp idealnie jak w modelu", a to tylko wartosc startowa.
+
+    `band` (niepewnosc z identyfikacji) przy kazdej dopasowanej wartosci: "armatura x0.45"
+    bez "+-inf" wygladalo jak pomiar, a nie zgadywanka (verify2, s6).
     """
     fitted = set(fitted)
+    band = band or {}
     a, b = [], []
     for name, label in DYN_PARAMS:
         v = float(getattr(dyn, name))
         txt = f"{label} {v / 20 * 1000:.0f} ms" if name == "delay" else f"{label} x{v:.2f}"
+        if name in fitted and name in band and band_text(name, band[name]):
+            txt += f" ({band_text(name, band[name])})"
         (a if name in fitted else b).append(txt)
     return a, b
 
@@ -241,6 +258,10 @@ class TwinApp:
         self.train = jobs.TrainingJob(self.policies_dir, self.ws_path)
         self.runner = None
         self.policy = None
+        #: Licznik "operator zatrzymal ruch" (STOP, Dom, Polacz/Rozlacz, Zatrzymaj). Start polityki,
+        #: fali i identyfikacji zapamietuje go na poczatku i bierze ramie tylko, gdy sie nie zmienil
+        #: (`_motion_mark`, `_take_arm`) - STOP wcisniety w trakcie ladowania polityki ginal.
+        self._motion_gen = 0
         self.cube_det = CubeDetector()
         self.cube_tracker = CubeTracker()
         self.last_cube = None
@@ -406,6 +427,7 @@ class TwinApp:
 
     def _emergency_stop(self, event=None) -> None:
         """STOP: najpierw nadzor (ramie staje w zmierzonej pozie), dopiero potem sprzatanie watkow."""
+        self._motion_gen += 1                           # start w toku (ladowanie polityki) nie wezmie ramienia
         try:
             self.twin.estop("STOP z panelu")
         finally:
@@ -443,13 +465,34 @@ class TwinApp:
             self.twin.set_engaged(False)
             self.twin.release(PANEL_OWNER)
 
-    def _take_arm(self, owner: str, preempt=None) -> None:
-        """Ramie dla zadania `owner` - albo RuntimeError z tym, kto je ma. Panel oddaje je bez pytania."""
+    def _motion_mark(self) -> tuple[int, int]:
+        """(licznik panelu, `Twin.preempt_gen`) na poczatku startu zadania - patrz `_claim_kw`."""
+        return self._motion_gen, self.twin.preempt_gen
+
+    def _claim_kw(self, mark: tuple[int, int] | None) -> dict:
+        """Warunki dla `Twin.claim`: od `mark` nikt nie wcisnal STOP/Dom/Polacz/Zatrzymaj.
+
+        Zmierzone (verify2, s15/s15c/s15d): od klikniecia Uruchom do `claim` polityki mija
+        108-142 ms (ladowanie polityki); STOP albo Dom w tym oknie trafialy w stary runner,
+        a nowa polityka brala ramie pod STOP-em (po Skasuj STOP - 83,7 st. ruchu) albo
+        przerywala rampe do domu.
+        """
+        if mark is None:
+            return {}
+        panel_gen, twin_gen = mark
+        return {"gen": twin_gen, "guard": lambda: self._motion_gen == panel_gen}
+
+    def _take_arm(self, owner: str, preempt=None, mark: tuple[int, int] | None = None) -> None:
+        """Ramie dla zadania `owner` - albo RuntimeError z tym, kto je ma. Panel oddaje je bez pytania.
+
+        `mark` (`_motion_mark` z poczatku startu zadania): STOP, Dom albo Polacz od tamtej chwili
+        -> odmowa; aktywny STOP -> odmowa ("aktywny STOP", z `Twin.claim`).
+        """
         busy = self._busy(owner)
         if busy:
             raise RuntimeError(f"ramie zajete: {busy} - najpierw je zatrzymaj (albo STOP)")
         self._release_panel()
-        self.twin.claim(owner, preempt=preempt)
+        self.twin.claim(owner, preempt=preempt, **self._claim_kw(mark))
 
     def _panel_preempted(self) -> None:
         """Twin odebral ramie panelowi (Dom, STOP, polaczenie, petla padla) - sprzeglo w panelu off."""
@@ -463,6 +506,7 @@ class TwinApp:
         prawdziwym ramieniu (odtworzone: shoulder_pan 14,8 -> 40 -> -39 -> 33 st.
         bez zadnej akcji operatora), z pominieciem potwierdzen z ich startu.
         """
+        self._motion_gen += 1                           # start w toku nie wezmie ramienia po (roz)laczeniu
         if self.runner is not None:
             self.runner.stop(reason)
         self.calib_job.stop()
@@ -546,6 +590,8 @@ class TwinApp:
             connected=connected, backend=backend, simulated=simulated, arm_error=str(st.error or ""), estop=estop,
             owner=self._busy(PANEL_OWNER), warnings=tuple(str(w) for w in (getattr(st, "warnings", None) or [])),
             cameras=tuple(cams), dynamics=dyn_src, dynamics_backend=gd.dynamics_backend(dyn_src),
+            dynamics_useful=gd.dynamics_useful(dyn),
+            dyn_result_useful=bool(self.sysid_job.data.get("useful", True)),
             policies=tuple((p["name"], p["task"], bool(p.get("bundled"))) for p in self._policy_list),
             jobs=tuple(n for n, on in jobs_on if on), policy_running=runner.task.name if running else "",
             policy_from_cameras=running and vision, calib_result_pending=bool(self.calib_apply.visible),
@@ -571,12 +617,12 @@ class TwinApp:
                                                    "serwa SO-101 wprost przez port (do blizniaka ten); lerobot - "
                                                    "przez kalibracje LeRobota (katy przesuniete). Dziala po Polacz.")
             self.arm_port = g.add_text("Port", self.ws.port or "",
-                                       hint="Port dla feetech/lerobot: COM12, /dev/ttyACM0 albo "
+                                       hint="Port dla feetech/lerobot: COMx (Windows), /dev/ttyACM0 (Linux) albo "
                                             "socket://adres:5555 (most lerobot-mp-bridge). Dla sim nieuzywany.")
             self.ports_md = g.add_markdown("")
             scan = g.add_button("Wykryj porty", icon=viser.Icon.SEARCH,
-                                hint="Wypisuje porty USB-serial; przejsciowke CH343 (SO-101) wpisuje w pole Port, "
-                                     "gdy jest puste. Niczym nie rusza.")
+                                hint="Wypisuje porty USB-serial; pierwsza przejsciowke CH34x (WCH, typowa w "
+                                     "plytkach serw SO-101) wpisuje w pole Port, gdy jest puste. Niczym nie rusza.")
             self.arm_home_on_connect = g.add_checkbox(
                 "Po polaczeniu jedz do pozycji domowej", False,
                 hint="Zaznaczone: zaraz po Polacz ramie jedzie rampa do domu. Przy pierwszym polaczeniu "
@@ -584,7 +630,8 @@ class TwinApp:
             connect = g.add_button("Polacz", icon=viser.Icon.PLUG_CONNECTED, color="green",
                                    hint="Konczy wszystko, co jezdzi (polityka, fala, nagranie identyfikacji), "
                                         "kasuje potwierdzenia i laczy wybrane ramie; bez jazdy do domu ramie "
-                                        "stoi. Backend i port zapisuje w stanowisku.")
+                                        "stoi. Sciskajacy chwytak sciska dalej, gdy backend zna cel serwa (sim; "
+                                        "inaczej pierwszy ruch go puszcza). Backend i port zapisuje w stanowisku.")
             disconnect = g.add_button("Rozlacz", icon=viser.Icon.PLUG_CONNECTED_X,
                                       hint="Konczy polityke, fale i nagranie identyfikacji, odbiera ramie "
                                            "wszystkim i rozlacza backend. Potwierdzenia trzeba potem dac od nowa.")
@@ -597,13 +644,15 @@ class TwinApp:
             for p in lp.comports():
                 if p.vid is None:
                     continue
-                tag = " **(CH343 - SO-101)**" if p.vid == 0x1A86 else ""
+                # 0x1A86 = WCH (CH340/CH343/CH9102) - na nim jest typowa plytka serw SO-101, ale
+                # nie jedyna mozliwa; inne przejsciowki wpisuje sie recznie.
+                tag = " **(WCH CH34x - typowa dla SO-101)**" if p.vid == 0x1A86 else ""
                 lines.append(f"- `{p.device}` {p.description}{tag}")
                 if p.vid == 0x1A86 and not self.arm_port.value:
                     self.arm_port.value = p.device
             self.ports_md.content = "\n".join(lines) or (
-                "Brak przejsciowek USB-serial. Na Shadow: przepusc urzadzenie USB w kliencie albo uzyj mostu "
-                "`lerobot-mp-bridge` i portu `socket://adres:5555`.")
+                "Brak przejsciowek USB-serial. Na maszynie wirtualnej/zdalnej (np. Shadow): przepusc urzadzenie "
+                "USB w kliencie albo uzyj mostu `lerobot-mp-bridge` i portu `socket://adres:5555`.")
 
         @connect.on_click
         @self._safe
@@ -621,8 +670,9 @@ class TwinApp:
         with g.add_folder("Sterowanie"):
             self.arm_engage = g.add_checkbox("Sprzeglo: panel steruje ramieniem", False,
                                              hint="Panel bierze ramie: suwaki i uchwyt koncowki RUSZAJA ramieniem. "
-                                                  "Odmowa, gdy ramie ma polityka, fala albo identyfikacja; STOP, Dom "
-                                                  "i Polacz je gasza. Bez sprzegla suwaki tylko pokazuja katy.")
+                                                  "Odmowa przy aktywnym STOP-ie albo gdy ramie ma polityka, fala albo "
+                                                  "identyfikacja; STOP, Dom i Polacz je gasza. Bez sprzegla suwaki "
+                                                  "tylko pokazuja katy.")
             home = g.add_button("Pozycja domowa", icon=viser.Icon.HOME,
                                 hint="Odbiera ramie kazdemu (panel, polityka, fala, identyfikacja) i jedzie rampa "
                                      "do domu - RUSZA ramieniem. Sciskajacy chwytak zostaje zamkniety. Przy "
@@ -649,7 +699,7 @@ class TwinApp:
                 if name == spec.gripper:
                     tip = ("Chwytak 0..100: 0 = szczeki zamkniete, 100 = otwarte (tiki serwa jak w feetech). Ze "
                            "sprzeglem ustawia cel. Chwytak, ktory po STOP-ie dalej sciska: Skasuj STOP, "
-                           "sprzeglo, potem ten suwak (przy STOP-ie cele sa pomijane).")
+                           "sprzeglo, potem ten suwak (przy STOP-ie sprzeglo sie nie wlacza).")
                 else:
                     tip = (f"Kat stawu [st.], suwak {lo:g}..{hi:g} (zakres modelu). Ze sprzeglem ustawia cel - "
                            f"nadzor przycina go do limitow z konfiguracji i EEPROM serwa, wiec ostatnie stopnie "
@@ -675,14 +725,25 @@ class TwinApp:
         @home.on_click
         @self._safe
         def _(event):
-            self.twin.home()                            # odbiera ramie kazdemu (panel, polityka, fala)
-            self._gizmo_seed = None
+            self._go_home()
 
         @clear.on_click
         def _(event):
             self.twin.clear_estop()
 
         self._build_table()
+
+    def _go_home(self) -> None:
+        """Pozycja domowa: odbiera ramie kazdemu (panel, polityka, fala) - takze startowi w toku."""
+        self._motion_gen += 1
+        self.twin.home()
+        self._gizmo_seed = None
+
+    def _halt_policy(self) -> None:
+        """Polityki > Zatrzymaj: takze polityka, ktora dopiero laduje sie po Uruchom, nie ruszy."""
+        self._motion_gen += 1
+        if self.runner is not None:
+            self.runner.stop("zatrzymana z panelu")
 
     def _connect(self, backend: str, port: str | None, go_home: bool = False, **kw) -> None:
         """Polacz: najpierw koniec wszystkiego, co jezdzi, i nowe potwierdzenia (moze to byc inne ramie)."""
@@ -864,8 +925,8 @@ class TwinApp:
                                   hint="Usuwa wybrana kamere razem z jej kalibracja - od razu, bez pytania.")
         with g.add_folder("Dodaj kamere", expand_by_default=False):
             probe = g.add_button("Szukaj kamer USB", icon=viser.Icon.SEARCH,
-                                 hint="Szuka kamer USB, ktorych nie ma jeszcze w stanowisku. Na Shadow kamera "
-                                      "musi byc przepuszczona w kliencie.")
+                                 hint="Szuka kamer USB, ktorych nie ma jeszcze w stanowisku. Na maszynie "
+                                      "wirtualnej/zdalnej (np. Shadow) kamera musi byc przepuszczona w kliencie USB.")
             self.usb_pick = g.add_dropdown("Znalezione", ("-",), initial_value="-",
                                            hint="Kamera z ostatniego Szukaj kamer USB: indeks i rozdzielczosc.")
             add_usb = g.add_button("Dodaj kamere USB", icon=viser.Icon.PLUS,
@@ -963,7 +1024,8 @@ class TwinApp:
             self.usb_pick.options = opts
             self.usb_pick.value = opts[0]
             if not self._found_usb:
-                self._notify(event, "Brak nowych kamer", "Na Shadow kamere trzeba przepuscic w kliencie (USB).")
+                self._notify(event, "Brak nowych kamer", "Sprawdz kabel; na maszynie wirtualnej/zdalnej (np. Shadow) "
+                                                         "kamere trzeba przepuscic w kliencie USB.")
 
         @add_usb.on_click
         @self._safe
@@ -1188,7 +1250,9 @@ class TwinApp:
             moved = "-" if sh is None else (f"**TAK {_px(sh)}**" if self.watch.moved(c.name) else f"nie ({_px(sh)})")
             rows.append(f"| {c.name}{'' if c.enabled else ' (wyl.)'} | {c.source} | {c.intrinsics_from} | {cal} | {moved} |")
         self.cams_md.content = "\n".join(rows) if self.ws.cameras else \
-            "Brak kamer. Dodaj kamere USB albo symulowana (ponizej)."
+            ("Brak kamer. Dodaj kamere USB albo symulowana (ponizej). Gotowy przyklad w symulacji (dwie "
+             "skalibrowane kamery): zamknij panel, w konsoli `lerobot-twin demo` (examples/twin.sim.json), "
+             "uruchom panel ponownie.")
         with self.scene_lock:
             for n in list(self.frustums):
                 if n not in {c.name for c in self.ws.cameras}:
@@ -1417,6 +1481,7 @@ class TwinApp:
         return names
 
     def _start_card_calibration(self, event, cameras: list[str], quick: bool) -> None:
+        mark = self._motion_mark()                      # STOP/Dom/Polacz od teraz - fala nie bierze ramienia
         if not self.twin.connected:
             raise RuntimeError("polacz ramie (sim albo prawdziwe) w zakladce Ramie")
         if not cameras or cameras == ["-"]:
@@ -1428,7 +1493,7 @@ class TwinApp:
         # Fala bierze ramie na wlasnosc PRZED startem: jedzie polityka albo identyfikacja -
         # odmowa z powodem (wczesniej trzy watki pisaly cel na zmiane i ramie skakalo).
         # Odebranie ramienia (Dom, STOP, polaczenie) przerywa fale przez `calib_job.stop`.
-        self._take_arm(jobs.CALIB_OWNER, preempt=self.calib_job.stop)
+        self._take_arm(jobs.CALIB_OWNER, preempt=self.calib_job.stop, mark=mark)
         self.ws.card["tag_size"] = self.tag_mm.value / 1000
         self.calib_apply.visible = False
         try:
@@ -1466,7 +1531,9 @@ class TwinApp:
             self.calib_apply.visible = True
             j.data["shown"] = fit
         elif j.state in (jobs.FAILED, jobs.CANCELLED) and j.data.get("shown") != j.state:
-            self.calib_md.content = f"**{j.state}**: {j.error or j.message}"
+            # Przerwana przez operatora (STOP, Dom, Przerwij) to nie blad (`jobs.interrupted_by_operator`).
+            self.calib_md.content = (f"**Przerwane**: {j.message or 'fala przerwana'} - bez wyniku"
+                                     if j.state == jobs.CANCELLED else f"**Blad**: {j.error or j.message}")
             j.data["shown"] = j.state
 
         ij = self.intr_job
@@ -1697,10 +1764,15 @@ class TwinApp:
                                                    "po starcie). W sim niepotrzebne.")
             self.dyn_bar = g.add_progress_bar(0.0, visible=False)
             self.dyn_res = g.add_markdown("")
+            self.dyn_force = g.add_checkbox("Zapisz mimo to (wynik nic nie wyjasnia)", False, visible=False,
+                                            hint="Tylko gdy identyfikacja uznala wynik za nieprzydatny (niepewnosc "
+                                                 "ponad 30% albo blad prawie jak model). Zaznaczone odblokowuje "
+                                                 "Zapisz; przewodnik i tak nie zalicza kroku 5.")
             keep = g.add_button("Zapisz jako dynamike stanowiska", icon=viser.Icon.DEVICE_FLOPPY, color="green",
                                 visible=False,
                                 hint="Wynik identyfikacji staje sie dynamika stanowiska - srodkiem randomizacji "
-                                     "w kolejnych treningach.")
+                                     "w kolejnych treningach. Wynik, ktory nic nie wyjasnia, zapisuje dopiero po "
+                                     "zaznaczeniu 'Zapisz mimo to'.")
             reset = g.add_button("Wroc do modelu Menagerie", icon=viser.Icon.RESTORE,
                                  hint="Kasuje zapisana dynamike (bez pytania): trening wraca do modelu Menagerie.")
             self.dyn_keep = keep
@@ -1726,6 +1798,7 @@ class TwinApp:
         @ident.on_click
         @self._safe
         def _(event):
+            mark = self._motion_mark()                  # STOP/Dom/Polacz od teraz - nagranie nie bierze ramienia
             if not self.twin.connected:
                 raise RuntimeError("polacz ramie w zakladce Ramie")
             if not self.twin.status.simulated and not self.dyn_confirm.value:
@@ -1736,8 +1809,9 @@ class TwinApp:
                 raise RuntimeError("identyfikacja juz trwa")
             # Ramie dla identyfikacji albo odmowa z powodem - fala czy polityka w toku mieszaly
             # swoje cele z pobudzeniem, a nagranie z obu szlo do dopasowania dynamiki.
-            self._take_arm(jobs.SYSID_OWNER, preempt=self.sysid_job.stop)
+            self._take_arm(jobs.SYSID_OWNER, preempt=self.sysid_job.stop, mark=mark)
             self.dyn_keep.visible = False
+            self.dyn_force.visible = False
             try:
                 self.sysid_job.start(lambda job: jobs.run_sysid(job, self.twin))
             except Exception:
@@ -1748,11 +1822,11 @@ class TwinApp:
         @keep.on_click
         @self._safe
         def _(event):
-            dyn = self.sysid_job.result
-            self.ws.dynamics = dyn.to_dict()
-            self._save()
-            self.dyn_keep.visible = False
-            self._show_dynamics()
+            self._keep_dynamics()
+
+        @self.dyn_force.on_update
+        def _(event):
+            self.dyn_keep.disabled = not (self.sysid_job.data.get("useful", True) or self.dyn_force.value)
 
         @reset.on_click
         @self._safe
@@ -1761,17 +1835,45 @@ class TwinApp:
             self._save()
             self._show_dynamics()
 
+    def _keep_dynamics(self) -> None:
+        """Zapisz jako dynamike stanowiska - wynik, ktory nic nie wyjasnia, tylko z 'Zapisz mimo to'.
+
+        Zmierzone (verify2, s6): dopasowanie 0,55 -> 0,51 st. z armatura +-inf dalo sie zapisac
+        jednym kliknieciem, a trening centrowal randomizacje na armaturze x0,45 (prawda 1,0 poza
+        kazdym swiatem treningu). Taki zapis dostaje znacznik w zrodle - przewodnik go nie zalicza.
+        """
+        import dataclasses
+
+        j = self.sysid_job
+        dyn = j.result
+        if dyn is None:
+            raise RuntimeError("brak wyniku identyfikacji")
+        useful = bool(j.data.get("useful", True))
+        if not useful:
+            if not self.dyn_force.value:
+                raise RuntimeError("wynik nic nie wyjasnia - powtorz identyfikacje albo zaznacz 'Zapisz mimo to'")
+            why = j.data.get("useless_why") or "identyfikacja uznala wynik za nieprzydatny"
+            dyn = dataclasses.replace(dyn, source=f"{dyn.source}; {gd.USELESS_MARK}: {why}")
+        self.ws.dynamics = dyn.to_dict()
+        self._save()
+        self.dyn_keep.visible = self.dyn_force.visible = False
+        self.dyn_force.value = False
+        self._show_dynamics()
+
     def _show_dynamics(self) -> None:
         from ..rl.randomize import Dynamics
         d = Dynamics.from_dict(self.ws.dynamics)
         names = fitted_names(d)
         if names:
-            fitted, fixed = dynamics_parts(d, names)
+            fitted, fixed = dynamics_parts(d, names, getattr(d, "band", None))
             vals = f"dopasowane: {', '.join(fitted)}" + (f"; z modelu: {', '.join(fixed)}" if fixed else "")
         else:                                           # model albo zapis bez listy dopasowanych
             vals = ", ".join(sum(dynamics_parts(d, ()), []))
         self.dyn_md.content = (f"Srodek randomizacji: **{d.source}** - {vals}"
-                               + (f", blad dopasowania {d.fit_deg:.2f} st." if d.fit_deg else ""))
+                               + (f", blad dopasowania {d.fit_deg:.2f} st." if d.fit_deg else "")
+                               + ("" if gd.dynamics_useful(self.ws.dynamics) else
+                                  "  \n**Ta dynamika nic nie wyjasnia** - powtorz identyfikacje albo "
+                                  "Wroc do modelu Menagerie."))
 
     def _tick_training(self) -> None:
         p = self.train.progress()
@@ -1801,22 +1903,40 @@ class TwinApp:
             self.dyn_res.content = j.message
         elif j.state == jobs.DONE and j.result is not None and j.data.get("shown") is not j.result:
             d = j.result
-            fitted, fixed = dynamics_parts(d, fitted_names(d, sysid_default=True))
+            band = j.data.get("band") or getattr(d, "band", None) or {}
+            fitted, fixed = dynamics_parts(d, fitted_names(d, sysid_default=True), band)
             head = (f"Dopasowano: {', '.join(fitted)}" if fitted else
                     "Wynik (nie wiadomo, ktore parametry dopasowano)") + \
                    (f"; z modelu (nie dopasowane): {', '.join(fixed)}" if fixed else "")
+            # Na czym nagrano: wynik z sim, ktory skonczyl sie dopasowywac po Polacz do prawdziwego
+            # ramienia, wygladal jak dynamika stanowiska.
+            rec_backend = str(j.data.get("backend") or "?")
+            st = self.twin.status
+            now_backend = st.backend if st.connected else ""
+            where = f"Nagrane na: **{rec_backend}**" + (
+                f" (polaczone jest teraz: {now_backend} - to NIE jest jego dynamika)"
+                if now_backend and rec_backend not in ("?", now_backend) else "")
+            useful = bool(j.data.get("useful", True))
+            why = j.data.get("useless_why") or "identyfikacja uznala go za nieprzydatny"
+            verdict = "" if useful else (
+                f"  \n**Wynik nic nie wyjasnia** ({why}) - powtorz identyfikacje z wolnym ramieniem; "
+                f"zapis tylko po zaznaczeniu 'Zapisz mimo to'.")
             self.dyn_res.content = (f"{head}. Blad symulacji wzgledem nagrania: "
-                                    f"**{j.data.get('base', float('nan')):.2f} st. -> {d.fit_deg:.2f} st.**")
+                                    f"**{j.data.get('base', float('nan')):.2f} st. -> {d.fit_deg:.2f} st.**  \n"
+                                    f"{where}{verdict}")
+            self.dyn_force.value = False
+            self.dyn_force.visible = not useful
+            self.dyn_keep.disabled = not useful
             self.dyn_keep.visible = True
             j.data["shown"] = d
         elif j.state == jobs.FAILED and j.data.get("shown") != "err":
             self.dyn_res.content = f"**Blad**: {j.error}"
-            self.dyn_keep.visible = False               # "Zapisz" zapisywalby wynik, ktorego nie ma
+            self.dyn_keep.visible = self.dyn_force.visible = False   # "Zapisz" zapisywalby wynik, ktorego nie ma
             j.data["shown"] = "err"
         elif j.state == jobs.CANCELLED and j.data.get("shown") != "cancel":
             # Wczesniej przerwane zadanie znikalo bez slowa - pasek gasl, a wyniku nie bylo.
             self.dyn_res.content = f"**Przerwane**: {j.message or 'identyfikacja przerwana'}"
-            self.dyn_keep.visible = False
+            self.dyn_keep.visible = self.dyn_force.visible = False
             j.data["shown"] = "cancel"
 
     # =============================================================== polityki
@@ -1845,9 +1965,10 @@ class TwinApp:
             run = g.add_button("Uruchom", icon=viser.Icon.PLAYER_PLAY, color="green",
                                hint="Polityka jedzie na polaczonym ramieniu (przez nadzor) - RUSZA ramieniem. "
                                     "Odmowa przy aktywnym STOP-ie albo gdy ramie ma fala / identyfikacja; "
-                                    "sprzeglo panelu gasnie.")
+                                    "STOP, Dom albo Zatrzymaj w trakcie startu - nie rusza. Sprzeglo panelu gasnie.")
             halt = g.add_button("Zatrzymaj", icon=viser.Icon.PLAYER_STOP,
-                                hint="Zatrzymuje polityke; ramie trzyma ostatni cel.")
+                                hint="Zatrzymuje polityke - takze jeszcze ladowana po Uruchom; ramie trzyma "
+                                     "ostatni cel.")
             new_goal = g.add_button("reach: losowy cel", icon=viser.Icon.TARGET,
                                     hint="Nowy losowy cel z obszaru treningu (zolta kulka); gdy jedzie reach, "
                                          "ramie za nim pojedzie. Cel mozna tez przeciagac w 3D.")
@@ -1897,8 +2018,7 @@ class TwinApp:
 
         @halt.on_click
         def _(event):
-            if self.runner is not None:
-                self.runner.stop("zatrzymana z panelu")
+            self._halt_policy()
 
     def _policy_path(self) -> str:
         from ..rl.policy import list_policies
@@ -2004,9 +2124,19 @@ class TwinApp:
         mapa i polityka jechala po kostke, ktorej juz tam nie bylo.
         """
         kin = self._kin_vision
-        joints = dict(self.twin.status.measured) or self.twin.joints()
+        st = self.twin.status
+        joints = dict(st.measured) or self.twin.joints()
         q = kin.to_q(joints)
-        cmd = self.runner.q_cmd[5] if self.runner is not None else q[5]
+        # Rozkaz chwytaka, ktory NAPRAWDE idzie do serwa (`status.command`), a nie `runner.q_cmd`:
+        # runner startuje od zmierzonego kata szczeki, wiec po STOP/Dom z kostka w szczekach
+        # tracker nie widzial "sciska" i nie bral kostki "w dloni" - polityka stawala z
+        # "kamery jej nie widza" (verify2, s1).
+        grip = kin.spec.gripper
+        sent = (getattr(st, "command", None) or {}).get(grip)
+        if sent is not None:
+            cmd = kin.to_q({**joints, grip: float(sent)})[kin.spec.joints.index(grip)]
+        else:
+            cmd = self.runner.q_cmd[5] if self.runner is not None else q[5]
         now = time.monotonic()
         det = self.last_cube
         if det is not None and (det.confidence <= 0.4 or not det.t or det.t <= self._cube_used_t
@@ -2033,6 +2163,9 @@ class TwinApp:
     def _start_policy(self, event) -> None:
         from ..rl.policy import Policy
         from ..rl.runner import PolicyRunner
+        # Przed wszystkimi sprawdzeniami: STOP, Dom, Polacz albo Zatrzymaj od tej chwili (ladowanie
+        # polityki trwa 100-150 ms) = polityka nie bierze ramienia (`_claim_kw`).
+        mark = self._motion_mark()
         if not self.twin.connected:
             raise RuntimeError("polacz ramie w zakladce Ramie (sim, zeby bezpiecznie sprawdzic)")
         if not self.twin.status.simulated and not self.pol_confirm.value:
@@ -2076,7 +2209,12 @@ class TwinApp:
             self._set_goal(p)
             self.runner.episode_limit = False                # cel przeciagany na zywo - bez limitu epizodu
         self.goal_node.visible = self.goal_gizmo.visible = pol.task.name == "reach"
-        self.runner.start()                                  # bierze ramie ("polityka") albo RuntimeError
+        try:
+            # Bierze ramie ("polityka") albo RuntimeError: zajete, aktywny STOP, odebrane od `mark`.
+            self.runner.start(**self._claim_kw(mark))
+        except RuntimeError as exc:
+            self.runner.status.stopped_because = f"nie ruszyla: {exc}"
+            raise
         self.pol_confirm.value = False                       # nastepne uruchomienie - nowe potwierdzenie
 
     def _tick_policies(self) -> None:

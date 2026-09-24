@@ -1087,3 +1087,123 @@ def test_sysid_and_job_cleanup_pass_their_owner_to_the_clutch(twin, monkeypatch)
         jobs.run_sysid(jobs.Job("identyfikacja"), twin)
     assert calls and all(owner == jobs.SYSID_OWNER for _, owner in calls)
     assert twin.owner is None
+
+
+# ------------------------------------------------------------ runda 3b: sluchacze taktow (E1)
+def test_tick_listener_sees_what_was_really_sent_and_a_failing_listener_is_dropped(twin, monkeypatch):
+    """Identyfikacja stemplowala nagranie wlasnym zegarem (verify2: tlumienie do 62% obok) - petla
+    podaje teraz swoj takt, rozkaz, ktory NAPRAWDE poszedl, i czy odczyt byl swiezy."""
+    arm = FakeArm()
+    arm.clamp["shoulder_pan"] = (-1e9, 3.0)               # serwo przycina rozkaz: w probce to, co poszlo
+    connect_fake(twin, monkeypatch, arm)
+    got, calls = [], []
+
+    def bad(sample):
+        calls.append(sample)
+        raise ValueError("zly sluchacz")
+    h = twin.add_tick_listener(got.append)
+    twin.add_tick_listener(bad)
+    twin.set_engaged(True)
+    twin.set_target({"shoulder_pan": 10.0})
+    run(twin, 0.5)
+    assert len(calls) == 1                                  # usuniety po pierwszym wyjatku, petla dziala
+    assert twin.connected and len(got) == 25
+    ts = [s.t for s in got]
+    assert ts == sorted(ts) and ts[-1] == pytest.approx(0.5)
+    sent = [s for s in got if s.sent]
+    assert sent and sent[-1].sent == arm.sent[-1] and sent[-1].sent["shoulder_pan"] == pytest.approx(3.0)
+    assert any(s.fresh and s.measured_t == pytest.approx(s.t) for s in got)
+    assert all(s.measured_t <= s.t + 1e-9 for s in got)
+    arm.silent = 3                                          # lacze milczy: nic nie poszlo, odczyt nieswiezy
+    n = len(got)
+    run(twin, 0.2)
+    # Prawdziwe serwa czytane co drugi takt (40 ms): takt bez odczytu tez nie jest swiezy, ale wysyla.
+    stale = [s for s in got[n:] if not s.fresh]
+    assert stale and all(s.measured_t < s.t for s in stale)
+    assert any(s.sent == {} for s in got[n:])               # milczenie lacza: nic nie poszlo
+    assert len(arm.sent) == len([s for s in got if s.sent])
+    twin.remove_tick_listener(h)
+    n = len(got)
+    run(twin, 0.1)
+    assert len(got) == n
+    twin.remove_tick_listener(h)                            # drugi raz - bez bledu
+
+
+# ------------------------------------------------------------ runda 3b: STOP i Dom w trakcie startu
+def test_claim_and_clutch_are_refused_under_estop(twin, monkeypatch):
+    """Polityka ladowana 0,1 s po Uruchom brala ramie POD STOP-em (verify2, s15): `claim` i sprzeglo
+    tego nie sprawdzaly, a po Skasuj STOP ramie jechalo 83,7 st. pod zatrzymana polityka."""
+    arm = FakeArm()
+    connect_fake(twin, monkeypatch, arm)
+    twin.estop("STOP z panelu")
+    with pytest.raises(RuntimeError, match="aktywny STOP"):
+        twin.claim("polityka")
+    assert twin.owner is None
+    assert not twin.set_engaged(True, owner="polityka")
+    assert not twin.set_engaged(True)
+    assert not twin._engaged
+    with pytest.raises(RuntimeError, match="aktywny STOP"):
+        twin.move({"shoulder_pan": 20.0}, duration=0.2)
+    assert twin.owner is None and not twin._engaged
+    twin.clear_estop()
+    twin.claim("polityka")
+    assert twin.set_engaged(True, owner="polityka")
+
+
+def test_claim_after_a_preempt_since_the_mark_is_refused_and_home_keeps_ramping(twin, monkeypatch):
+    """Dom wcisniety w trakcie startu polityki: jej `claim` przerywal rampe do domu (verify2, s15c)."""
+    arm = FakeArm({"shoulder_pan": 50.0})
+    connect_fake(twin, monkeypatch, arm)
+    mark = twin.preempt_gen
+    twin.home()
+    with pytest.raises(RuntimeError, match="odebrane w trakcie startu.*pozycja domowa"):
+        twin.claim("polityka", gen=mark)
+    with pytest.raises(RuntimeError, match="w trakcie startu"):
+        twin.claim("polityka", guard=lambda: False)
+    assert twin.owner is None
+    run(twin, 3.5)
+    assert arm.pos["shoulder_pan"] == pytest.approx(SO101.home["shoulder_pan"], abs=0.5)
+    twin.claim("polityka", gen=twin.preempt_gen, guard=lambda: True)
+    assert twin.owner == "polityka"
+
+
+# ------------------------------------------------------------ runda 3b: Polacz z kostka w szczekach
+class GoalArm(FakeArm):
+    """Backend, ktory zna cel serw (jak Goal_Position) - `Twin._squeeze_at_connect`."""
+
+    def goal_positions(self):
+        return dict(self.goal)
+
+
+@pytest.mark.parametrize("go_home", [False, True])
+def test_reconnect_keeps_a_squeezing_gripper_closed_when_the_backend_knows_the_goal(twin, monkeypatch, go_home):
+    """Polacz w trakcie lift: nadzor startowal od zmierzonego kata szczeki (30), a pierwsze sprzeglo
+    wysylalo go jako cel - zerowa sila, kostka zsuwala sie 3,8 -> 2,3 cm (verify2, s1)."""
+    arm = GoalArm()
+    squeeze(twin, monkeypatch, arm)
+    connect_fake(twin, monkeypatch, arm, go_home=go_home)
+    assert twin.status.command["gripper"] == pytest.approx(5.0)
+    n = len(arm.sent)
+    run(twin, 3.5 if go_home else 0.0)                     # rampa startowa do domu nie otwiera szczek
+    twin.claim("panel")
+    twin.set_engaged(True, owner="panel")
+    twin.set_target({"shoulder_pan": 5.0}, owner="panel")
+    run(twin, 1.0)
+    assert arm.sent[n:] and max(s["gripper"] for s in arm.sent[n:]) == pytest.approx(5.0)
+
+
+def test_reconnect_without_goal_positions_starts_from_the_measured_jaw(twin, monkeypatch):
+    """Backend bez `goal_positions` (feetech przed jego dodaniem): jak dotad - od pomiaru (TWIN.md)."""
+    arm = FakeArm()
+    squeeze(twin, monkeypatch, arm)
+    connect_fake(twin, monkeypatch, arm)
+    assert twin.status.command["gripper"] == pytest.approx(30.0)
+
+
+def test_scene_backend_reports_the_goal_its_actuators_hold(twin):
+    twin.connect("sim", threaded=False)
+    twin.set_engaged(True)
+    twin.set_target({"gripper": 5.0})
+    run(twin, 0.1)
+    goal = twin._backend.goal_positions()
+    assert goal["gripper"] == pytest.approx(twin.status.command["gripper"], abs=1e-6)

@@ -319,3 +319,52 @@ def test_camera_without_frame_is_flagged_only_after_a_few_seconds(panel, monkeyp
         with panel.frame_lock:
             panel.frames = frames
         panel._frame_seen.pop("usb_przewodnik", None)
+
+
+# ------------------------------------------------------------------ runda 3b
+def test_a_saved_fit_that_explains_nothing_does_not_count_as_step_5():
+    """Dopasowanie 0,55 -> 0,51 st. z armatura +-inf dalo sie zapisac, a przewodnik zaliczal krok 5
+    i prowadzil do treningu centrowanego na zgadywance (verify2, s6)."""
+    good = {"source": "identyfikacja t (sim); niepewnosc: x", "fitted": ["damping", "armature", "delay"],
+            "band": {"damping": 0.1, "armature": 0.2, "delay": 0.005}}
+    assert gd.dynamics_useful(good) and gd.dynamics_useful({}) and gd.dynamics_useful(None)
+    assert not gd.dynamics_useful({**good, "band": {**good["band"], "armature": float("inf")}})
+    assert not gd.dynamics_useful({**good, "band": {**good["band"], "damping": 0.6}})
+    assert not gd.dynamics_useful({**good, "source": good["source"] + f"; {gd.USELESS_MARK}: blad jak model"})
+    base = dict(connected=True, backend="sim", cameras=(CameraSnap("sym1", True, trusted=True, calibrated=True,
+                                                                    intrinsics_ok=True),),
+                policies=BUNDLED, dynamics=good["source"], dynamics_backend="sim")
+    assert _status(gd.build(GuideSnapshot(**base)))[5] == DONE
+    g = gd.build(GuideSnapshot(**base, dynamics_useful=False))
+    assert g.current.number == 5 and "nic nie wyjasnia" in g.current.detail and "Identyfikuj" in g.now
+    # Czekajacy wynik, ktory nic nie wyjasnia: "powtorz", a nie "kliknij Zapisz".
+    g = gd.build(GuideSnapshot(**base, dyn_result_pending=True, dyn_result_useful=False))
+    assert "nic nie wyjasnia" in g.now and "powtorz" in g.now and "kliknij **Zapisz" not in g.now
+
+
+def test_sim_without_any_camera_suggests_the_demo_workspace():
+    g = gd.build(GuideSnapshot(connected=True, backend="sim"))
+    assert g.current.number == 1 and "lerobot-twin demo" in g.now and "twin.sim.json" in g.now
+    # Sa juz kamery (np. prawdziwe) albo prawdziwe ramie - bez podpowiedzi demo.
+    assert "demo" not in gd.build(GuideSnapshot(connected=True, backend="sim", cameras=(_real_cam(),))).now
+    assert "demo" not in gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False)).now
+
+
+def test_panel_texts_are_not_specific_to_one_machine(panel):
+    """Pakiet idzie na inne komputery: podpowiedzi z COM12, "Na Shadow:" i samym CH343 byly nieprawda
+    poza jedna maszyna (runda pakowania)."""
+    texts = [str(getattr(h, "hint", "") or "") for h in panel.server.gui._gui_input_handle_from_uuid.values()]
+    joined = "\n".join(texts)
+    assert "COM12" not in joined and "Na Shadow" not in joined and "CH343 (SO-101)" not in joined
+    assert "COMx" in panel.arm_port.hint and "/dev/ttyACM0" in panel.arm_port.hint
+    blk = gd.blockers(GuideSnapshot(connected=True, backend="feetech", simulated=False,
+                                    cameras=(_real_cam(has_frame=False),)))
+    assert any("maszynie wirtualnej/zdalnej" in b for b in blk) and not any("na Shadow:" in b for b in blk)
+    saved = list(panel.ws.cameras)
+    try:
+        panel.ws.cameras.clear()
+        panel._refresh_cameras()
+        assert "lerobot-twin demo" in panel.cams_md.content
+    finally:
+        panel.ws.cameras[:] = saved
+        panel._refresh_cameras()
