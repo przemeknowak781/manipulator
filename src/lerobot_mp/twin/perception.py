@@ -172,9 +172,20 @@ class CubeTracker:
     promieniu `settle_spread` od siebie, choc TCP przesunal sie w tym czasie
     w poziomie o `settle_move` (wiecej niz `settle_spread`). Duch kostki niesionej
     w szczekach tak nie umie: to rzut kostki wzdluz promienia kamery na blat, wiec
-    jedzie w poziomie razem z dlonia (i szybciej od niej). Dlon stojaca w miejscu
-    niczego nie dowodzi - wtedy zostaje stare polozenie, a zrodlo mowi, ze jedna
-    kamera widzi kostke gdzie indziej.
+    jedzie w poziomie razem z dlonia (i szybciej od niej).
+
+    Dlon stojaca w miejscu sama niczego nie dowodzi - ALE duch podniesionej kostki
+    potrzebuje kostki w szczekach, a w szczekach otwartych szerzej niz `open_q`
+    kostki nie ma (30 mm kostki to w blizniaku 0,19-0,20 rad szczeki, 42 mm
+    przekatnej - 0,35 rad; `open_q` = 0,40 rad to 47 mm szczeliny). Wtedy wystarcza
+    `settle_n` zgodnych detekcji, bez ruchu dloni. Bez tego (zmierzone, panel
+    z jedna kamera): STOP 6,6 cm od kostki i ponowne Uruchom - swiezy tracker
+    odrzucal dobra detekcje (pewnosc 0,99), bo runner czekajacy na kostke nie rusza
+    ramieniem, i po 3 s "kamery jej nie widza"; kostka potracona przy dloni
+    zawieszonej w miejscu - 1 z 8 prob wisiala 6,9 s na "ostatnie widziane", potem
+    to samo. Szczeka przymknieta i dlon stoi - zostaje stare polozenie, a zrodlo
+    mowi, ze jedna kamera widzi kostke gdzie indziej (albo "brak (...)" z powodem
+    i tym, co zrobic, gdy starego polozenia nie ma).
 
     Kostka w dloni, a szczeka przestaje sciskac (zamknela sie na pustym albo
     otworzyla) - kostka wypadla. Nie wisi w powietrzu tam, gdzie byla w szczekach:
@@ -186,7 +197,7 @@ class CubeTracker:
     def __init__(self, hold_s: float = 6.0, grab_radius: float = 0.06, grip_margin: float = 0.05,
                  block_margin: float = 0.05, near_radius: float = 0.10, confirm_dist: float = 0.01,
                  settle_n: int = 3, settle_spread: float = 0.01, settle_move: float = 0.015,
-                 settle_window: float = 1.5, drop_height: float = 0.01):
+                 settle_window: float = 1.5, drop_height: float = 0.01, open_q: float = 0.40):
         self.hold_s, self.grab_radius = hold_s, grab_radius
         self.grip_margin, self.block_margin = grip_margin, block_margin
         #: "Przy dloni": TCP blizej kostki (ostatniej albo wykrytej) niz tyle [m].
@@ -201,6 +212,9 @@ class CubeTracker:
         self.settle_move, self.settle_window = settle_move, settle_window
         #: Kostka upuszczona wyzej niz tyle [m] nad polozeniem lezacej - opuszczana na blat.
         self.drop_height = drop_height
+        #: Kat szczeki [rad, jak `grip_q`], powyzej ktorego szczeka na pewno nie trzyma kostki:
+        #: pojedynczy swiadek przy STOJACEJ dloni jest wtedy przyjmowany (patrz opis klasy).
+        self.open_q = open_q
         self.last: tuple[np.ndarray, np.ndarray] | None = None
         self.t_last = -np.inf
         self.in_hand: np.ndarray | None = None          # poza kostki w ukladzie TCP
@@ -212,6 +226,10 @@ class CubeTracker:
         #: Dopisek do "ostatnie widziane": pominieta detekcja widzi kostke gdzie indziej
         #: albo kostka wypadla z dloni - panel mowi to wprost zamiast cicho trzymac stare.
         self._note = ""
+        #: Ostatnio pominiety pojedynczy swiadek przy dloni: (chwila, powod). Gdy kostki nie ma
+        #: wcale ("brak"), panel mowi DLACZEGO - wczesniej runner konczyl "kamery jej nie
+        #: widza", choc kamera widziala ja z pewnoscia 0,99 (tylko tracker jej nie przyjal).
+        self._rejected: tuple[float, str] | None = None
 
     def _single_camera_near_hand(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool) -> bool:
         """Czy detekcja moze byc podniesiona kostka, ktora jedna kamera "polozyla" na blacie."""
@@ -225,8 +243,10 @@ class CubeTracker:
             near |= np.linalg.norm(self.last[0] - tcp) < self.near_radius
         return bool(near)
 
-    def _settled(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool, now: float) -> bool:
-        """Czy pojedynczy swiadek przy dloni to kostka LEZACA: stoi, choc dlon jedzie."""
+    def _settled(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool, now: float,
+                 jaw_open: bool = False) -> bool:
+        """Czy pojedynczy swiadek przy dloni to kostka LEZACA: stoi, choc dlon jedzie
+        (albo dlon stoi, ale szczeka jest otwarta szerzej niz kostka - `jaw_open`)."""
         if self.in_hand is not None or squeezing:
             self._witness.clear()
             return False
@@ -244,8 +264,11 @@ class CubeTracker:
             return False
         # W POZIOMIE: dlon jadaca tylko w gore/dol nad kamera patrzaca z gory przesuwa
         # ducha kostki w szczekach o ulamek swojego ruchu - moglby "stac".
+        # Szczeka otwarta szerzej niz kostka: w szczekach nic nie ma, wiec nie ma i ducha
+        # podniesionej kostki - ruch dloni nie jest potrzebny (stojace swiadectwa dalej tak:
+        # spadajaca albo toczaca sie kostka przerywa ciag).
         xy = np.array([w[2][:2] for w in self._witness])
-        if np.linalg.norm(xy[:, None] - xy[None], axis=2).max() < self.settle_move:
+        if not jaw_open and np.linalg.norm(xy[:, None] - xy[None], axis=2).max() < self.settle_move:
             return False
         self._witness.clear()
         return True
@@ -271,8 +294,11 @@ class CubeTracker:
         self._grip_prev = grip_q
         squeezing = grip_q - grip_cmd > self.block_margin and grip_q > grip_closed + self.grip_margin
         holding = still and squeezing
+        jaw_open = grip_q > self.open_q and not squeezing
         if det is not None and self._single_camera_near_hand(det, T_tcp, squeezing):
-            if not self._settled(det, T_tcp, squeezing, now):
+            if not self._settled(det, T_tcp, squeezing, now, jaw_open):
+                self._rejected = (now, "szczeka zacisnieta" if self.in_hand is not None or squeezing
+                                  else "dlon stoi" if len(self._witness) >= self.settle_n else "skacze")
                 # Zgodna z ostatnim polozeniem (kostka lezy, dlon nad nia) - tylko odswieza jego
                 # waznosc, zeby kostka nie "znikala" po `hold_s`, gdy dlon dlugo nad nia krazy.
                 if self.in_hand is None and self.last is not None:
@@ -286,6 +312,7 @@ class CubeTracker:
         if det is not None and not (holding and self.in_hand is not None):
             self.last, self.t_last, self.source = (det.pos, det.rot), now, "kamery"
             self._rest_z, self._note, self._carried = float(det.pos[2]), "", False
+            self._rejected = None
             if not holding:
                 self.in_hand = None
             return self.last
@@ -319,7 +346,29 @@ class CubeTracker:
             self.source = f"ostatnie widziane ({self._note})" if self._note else "ostatnie widziane"
             return self.last
         self.source = "brak"
+        why = self.why_rejected(now)
+        if why:
+            self.source = f"brak ({why})"
         return None
+
+    def why_rejected(self, now: float, within: float = 2.0) -> str:
+        """Dlaczego kostka widziana przez jedna kamere przy dloni nie jest przyjeta - i co zrobic.
+
+        "" - w ciagu `within` s zadna detekcja nie byla pominieta (kamery naprawde jej
+        nie widza). Tekst dla operatora: runner stajacy na "kamery jej nie widza" przy
+        kostce widzianej z pewnoscia 0,99 prowadzil do zlej diagnozy (zmierzone, panel).
+        """
+        if self._rejected is None or now - self._rejected[0] > within:
+            return ""
+        why = self._rejected[1]
+        if why == "szczeka zacisnieta":
+            return ("1 kamera widzi kostke przy zacisnietej szczece i nie odrozni jej od podniesionej - "
+                    "otworz chwytak albo dodaj druga kamere")
+        if why == "skacze":
+            return ("1 kamera widzi kostke przy dloni, ale jej polozenie skacze albo jedzie z dlonia - "
+                    "czekam, az stanie")
+        return ("1 kamera widzi kostke przy stojacej dloni i nie odrozni jej od podniesionej - "
+                "otworz chwytak, odsun ramie (Dom) albo dodaj druga kamere")
 
 
 @dataclass

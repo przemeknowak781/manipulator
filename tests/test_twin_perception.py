@@ -122,6 +122,14 @@ def test_single_camera_confirmation_keeps_a_resting_cube_alive():
     T_above = pose(np.eye(3), cube + [0.0, 0.0, 0.05])
     for t in np.arange(0.5, 3.0, 0.5):
         got = tr.update(_det(cube + [0.003, 0.0, 0.0], 1), T_above, 0.8, 0.8, -0.17, now=float(t))
+        # Szczeka otwarta: po `settle_n` zgodnych detekcjach kostka moze tez przejsc na polozenie
+        # z kamery (3 mm dalej) - byle nie znikala.
+        assert got is not None and np.linalg.norm(got[0] - cube) < 0.004
+    # Szczeka przymknieta (moglaby trzymac kostke): tylko potwierdzenie starego polozenia.
+    tr = CubeTracker(hold_s=1.0)
+    tr.update(_det(cube, 1), pose(np.eye(3), np.array([0.1, -0.15, 0.2])), 0.3, 0.3, -0.17, now=0.0)
+    for t in np.arange(0.5, 3.0, 0.5):
+        got = tr.update(_det(cube + [0.003, 0.0, 0.0], 1), T_above, 0.3, 0.3, -0.17, now=float(t))
         assert got is not None and np.allclose(got[0], cube)
 
 
@@ -182,19 +190,76 @@ def test_pushed_cube_is_reacquired_when_it_stays_put_while_the_hand_moves():
     cube = np.array([0.22, 0.03, 0.015])
     tr.update(_det(cube, 2), T_FAR, 0.8, 0.8, CLOSED, now=0.0)
     pushed = cube + [0.03, 0.0, 0.0]
-    # Dlon stoi 5 cm nad starym miejscem: nic nie dowodzi, ze to nie duch - zostaje stare
-    # polozenie, ale zrodlo mowi wprost, ze kamera widzi kostke gdzie indziej.
+    # Dlon stoi 5 cm nad starym miejscem, szczeka przymknieta (0,3 rad, szczelina 38 mm - w takiej
+    # moglaby byc kostka): nic nie dowodzi, ze to nie duch - zostaje stare polozenie, ale zrodlo
+    # mowi wprost, ze kamera widzi kostke gdzie indziej.
     T_hover = pose(np.eye(3), cube + [0.0, 0.0, 0.05])
     for t in (0.1, 0.2, 0.3, 0.4):
         jitter = [0.002 * (-1) ** int(10 * t), 0.0, 0.0]
-        got = tr.update(_det(pushed + jitter, 1), T_hover, 0.8, 0.8, CLOSED, now=t)
+        got = tr.update(_det(pushed + jitter, 1), T_hover, 0.3, 0.3, CLOSED, now=t)
         assert np.allclose(got[0], cube)
     assert "gdzie indziej" in tr.source
     # Dlon odjezdza w poziomie, kostka stoi (szum 2-4 mm) - przyjeta z kamer.
     for k, t in enumerate((0.5, 0.6, 0.7)):
         T = pose(np.eye(3), cube + [-0.008 * k, -0.006 * k, 0.05])
-        got = tr.update(_det(pushed + [0.0, 0.003 * (-1) ** k, 0.0], 1), T, 0.8, 0.8, CLOSED, now=t)
+        got = tr.update(_det(pushed + [0.0, 0.003 * (-1) ** k, 0.0], 1), T, 0.3, 0.3, CLOSED, now=t)
     assert tr.source == "kamery" and np.linalg.norm(got[0] - pushed) < 0.004
+
+
+OPEN = 0.8        # szczeka otwarta (szczelina 77 mm); kostka 30 mm trzymana to 0,19-0,20 rad
+
+
+def test_pushed_cube_is_reacquired_under_a_still_hand_with_an_open_jaw():
+    """Kostka potracona, dlon zawisla nad nia z otwarta szczeka (panel, jedna kamera): 1 z 8 prob
+    wisiala 6,9 s na "ostatnie widziane (1 kamera widzi ja gdzie indziej)", potem "kamery jej nie widza".
+    Duch podniesionej kostki potrzebuje kostki w szczekach - otwarta szeroko jej nie trzyma."""
+    tr = CubeTracker()
+    cube = np.array([0.22, 0.03, 0.015])
+    tr.update(_det(cube, 2), T_FAR, OPEN, OPEN, CLOSED, now=0.0)
+    pushed = cube + [0.03, 0.0, 0.0]
+    T_hover = pose(np.eye(3), cube + [0.0, 0.0, 0.05])
+    for t in (0.1, 0.2, 0.3):
+        got = tr.update(_det(pushed + [0.002 * (-1) ** int(10 * t), 0.0, 0.0], 1), T_hover, OPEN, OPEN,
+                        CLOSED, now=t)
+    assert tr.source == "kamery" and np.linalg.norm(got[0] - pushed) < 0.003
+
+
+def test_restart_next_to_the_cube_with_one_camera_takes_the_cube():
+    """STOP 6,6 cm od kostki, ponowne Uruchom: swiezy tracker, runner nie rusza ramieniem, dopoki
+    nie ma kostki. Wczesniej pomijal detekcje z pewnoscia 0,99 i po 3 s "kamery jej nie widza"."""
+    tr = CubeTracker()
+    cube = np.array([0.20, 0.03, 0.015])
+    T_still = pose(np.eye(3), cube + [0.03, -0.02, 0.055])
+    got = None
+    for k, t in enumerate((0.1, 0.25, 0.4)):
+        got = tr.update(_det(cube + [0.0, 0.002 * (-1) ** k, 0.0], 1), T_still, OPEN, OPEN, CLOSED, now=t)
+    assert tr.source == "kamery" and np.linalg.norm(got[0] - cube) < 0.003
+
+
+def test_a_still_hand_with_a_closed_jaw_keeps_the_ghost_out_and_says_why():
+    """Szczeka na wysokosci kostki (albo zacisnieta), dlon stoi: jedna kamera przy dloni dalej nie jest
+    przyjmowana - to moze byc duch podniesionej kostki. Tak jest przy restarcie z kostka w szczekach:
+    rozkaz chwytaka = zmierzony kat, wiec tracker nie widzi "sciskania". Zamiast "brak" (runner:
+    "kamery jej nie widza") zrodlo mowi, co widzi i co zrobic."""
+    held = 0.19                                         # zmierzony kat szczeki na kostce 30 mm
+    cube = np.array([0.20, 0.03, 0.015])
+    T_up = pose(np.eye(3), cube + [0.0, 0.0, 0.045])
+    ghost = cube + [-0.034, 0.048, 0.0]               # zmierzone: podniesiona o 4 cm, kamera a
+    tr = CubeTracker()
+    for k in range(12):
+        got = tr.update(_det(ghost + [0.001 * (-1) ** k, 0.0, 0.0], 1), T_up, held, held, CLOSED,
+                        now=0.1 * (k + 1))
+        assert got is None and tr.source.startswith("brak (")
+    assert "Dom" in tr.source and "druga kamere" in tr.source
+    # Kilka sekund bez zadnej detekcji: powod wygasa - teraz naprawde nikt jej nie widzi.
+    assert tr.update(None, T_up, held, held, CLOSED, now=5.0) is None and tr.source == "brak"
+    # Szczeka zacisnieta na kostce (rozkaz ciasniej) i dlon stoi: duch nigdy nie wchodzi.
+    tr = CubeTracker()
+    _holding(tr, cube)
+    T_up = pose(np.eye(3), cube + [0.0, 0.0, 0.085])
+    for k in range(12):
+        got = tr.update(_det(ghost, 1), T_up, held, CLOSED, CLOSED, now=0.6 + 0.1 * k)
+        assert tr.source == "w dloni" and got[0][2] == pytest.approx(0.095)
 
 
 def test_ghost_moving_with_the_hand_is_never_accepted():
@@ -290,6 +355,8 @@ def test_moved_camera_is_detected_and_moving_arm_is_not():
         s.model.cam_quat[cam] = q
         mujoco.mj_forward(s.model, s.data)
         shift = w.check("c", s.render("c"), arm_mask(s, "c"))
+        assert not w.moved("c")                 # "przestawiona" dopiero po drugim zgodnym sprawdzeniu
+        w.check("c", s.render("c"), arm_mask(s, "c"))
     # Miara to najwieksze przesuniecie naroznika kadru: przy pochyleniu naroznik idzie troche
     # dalej niz srodek (10,7 px przy 560*a = 9,8 px), stad 15%, a nie 10%.
     assert shift == pytest.approx(560 * a, rel=0.15)
