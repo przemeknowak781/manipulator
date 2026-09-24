@@ -168,6 +168,11 @@ def test_move_belongs_to_the_calibration_and_refuses_a_foreign_owner():
         tw.claim("polityka")
         with pytest.raises(RuntimeError, match="ramie zajete: polityka"):
             tw.move({"shoulder_pan": 10.0}, duration=0.2)
+        tw.release("polityka")
+        # Fala, ktorej ramie odebrano miedzy przejazdami, nie bierze wolnego ramienia na nowo.
+        with pytest.raises(RuntimeError, match="ramie odebrane"):
+            tw.move({"shoulder_pan": 10.0}, duration=0.2, take=False)
+        assert tw.owner is None
     finally:
         tw.close()
 

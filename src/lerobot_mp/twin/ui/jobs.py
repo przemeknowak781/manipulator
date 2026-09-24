@@ -189,11 +189,12 @@ CALIB_OWNER, SYSID_OWNER = "kalibracja", "identyfikacja"
 class _OwnedArm:
     """Ramie dla sesji kalibracji: kazdy przejazd tylko, gdy fala WCIAZ ma ramie.
 
-    `Twin.move` bierze wolne ramie sam. Fala przerwana miedzy przejazdami (np.
-    "Polacz" przelaczylo sim na prawdziwe ramie w czasie zdjec) wziela wiec
+    `Twin.move` domyslnie bierze wolne ramie sam. Fala przerwana miedzy przejazdami
+    (np. "Polacz" przelaczylo sim na prawdziwe ramie w czasie zdjec) wziela wiec
     NOWE ramie nastepnym `move` i jechala dalej na prawdziwym SO-101 - bez
     potwierdzenia "karta w szczekach" i z chwytakiem zamykanym do 0. Panel
-    bierze ramie dla fali przed jej startem; tu sprawdzamy, ze wciaz je ma.
+    bierze ramie dla fali przed jej startem; tu sprawdzamy, ze wciaz je ma, a
+    `take=False` zamyka okno miedzy sprawdzeniem a przejazdem.
     """
 
     def __init__(self, twin, job: Job, owner: str = CALIB_OWNER):
@@ -208,7 +209,7 @@ class _OwnedArm:
             raise RuntimeError(f"fala przerwana - ramie odebrane ({reason})")
         if self.job.cancel.is_set():
             raise RuntimeError("fala przerwana")
-        self.twin.move(joints, duration, owner=self.owner)
+        self.twin.move(joints, duration, owner=self.owner, take=False)
 
 
 def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False) -> Any:

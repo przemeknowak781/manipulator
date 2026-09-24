@@ -493,13 +493,15 @@ class Twin:
             self._fault, self._note = "", ""
 
     def move(self, joints: Mapping[str, float], duration: float, settle: float = 0.4,
-             owner: str = "kalibracja") -> None:
+             owner: str = "kalibracja", take: bool = True) -> None:
         """Blokujacy przejazd rampa smoothstep - dla sesji kalibracji (`session.Robot`).
 
         Ruch nalezy do `owner`: gdy ramie jest wolne, bierze je (i zostawia - fala
         to wiele przejazdow, a konczy ja `home()`, ktory ramie odbiera); gdy ma
         je ten sam wlasciciel - jedzie; gdy inny - RuntimeError "ramie zajete".
-        Bez tego fala i polityka pisaly cel na zmiane.
+        Bez tego fala i polityka pisaly cel na zmiane. `take=False`: wolnego ramienia
+        nie bierze, tylko RuntimeError - dla fali, ktorej ramie odebrano miedzy
+        przejazdami (inaczej jechalaby dalej na ramieniu polaczonym w tym czasie).
 
         RuntimeError, gdy w trakcie ramie odebrano (dom, STOP, inny wlasciciel),
         rozlaczono albo polaczono na nowo - wtedy fala nie moze liczyc na poze,
@@ -510,6 +512,8 @@ class Twin:
         self._wait_for_homing()
         with self._own_lock:
             if self._owner is None:
+                if not take:
+                    raise RuntimeError(f"ruch przerwany: ramie odebrane ({self._gen_reason or 'nikt go nie ma'})")
                 self._owner, self._preempt_cb = owner, None
             elif self._owner != owner:
                 raise RuntimeError(f"ramie zajete: {self._owner}")

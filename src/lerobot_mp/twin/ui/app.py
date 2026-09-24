@@ -113,7 +113,8 @@ def no_frame_image(text: str = "brak kadru", size: tuple[int, int] = (320, 240))
 
 
 class TwinApp:
-    def __init__(self, workspace: str | Path | None = None, host: str = "0.0.0.0", port: int = 8080):
+    def __init__(self, workspace: str | Path | None = None, host: str = "127.0.0.1", port: int = 8080):
+        self.host = host
         self.ws = Workspace.load(workspace)
         self.ws_path = Path(self.ws.path).resolve() if self.ws.path else None
         self.twin = Twin(self.ws)
@@ -1833,7 +1834,8 @@ class TwinApp:
 
     def run(self) -> None:
         port = self.server.get_port()
-        print(f"Panel blizniaka: http://localhost:{port}  (zdalnie: http://<adres-maszyny>:{port})", flush=True)
+        remote = "  (zdalnie: http://<adres-maszyny>:{port})" if self.host not in ("127.0.0.1", "localhost") else ""
+        print(f"Panel blizniaka: http://localhost:{port}{remote.format(port=port)}", flush=True)
         t_slow = t_map = t_watch = t_list = 0.0
         frames: dict[str, np.ndarray] = {}
         try:
@@ -1889,7 +1891,8 @@ class TwinApp:
 def main(argv: list[str] | None = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="lerobot-twin ui", description="Panel cyfrowego blizniaka w przegladarce.")
-    ap.add_argument("--host", default="0.0.0.0")
+    # Panel steruje ramieniem i nie ma hasla: z sieci tylko na zyczenie (--host 0.0.0.0).
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--workspace", default=None)
     a = ap.parse_args(argv)
