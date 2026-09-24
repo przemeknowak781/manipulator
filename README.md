@@ -27,37 +27,197 @@ gestów, zanim cokolwiek podłączysz.
 
 ---
 
+## Szybki start na nowym komputerze
+
+Repozytorium zawiera wszystko, czego potrzeba do uruchomienia — także modele
+i dane:
+
+| Katalog | Co w nim jest | W repozytorium? |
+|---|---|---|
+| `models/` | modele MediaPipe: dłoń i poza `lite` ([models/README.md](models/README.md)) | tak; brakujący model pobiera się sam |
+| `assets/robots/so101/` | model ramienia z MuJoCo Menagerie z siatkami STL | tak |
+| `assets/so101_preview.npz` | model podglądu 3D aplikacji `lerobot-mp` | tak |
+| `assets/policies/` | polityki bazowe `reach-v3` i `lift-v3` (start do douczania) | tak |
+| `examples/twin.sim.json` | przykładowe stanowisko w symulacji: dwie kamery z zaufaną kalibracją | tak |
+| `workspace/twin.json` | **Twoje** stanowisko: kamery i ich kalibracja, port, stół, zmierzona dynamika | nie — per biurko, powstaje przy pierwszym zapisie w panelu albo przez `lerobot-twin demo` |
+| `workspace/policies/` | polityki, które sam wytrenujesz | nie |
+| `configs/local.yaml` | Twoja konfiguracja (kopia `configs/default.yaml`), np. tiki chwytaka | nie (`.gitignore`) |
+
+Przy uruchomieniu z klonu domyślne ścieżki (`models/…`, `workspace/…`) liczą
+się od katalogu repozytorium, więc `lerobot-twin ui` odpalone z innego
+katalogu trafia w to samo stanowisko. Ścieżki podane w flagach liczą się jak
+zwykle od katalogu bieżącego. Poza repozytorium zostają tylko rzeczy tworzone
+na danej maszynie: kalibracja LeRobota (tylko backend `lerobot`) i pamięć
+podręczna kerneli MuJoCo Warp (ok. 100 s kompilacji przy pierwszym treningu).
+
+**Wymagania:** Python **3.12** (sprawdzony 3.12.10), Git, OpenGL (każda karta
+graficzna, także zintegrowana). Trening polityk wymaga karty **NVIDIA z CUDA**
+(sterownik z obsługą CUDA 12). Bez niej działa wszystko poza treningiem: panel,
+kalibracja, percepcja, identyfikacja dynamiki i ewaluacja polityk na CPU.
+Sprawdzone wersje pakietów są w [`constraints.txt`](constraints.txt).
+
+### 1. Instalacja
+
+**Windows + karta NVIDIA** (PowerShell):
+
+```powershell
+git clone <adres-repozytorium> manipulator
+cd manipulator
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+# torch z CUDA NAJPIERW - torch z PyPI na Windows jest bez CUDA
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -e ".[twin,train,feetech,dev]" -c constraints.txt
+```
+
+Karty RTX 50xx: `cu128` zamiast `cu126`. Mało miejsca na `C:`? Ustaw
+`$env:TMP` i `$env:PIP_CACHE_DIR` na inny dysk przed instalacją (koło torcha
+z CUDA ma ok. 2,6 GB).
+
+**Linux + karta NVIDIA** (x86_64, glibc ≥ 2.28, np. Ubuntu 22.04/24.04):
+
+```bash
+sudo apt install python3.12 python3.12-venv libgl1 libglib2.0-0 libegl1   # Ubuntu 22.04: python3.12 z PPA deadsnakes
+git clone <adres-repozytorium> manipulator && cd manipulator
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -e ".[twin,train,feetech,dev]" -c constraints.txt
+sudo usermod -aG dialout $USER    # dostęp do portu ramienia (po tym wyloguj się i zaloguj)
+```
+
+Torch z PyPI na Linuksie jest z CUDA 13 i wymaga sterownika ≥ 580 — dlatego
+też tu indeks `cu126`. Na serwerze bez ekranu: `export MUJOCO_GL=egl`.
+
+**Bez karty NVIDIA** (Windows, Linux; macOS z Apple Silicon):
+
+```bash
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu   # macOS: pip install torch==2.11.0
+pip install -e ".[twin,feetech,dev]" -c constraints.txt
+```
+
+Linux bez ekranu i bez GPU: dodatkowo `sudo apt install libosmesa6` i
+`export MUJOCO_GL=osmesa`. Sama aplikacja sterowania dłonią (bez bliźniaka,
+bez torcha): `pip install -e ".[feetech]" -c constraints.txt`.
+
+### 2. Sprawdzenie
+
+```bash
+lerobot-twin check
+```
+
+Wypisuje wersje (mujoco, viser, torch, cv2…), model SO-101 i porty USB-serial,
+a osobno gotowość do treningu: torch z CUDA (`cuda.is_available`, karta), warp
+i mujoco_warp. „Trening na GPU: niedostępny” na komputerze bez NVIDIA to nie
+błąd.
+
+### 3. Panel bliźniaka z przykładowym stanowiskiem
+
+```bash
+lerobot-twin demo     # examples/twin.sim.json -> workspace/twin.json (istniejącego nie nadpisze bez --force)
+lerobot-twin ui       # http://localhost:8080
+```
+
+W panelu: zakładka **Ramię** → `sim` → **Połącz**; zakładka **Polityki** →
+`lift-v3`, `lift: skad polozenie kostki` = **kamery**, kostkę kładzie przycisk
+`lift (sim): poloz kostke losowo`. Bez `demo` bliźniak startuje z pustym
+stanowiskiem (ramię `sim`, bez kamer) — kamery dodaje się w zakładce Kamery
+(`Dodaj symulowana przed ramieniem`, potem kalibracja albo
+`Symulowana: uznaj prawdziwa poze za kalibracje`).
+Karta z panelem musi być widoczna: viser w karcie w tle nic nie rysuje.
+
+### 4. Testy
+
+```bash
+pytest -q                     # ok. 6 min na RTX A4500 (+ ok. 100 s kompilacji kerneli Warp za 1. razem)
+pytest -q -m "not render"     # komputer bez OpenGL
+```
+
+Testy GPU pomijają się same bez CUDA albo bez `mujoco_warp`; testy bliźniaka —
+bez `mujoco`/`torch`. Jeden stary test (`test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`)
+jest oznaczony jako znany problem (`xfail`).
+
+### 5. Trening (tylko NVIDIA)
+
+```bash
+lerobot-twin train --task reach --iters 160
+lerobot-twin train --init assets/policies/reach-v3/policy.pt --iters 150    # douczanie polityki bazowej
+lerobot-twin eval workspace/policies/<nazwa>/policy.pt --rand               # ewaluacja, działa na CPU
+```
+
+Wyniki trafiają do `workspace/policies/<nazwa>/`. Na karcie z mniej niż 20 GB
+pamięci dodaj `--envs 2048` albo `1024`.
+
+### 6. Prawdziwe SO-101
+
+Do bliźniaka służy backend `feetech` (sam `pyserial`, bez LeRobota i bez jego
+kalibracji). Port pokaże `lerobot-twin check` albo „Wykryj porty” w panelu
+(Windows `COMx`, Linux `/dev/ttyACM0`). Tiki chwytaka w konfiguracji
+(`robot.gripper_closed_ticks` 1986 / `gripper_open_ticks` 2670) to wartości
+ramienia autora — sprawdź swoje i wpisz je w kopię konfiguracji:
+
+```bash
+cp configs/default.yaml configs/local.yaml      # Windows: copy configs\default.yaml configs\local.yaml
+lerobot-twin --config configs/local.yaml ui
+```
+
+Dalej: [docs/TWIN.md](docs/TWIN.md), „Pierwszy test na prawdziwym stanowisku”, od kroku 0.
+
+### Naprawa OpenCV po LeRobocie
+
+Opcjonalny backend `lerobot` (`pip install -e ".[robot]" -c constraints.txt`,
+tylko Python 3.12) ciągnie `opencv-python-headless`, który podmienia `cv2` na
+wersję bez okien — testy przechodzą, ale okno podglądu `lerobot-mp` się nie
+otwiera. Naprawa:
+
+```bash
+pip uninstall -y opencv-python-headless opencv-python
+pip install --force-reinstall --no-deps opencv-contrib-python==5.0.0.93
+python -c "import cv2; print([l.strip() for l in cv2.getBuildInformation().splitlines() if 'GUI' in l])"
+```
+
+Ostatnie polecenie ma pokazać `WIN32UI` (Windows) albo `GTK`/`QT` (Linux), a nie `NONE`.
+
+---
+
 ## Szybki start
 
 ### Windows
 
 Kliknij dwukrotnie **`start.bat`**. Przy pierwszym uruchomieniu utworzy
-środowisko i zainstaluje zależności, potem pokaże menu: symulator, prawdziwe
-ramię, tryb IK, demo z pliku wideo, diagnostyka.
+środowisko (Python 3.12, jeśli jest) i zainstaluje zależności w wersjach
+z `constraints.txt`, potem pokaże menu: symulator, prawdziwe ramię, tryb IK,
+demo z pliku wideo, diagnostyka, panel bliźniaka.
 
 ### Linux / macOS
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[feetech]" -c constraints.txt
 lerobot-mp                      # symulator + kamera 0
 ```
 
-Model MediaPipe (~8 MB) pobiera się sam przy pierwszym starcie.
+Modele MediaPipe są w repozytorium (`models/`); gdyby ich zabrakło, pobiorą
+się same przy pierwszym starcie.
 
 ### Prawdziwe ramię
 
 ```bash
-pip install "lerobot[feetech]"
+pip install -e ".[feetech]" -c constraints.txt
 lerobot-mp --port /dev/ttyACM0        # Linux
 lerobot-mp --port COM5                # Windows
 ```
 
-Ramię musi być wcześniej skalibrowane narzędziami LeRobot — aplikacja korzysta
-z tej samej kalibracji (`--robot-id` wskazuje jej plik).
+Bez zainstalowanego LeRobota `--port` używa backendu `feetech` — rozmowy wprost
+z serwami, bez kalibracji LeRobota. Z LeRobotem (`.[robot]`) domyślny jest
+backend `lerobot`: ramię musi być wtedy skalibrowane jego narzędziami, a
+`--robot-id` wskazuje plik kalibracji. Backend wybiera się jawnie flagą
+`--robot feetech|lerobot`.
 
 > **Zanim podłączysz robota:** zrób wokół niego miejsce. Sterowanie rusza
-> dopiero po naciśnięciu **SPACJI**, a **X** to zatrzymanie awaryjne.
+> dopiero po naciśnięciu **SPACJI**, **ESC** to zatrzymanie awaryjne, a **X**
+> zamyka aplikację (i odsyła ramię do pozycji domowej).
 
 ### Kiedy system nie widzi ramienia
 
@@ -301,6 +461,8 @@ było mylone z zaciskaniem pięści.
 Panel obok obrazu z kamery pokazuje **rzeczywistą geometrię SO-101**: bryły
 producenta (STEP z `TheRobotStudio/SO-ARM100`) złożone według jego URDF-a,
 zaimportowane z repozytorium [Articulus](https://github.com/przemeknowak781/articulus).
+Model MJCF ramienia — MuJoCo Menagerie (Apache-2.0), modele MediaPipe — Google
+(Apache-2.0). Pełna lista plików osób trzecich: [NOTICE](NOTICE).
 
 Kinematyka podglądu nie jest przepisana drugi raz — łańcuch jest wczytywany
 z eksportu Articulusa jako ciąg kroków `pre @ ruch @ post`. Test
@@ -356,7 +518,7 @@ Nic nie trafia do serw z pominięciem nadzoru (`control/safety.py`):
   zamiast skoku przy pierwszym rozkazie,
 * **watchdog dłoni** — zniknięcie ręki zamraża ruch po 0,4 s, a po 6 s
   odsyła ramię do pozycji domowej,
-* **stop awaryjny** klawiszem `X`,
+* **stop awaryjny** klawiszem `ESC` (drugie `ESC` go kasuje; `X` zamyka aplikację),
 * **`max_relative_target`** przekazywany do LeRobot jako dodatkowy limit
   sprzętowy skoku.
 
@@ -398,10 +560,10 @@ a dla `wrist_flex` i `wrist_roll` **bezwymiarowe przełożenie** (1,0 = ruch 1:1
 ## Bez kamery i bez ekranu
 
 ```bash
-lerobot-mp --source demo.mp4 --no-view --clutch always --record wynik.mp4
+lerobot-mp --source nagranie.mp4 --no-view --clutch always --record wynik.mp4
 ```
 
-Odtwarza plik wideo zamiast kamery i zapisuje cały podgląd — z HUD-em i modelem
+Odtwarza plik wideo (własne nagranie dłoni — w repozytorium nie ma przykładowego) zamiast kamery i zapisuje cały podgląd — z HUD-em i modelem
 3D — do pliku. Przydaje się do demonstracji i do zgłaszania błędów.
 
 ---
@@ -440,12 +602,14 @@ ten sam format, więc działa na obu wersjach.
 ### Testy
 
 ```bash
-pip install pytest && pytest -q
+pip install -e ".[dev]" -c constraints.txt && pytest -q
 ```
 
-174 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
+484 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
 nadzór), kąty ramienia w układzie tułowia, wątek podglądu 3D i zgodność modelu
-ze źródłem oraz cały łańcuch od cech dłoni do symulowanego ramienia.
+ze źródłem, cały łańcuch od cech dłoni do symulowanego ramienia oraz bliźniaka
+(kalibracja, percepcja, RL, panel). Bez extra `[twin]` testy bliźniaka się
+pomijają; bez OpenGL: `pytest -q -m "not render"`.
 
 Kilka z nich sprawdza **skutek fizyczny, a nie wartość stawu** — i to nie jest
 formalność: w kalibracji SO-101 rosnący `shoulder_lift` *opuszcza* ramię, więc
@@ -456,9 +620,13 @@ końcówki go nie przepuszcza.
 
 ## Wymagania
 
-* Python 3.10+
+* Python 3.12 (sama aplikacja `lerobot-mp` działa od 3.10, ale sprawdzany
+  i wymagany przez LeRobota jest 3.12)
 * kamera internetowa
-* dla prawdziwego ramienia: `lerobot[feetech]`, skalibrowane SO-101 i port USB
+* dla prawdziwego ramienia: SO-101 na USB i `.[feetech]` (albo `.[robot]`
+  z LeRobotem i jego kalibracją)
+* bliźniak (`.[twin]`): OpenGL do renderu kamer; trening (`.[train]`):
+  karta NVIDIA z CUDA — szczegóły w „Szybki start na nowym komputerze”
 
 ## Licencja
 

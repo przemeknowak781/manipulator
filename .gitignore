@@ -13,9 +13,12 @@ env/
 .coverage
 htmlcov/
 
-# Pobierane automatycznie modele MediaPipe (~8 MB)
+# Modele MediaPipe: dwa domyslne sa w repozytorium (patrz models/README.md),
+# inne (np. pose_landmarker_full) pobieraja sie same i zostaja lokalne
 models/*.task
 !models/.gitkeep
+!models/hand_landmarker.task
+!models/pose_landmarker_lite.task
 
 # Nagrania / zrzuty z aplikacji
 recordings/
@@ -31,3 +34,6 @@ workspace/
 
 # Ostrzezenia MuJoCo zapisywane przy kompilacji scen
 MUJOCO_LOG.TXT
+
+# Pliki Claude Code (worktree agentow, launch.json) - lokalne, nie do repozytorium
+.claude/

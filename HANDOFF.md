@@ -32,6 +32,29 @@ tą samą ścieżką kodu, którą pójdzie sprzęt:
   poprawione, sprawdzone przez niezależnych weryfikatorów, luki i nowe
   problemy z weryfikacji poprawione w drugiej rundzie — sekcja 2a.
 
+## Repozytorium na innym komputerze
+
+Klon ma wszystko do uruchomienia bez Shadow — instalacja per platforma:
+README, „Szybki start na nowym komputerze”.
+
+- **W repozytorium:** modele MediaPipe (`models/*.task`, źródła i sumy
+  w `models/README.md`), model ramienia i siatki (`assets/robots/so101`),
+  podgląd 3D (`assets/so101_preview.npz`), polityki bazowe (`assets/policies`),
+  przykładowe stanowisko w symulacji (`examples/twin.sim.json`,
+  `lerobot-twin demo`), sprawdzone wersje pakietów (`constraints.txt`),
+  licencje plików osób trzecich (`NOTICE`).
+- **Poza repozytorium (per maszyna):** `workspace/` (stanowisko i własne
+  polityki), `configs/local.yaml` (tiki chwytaka i reszta konfiguracji
+  ramienia, `lerobot-twin --config …`), `.claude/`, cache kerneli Warp,
+  kalibracja LeRobota (tylko backend `lerobot`).
+- Domyślne ścieżki (`models/…`, `workspace/…`) z klonu liczą się od katalogu
+  repozytorium (`src/lerobot_mp/paths.py`), więc katalog uruchomienia nie ma
+  znaczenia; bez klonu — od katalogu bieżącego.
+- `lerobot-twin check` mówi osobno, czy komputer nadaje się do treningu
+  (torch z CUDA, warp, mujoco_warp). Bez NVIDIA działa wszystko poza treningiem.
+- Liczby w tym dokumencie i w TWIN.md są zmierzone na Shadow (RTX A4500);
+  porty `COM11`/`COM12` i numery seryjne CH343 to sprzęt autora.
+
 ---
 
 ## 1. Co się zmieniło względem planu DGX
@@ -65,8 +88,8 @@ czas renderu — zmierzony; PyTorch z CUDA — działa; MJX/Warp — Warp dział
 | `twin/runtime.py` | pętla ramienia: jeden właściciel ruchu, STOP/Dom w zmierzonej pozie, reakcja na błędy serw i utratę łącza, render bez blokady pętli | `tests/test_twin_runtime.py` (czas symulowany) |
 | `robot/feetech.py` | + `socket://` (most, `TCP_NODELAY`), SYNC READ z powrotem do odczytów po kolei, suma kontrolna odpowiedzi, bity błędów serw (`faults()`), limity z EEPROM (`joint_limits()`) | testy na symulowanej magistrali |
 
-Testy: `pytest -q` — wszystko poza znanym, starym `test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`
-(za sztywny próg w samym teście, sprzed bliźniaka).
+Testy: `pytest -q` — wszystko przechodzi; znany, stary `test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`
+(za sztywny próg w samym teście, sprzed bliźniaka) jest oznaczony `xfail`.
 
 ---
 
@@ -165,6 +188,8 @@ niosą teraz krytyka, a stare dostają rozgrzewkę (TWIN.md, *Polityki bazowe*).
    **Przy pierwszym połączeniu sprawdzić zero chwytaka**: chwytak 0 w bliźniaku
    to −5,4° kąta szczęki (tiki z konfiguracji); jeśli na ramieniu przy 0
    szczęki się nie stykają, zero szczęki w MJCF nie leży w `center_ticks`.
+   Poprawka: `robot.center_ticks` / `gripper_closed_ticks` / `gripper_open_ticks`
+   w `configs/local.yaml` i `lerobot-twin --config configs/local.yaml ui`.
 3. **Obserwacje obrazowe w RL** — renderer MuJoCo Warp (wsadowy, na GPU)
    zgadza się z OpenGL do 0,05 px; środowisko obrazowe to kolejny krok
    (mapa stołu z kamer jako wejście, jak w galaxeo).

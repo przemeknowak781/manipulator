@@ -14,6 +14,8 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 import yaml
 
+from .paths import CONFIG_ENV, config_from_env
+
 # Kolejnosc stawow taka sama jak w LeRobot dla SO-100/SO-101.
 JOINT_NAMES: tuple[str, ...] = (
     "shoulder_pan",
@@ -484,8 +486,18 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_config(path: str | Path | None = None, overrides: dict[str, Any] | None = None) -> AppConfig:
-    """Wczytuje konfiguracje: domyslne wartosci <- plik YAML <- nadpisania CLI."""
+    """Wczytuje konfiguracje: domyslne wartosci <- plik YAML <- nadpisania CLI.
+
+    Bez `path` plik bierze sie ze zmiennej srodowiskowej `LEROBOT_MP_CONFIG`
+    (jesli jest ustawiona). Tak blizniak - ktory wola `load_config()` w kilku
+    miejscach, takze w procesie treningu - dostaje tiki chwytaka i port z pliku
+    podanego raz w `lerobot-twin --config ...`.
+    """
     data: dict[str, Any] = {}
+    if path is None:
+        path = config_from_env()
+        if path is not None and not path.is_file():
+            raise FileNotFoundError(f"{CONFIG_ENV}={path}: nie ma takiego pliku konfiguracji")
     if path is not None:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         if not isinstance(raw, dict):

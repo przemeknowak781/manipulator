@@ -10,8 +10,10 @@ rem  Klikniecie dwukrotne otwiera menu. Mozna tez wywolac z argumentami,
 rem  ktore ida prosto do aplikacji, np.:
 rem      start.bat --port COM5 --mode ik
 rem
-rem  Przy pierwszym uruchomieniu tworzy srodowisko .venv i instaluje
-rem  zaleznosci. Kolejne starty sa juz natychmiastowe.
+rem  Przy pierwszym uruchomieniu tworzy srodowisko .venv (Python 3.12,
+rem  jesli jest) i instaluje zaleznosci w wersjach z constraints.txt.
+rem  Kolejne starty sa juz natychmiastowe. Panel blizniaka (opcja 7)
+rem  doinstalowuje swoje pakiety [twin,feetech] przy pierwszym uzyciu.
 rem ===================================================================
 
 cd /d "%~dp0"
@@ -47,6 +49,7 @@ echo     %C_OK%3%C_OFF%  Symulator + tryb IK  %C_DIM%- sterowanie kartezjanskie%
 echo     %C_OK%4%C_OFF%  Demo z pliku wideo   %C_DIM%- bez kamery%C_OFF%
 echo     %C_OK%5%C_OFF%  Diagnostyka          %C_DIM%- testy i wypis konfiguracji%C_OFF%
 echo     %C_OK%6%C_OFF%  Napraw srodowisko    %C_DIM%- przeinstaluj zaleznosci%C_OFF%
+echo     %C_OK%7%C_OFF%  Panel blizniaka      %C_DIM%- symulacja MuJoCo w przegladarce (lerobot-twin ui)%C_OFF%
 echo     %C_OK%0%C_OFF%  Wyjscie
 echo.
 set "PICK="
@@ -62,6 +65,7 @@ if "%PICK%"=="3" goto :m_ik
 if "%PICK%"=="4" goto :m_video
 if "%PICK%"=="5" goto :m_diag
 if "%PICK%"=="6" goto :m_fix
+if "%PICK%"=="7" goto :m_twin
 echo   %C_ERR%Nie znam opcji "%PICK%".%C_OFF%
 goto :menu
 
@@ -83,6 +87,9 @@ goto :menu
 :m_fix
 call :install force
 goto :menu
+:m_twin
+call :run_twin
+goto :menu
 
 rem ===================================================================
 :banner
@@ -96,17 +103,25 @@ exit /b 0
 
 rem --- szukanie Pythona ----------------------------------------------
 :ensure_python
+rem Najpierw 3.12 - z nim sprawdzone sa wszystkie wersje w constraints.txt
+rem (numpy 2.2.6 nie ma kol dla 3.14, LeRobot 0.6 wymaga 3.12).
 set "LAUNCHER="
-py -3 --version >nul 2>&1 && set "LAUNCHER=py -3"
+py -3.12 --version >nul 2>&1 && set "LAUNCHER=py -3.12"
+if not defined LAUNCHER (
+    py -3 --version >nul 2>&1 && set "LAUNCHER=py -3"
+)
 if not defined LAUNCHER (
     python --version >nul 2>&1 && set "LAUNCHER=python"
 )
 if not defined LAUNCHER (
     echo.
     echo   %C_ERR%Nie znalazlem Pythona.%C_OFF%
-    echo   Zainstaluj Pythona 3.10 lub nowszego z https://www.python.org/downloads/
+    echo   Zainstaluj Pythona 3.12 z https://www.python.org/downloads/
     echo   %C_DIM%W instalatorze zaznacz "Add python.exe to PATH".%C_OFF%
     exit /b 1
+)
+if not "%LAUNCHER%"=="py -3.12" (
+    echo   %C_DIM%Uwaga: nie ma Pythona 3.12 - uzywam: %LAUNCHER%. Sprawdzony jest 3.12.%C_OFF%
 )
 exit /b 0
 
@@ -127,10 +142,11 @@ exit /b %ERRORLEVEL%
 echo.
 echo   %C_DIM%Instaluje zaleznosci - to potrwa kilka minut ...%C_OFF%
 "%VENV_PY%" -m pip install --upgrade pip --quiet
+rem [feetech] to sam pyserial - bez niego opcja 2 (prawdziwe ramie) nie ruszy.
 if "%~1"=="force" (
-    "%VENV_PY%" -m pip install --force-reinstall --no-cache-dir -e .
+    "%VENV_PY%" -m pip install --force-reinstall --no-cache-dir -e ".[feetech]" -c constraints.txt
 ) else (
-    "%VENV_PY%" -m pip install -e .
+    "%VENV_PY%" -m pip install -e ".[feetech]" -c constraints.txt
 )
 if errorlevel 1 (
     echo   %C_ERR%Instalacja nie powiodla sie.%C_OFF%
@@ -144,7 +160,7 @@ rem --- uruchomienia ---------------------------------------------------
 :run
 echo.
 echo   %C_DIM%Uruchamiam: lerobot-mp %*%C_OFF%
-echo   %C_DIM%Zamkniecie: klawisz Q w oknie podgladu.%C_OFF%
+echo   %C_DIM%Zamkniecie: klawisz X w oknie podgladu. Stop awaryjny: ESC.%C_OFF%
 echo.
 "%VENV_PY%" -m lerobot_mp %*
 if errorlevel 1 echo   %C_ERR%Aplikacja zakonczyla sie bledem.%C_OFF%
@@ -180,7 +196,8 @@ if "%PORT%"=="" (
 )
 echo.
 echo   %C_ERR%UWAGA:%C_OFF% ramie zaraz sie poruszy. Zrob wokol niego miejsce.
-echo   %C_DIM%Sterowanie rusza dopiero po nacisnieciu SPACJI, a klawisz X to stop awaryjny.%C_OFF%
+echo   %C_DIM%Sterowanie rusza dopiero po nacisnieciu SPACJI, ESC to stop awaryjny,%C_OFF%
+echo   %C_DIM%a X zamyka aplikacje (ramie wraca wtedy do pozycji domowej).%C_OFF%
 pause
 call :run --port %PORT%
 exit /b 0
@@ -203,9 +220,53 @@ echo   %C_TITLE%Konfiguracja%C_OFF%
 "%VENV_PY%" -m lerobot_mp --print-config
 echo.
 echo   %C_TITLE%Testy%C_OFF%
-"%VENV_PY%" -m pip install pytest --quiet
+"%VENV_PY%" -m pip install -e ".[feetech,dev]" -c constraints.txt --quiet
+rem Testy blizniaka pomijaja sie same, jesli panel (opcja 7) nie byl jeszcze instalowany.
 "%VENV_PY%" -m pytest -q
 exit /b 0
+
+rem --- panel blizniaka ------------------------------------------------
+:run_twin
+"%VENV_PY%" -c "import mujoco, viser, gymnasium, torch" >nul 2>&1
+if errorlevel 1 (
+    call :install_twin || exit /b 0
+)
+if not exist "%~dp0workspace\twin.json" (
+    echo.
+    echo   %C_DIM%Nie ma jeszcze stanowiska ^(workspace\twin.json^). Przyklad w symulacji:%C_OFF%
+    echo   %C_DIM%ramie sim i dwie skalibrowane kamery symulowane ^(examples\twin.sim.json^).%C_OFF%
+    set "DEMO="
+    set /p "DEMO=  Wczytac przyklad? [T/n]: "
+    if /i not "!DEMO!"=="n" "%VENV_PY%" -m lerobot_mp.twin.cli demo
+)
+echo.
+echo   %C_OK%Panel: http://localhost:8080%C_OFF%  %C_DIM%- otworz w przegladarce; karta musi byc widoczna.%C_OFF%
+echo   %C_DIM%Zamkniecie: Ctrl+C w tym oknie.%C_OFF%
+echo.
+"%VENV_PY%" -m lerobot_mp.twin.cli ui
+exit /b 0
+
+:install_twin
+echo.
+echo   %C_DIM%Pierwsze uruchomienie panelu - instaluje MuJoCo, viser i torcha ...%C_OFF%
+rem torch NAJPIERW z indeksu PyTorcha: z PyPI na Windows jest bez CUDA.
+rem Z karta NVIDIA - kolo z CUDA (ok. 2,6 GB), bez niej - CPU (panel dziala i tak).
+where nvidia-smi >nul 2>&1
+if errorlevel 1 (
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
+) else (
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu126"
+)
+"%VENV_PY%" -m pip install torch==2.11.0 --index-url !TORCH_INDEX!
+if errorlevel 1 goto :install_twin_fail
+"%VENV_PY%" -m pip install -e ".[twin,feetech]" -c constraints.txt
+if errorlevel 1 goto :install_twin_fail
+echo   %C_OK%Gotowe.%C_OFF% %C_DIM%Trening na GPU: pip install -e ".[train]" -c constraints.txt%C_OFF%
+exit /b 0
+:install_twin_fail
+echo   %C_ERR%Instalacja panelu nie powiodla sie.%C_OFF%
+echo   %C_DIM%Sprawdz polaczenie z internetem i wolne miejsce na dysku.%C_OFF%
+exit /b 1
 
 rem ===================================================================
 :fail

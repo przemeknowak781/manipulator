@@ -21,9 +21,11 @@ import numpy as np
 import torch
 from torch import nn
 
+from ...paths import data_path
 from . import task as tk
 
-DEFAULT_DIR = Path("workspace") / "policies"
+#: Polityki stanowiska. W klonie repozytorium wzgledem jego korzenia (`lerobot_mp.paths`).
+DEFAULT_DIR = data_path(Path("workspace") / "policies")
 
 
 def mlp(sizes: list[int], out: int) -> nn.Sequential:

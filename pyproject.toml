@@ -9,24 +9,32 @@ description = "Sterowanie ramieniem LeRobot 101 (SO-101) gestami dloni przy uzyc
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+# Wersje sprawdzone razem sa w constraints.txt:  pip install -e ".[...]" -c constraints.txt
 dependencies = [
     "mediapipe>=0.10.9",
-    "opencv-python>=4.8",
+    # contrib, nie opencv-python: mediapipe i tak ciagnie opencv-contrib-python, a oba
+    # pakiety zapisuja ten sam katalog cv2/ - dwa naraz nadpisuja sie nawzajem.
+    "opencv-contrib-python>=4.8",
     "numpy>=1.24",
     "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
-robot = ["lerobot[feetech]>=0.3.0"]
+# Backend `lerobot` (LeRobot 0.6 wymaga Pythona 3.12). Ciagnie opencv-python-headless,
+# ktory psuje okno podgladu - naprawa w README ("Naprawa OpenCV po LeRobocie").
+robot = ["lerobot[feetech]>=0.6,<0.7; python_version>='3.12'"]
 # Sterowanie serwami wprost, bez LeRobota i bez torcha.
 feetech = ["pyserial>=3.5"]
 # Most COM <-> TCP - potrzebny tylko na maszynie, do ktorej wpiete jest ramie.
 bridge = ["pyserial>=3.5"]
-# Cyfrowy blizniak: symulacja, srodowisko RL i panel webowy.
-twin = ["mujoco>=3.3", "gymnasium>=1.0", "viser>=1.1", "pyserial>=3.5"]
-# Trening na GPU: tysiace swiatow MuJoCo Warp + PPO w torchu. UWAGA: na Windows
-# PyPI daje torch BEZ CUDA - koło z CUDA trzeba wziac z indeksu PyTorcha, patrz docs/TWIN.md.
-train = ["mujoco>=3.14", "mujoco-warp>=3.14", "torch>=2.2"]
+# Cyfrowy blizniak: symulacja, srodowisko RL, panel webowy i polityki (torch - takze bez GPU).
+# UWAGA: torch zainstaluj NAJPIERW z indeksu PyTorcha (cu126 albo cpu), patrz README.
+twin = ["mujoco>=3.14,<3.15", "gymnasium>=1.0", "viser>=1.1", "pyserial>=3.5", "torch>=2.7,<2.12"]
+# Trening na GPU: tysiace swiatow MuJoCo Warp + PPO w torchu. mujoco i mujoco-warp musza
+# miec te sama wersje. Na Windows PyPI daje torch BEZ CUDA - kolo z CUDA z indeksu PyTorcha.
+train = ["mujoco>=3.14,<3.15", "mujoco-warp>=3.14,<3.15", "torch>=2.7,<2.12"]
+# Skrypty z research/3d (otoczki wypukle, dobor chwytu).
+research = ["trimesh>=4,<6"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]

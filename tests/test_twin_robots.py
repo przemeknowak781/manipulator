@@ -12,10 +12,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from lerobot_mp.twin.kinematics import RobotKinematics, inverse
-from lerobot_mp.twin.robots import SO101, get_spec
-
+# Przed importem blizniaka: kinematics importuje mujoco, a bez niego (instalacja
+# bez [twin]) caly plik ma sie pominac, a nie przerwac zbieranie testow.
 mujoco = pytest.importorskip("mujoco")
+
+from lerobot_mp.twin.kinematics import RobotKinematics, inverse  # noqa: E402
+from lerobot_mp.twin.robots import SO101, get_spec  # noqa: E402
 
 
 @pytest.fixture(scope="module")

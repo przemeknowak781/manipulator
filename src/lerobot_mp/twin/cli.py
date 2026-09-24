@@ -1,6 +1,7 @@
 """Wiersz polecen blizniaka: `lerobot-twin <polecenie>`.
 
-    lerobot-twin check                       # czy srodowisko jest gotowe (bez renderu)
+    lerobot-twin check                       # czy srodowisko jest gotowe (bez renderu), takze GPU
+    lerobot-twin demo                        # przykladowe stanowisko w symulacji (2 kamery)
     lerobot-twin card --tag-mm 50            # arkusz karty kalibracyjnej do druku
     lerobot-twin board --square-mm 28        # tablica ChArUco do intrynsyk kamery
     lerobot-twin calib-sim --n 5 --cameras 2 # kalibracja w symulacji, oceniana wzgledem prawdy
@@ -10,6 +11,10 @@
     lerobot-twin policies                    # zapisane polityki i ich wyniki
     lerobot-twin ui                          # panel w przegladarce: http://localhost:8080
     lerobot-twin ui --host 0.0.0.0           # ... dostepny z sieci (bez hasla - tylko w zaufanej)
+    lerobot-twin --config configs/local.yaml ui   # tiki chwytaka, baudrate itd. z pliku YAML
+
+`--config` ustawia zmienna LEROBOT_MP_CONFIG, wiec plik widzi tez proces treningu
+uruchamiany z panelu.
 """
 
 from __future__ import annotations
@@ -34,13 +39,17 @@ def _check(_: argparse.Namespace) -> int:
 
     print("lerobot-twin: sprawdzenie srodowiska\n")
     line("Python", f"{sys.version.split()[0]} ({platform.machine()}, {platform.system()})")
-    for mod in ("mujoco", "gymnasium", "viser", "cv2", "numpy"):
+    for mod in ("mujoco", "gymnasium", "viser", "cv2", "numpy", "torch"):
         try:
             m = __import__(mod)
             line(mod, getattr(m, "__version__", "?"))
         except ImportError as exc:
             line(mod, f"brak ({exc}) - pip install -e \".[twin]\"", False)
     line("MUJOCO_GL", os.environ.get("MUJOCO_GL", "(domyslny: glfw; bez ekranu ustaw egl)"))
+    from ..paths import CONFIG_ENV, config_from_env
+
+    cfg_file = config_from_env()
+    line("konfiguracja", f"{cfg_file} ({CONFIG_ENV})" if cfg_file else "domyslna (bez --config)")
 
     try:
         from .kinematics import RobotKinematics
@@ -75,8 +84,67 @@ def _check(_: argparse.Namespace) -> int:
     except ImportError:
         line("pyserial", "brak - potrzebny do prawdziwego ramienia", False)
 
+    gpu_ok, gpu_lines = _gpu_report()
+    print("\nTrening na GPU (lerobot-twin train) - opcjonalny:")
+    for label, value in gpu_lines:
+        print(f"  --   {label:<28} {value}")
+    print("  " + ("Trening na GPU: gotowy." if gpu_ok else
+                  "Trening na GPU: niedostepny. Wymaga karty NVIDIA z CUDA, torcha z CUDA i mujoco-warp\n"
+                  "  (pip install -e \".[train]\"). Panel, kalibracja, percepcja i ewaluacja polityk\n"
+                  "  na CPU dzialaja bez tego."))
+
     print("\nWszystko gotowe." if ok else "\nSa bledy - patrz wyzej.")
     return 0 if ok else 1
+
+
+def _gpu_report() -> tuple[bool, list[tuple[str, str]]]:
+    """Co wiadomo o GPU: torch (wersja, CUDA, karta), warp i mujoco_warp. Nic tu nie jest bledem."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    out: list[tuple[str, str]] = []
+    ready = True
+    try:
+        import torch
+
+        cuda_build = torch.version.cuda
+        avail = bool(torch.cuda.is_available())
+        name = torch.cuda.get_device_name(0) if avail else "-"
+        out.append(("torch CUDA", f"kompilacja CUDA {cuda_build or 'brak (kolo CPU)'}, "
+                                  f"cuda.is_available={avail}, karta: {name}"))
+        ready &= avail
+    except ImportError:
+        out.append(("torch", "brak"))
+        ready = False
+    try:
+        import warp as wp
+
+        try:  # bez bannera przy inicjalizacji
+            wp.config.log_level = wp.LOG_WARNING
+        except AttributeError:  # pragma: no cover - starszy warp
+            wp.config.quiet = True
+        wp.init()
+        n = wp.get_cuda_device_count()
+        names = ", ".join(d.name for d in wp.get_cuda_devices()) if n else "brak karty CUDA"
+        out.append(("warp", f"{wp.config.version}, widzi GPU: {names}"))
+        ready &= n > 0
+    except ImportError:
+        out.append(("warp", "brak - pip install -e \".[train]\""))
+        ready = False
+    except Exception as exc:  # noqa: BLE001 - sterownik, CUDA: tylko raport
+        out.append(("warp", f"{type(exc).__name__}: {exc}"))
+        ready = False
+    try:
+        import mujoco_warp  # noqa: F401
+
+        try:
+            ver = version("mujoco-warp")
+        except PackageNotFoundError:  # pragma: no cover
+            ver = "?"
+        out.append(("mujoco_warp", ver))
+    except ImportError:
+        out.append(("mujoco_warp", "brak - pip install -e \".[train]\""))
+        ready = False
+    return ready, out
 
 
 def _card(a: argparse.Namespace) -> int:
@@ -128,7 +196,7 @@ def _workspace(a: argparse.Namespace) -> int:
     print(f"  ramie: {ws.robot}, backend: {ws.backend}, port: {ws.port or '-'}")
     print(f"  karta: tag {ws.card_obj().tag_size * 1000:.1f} mm")
     if not ws.cameras:
-        print("  kamery: brak")
+        print("  kamery: brak  (przyklad w symulacji z dwiema kamerami: lerobot-twin demo)")
     for cam in ws.cameras:
         cal = cam.calibration
         state = ("zaufana" if cam.trusted else f"NIEZAUFANA ({cal.get('reason', '')})") if cam.calibrated \
@@ -136,6 +204,38 @@ def _workspace(a: argparse.Namespace) -> int:
         rms = f", residuum {cal['rms_px']:.2f} px" if "rms_px" in cal else ""
         print(f"  kamera {cam.name}: zrodlo {cam.source}, {cam.width}x{cam.height}, "
               f"intrynsyki {cam.intrinsics_from}, {state}{rms}")
+    return 0
+
+
+#: Przykladowe stanowisko w symulacji - dwie kamery, ktorych skalibrowana poza
+#: jest ich prawdziwa poza w scenie (zaufane), wiec "kostka z kamer" dziala od razu.
+DEMO_WORKSPACE = Path("examples") / "twin.sim.json"
+
+
+def _demo(a: argparse.Namespace) -> int:
+    import shutil
+
+    from ..paths import data_path
+    from .robots import resolve_asset
+
+    src = resolve_asset(DEMO_WORKSPACE)
+    if not src.is_file():
+        print(f"Brak {DEMO_WORKSPACE} - to polecenie dziala z klonu repozytorium.", file=sys.stderr)
+        return 1
+    # To samo co workspace.default_path(), ale bez importu `workspace` (ciagnie mujoco).
+    dst = Path(a.path) if a.path else data_path(Path("workspace") / "twin.json")
+    if dst.exists() and not a.force:
+        print(f"{dst} juz istnieje - nie nadpisuje (to moze byc Twoja kalibracja).\n"
+              f"Nadpisz: lerobot-twin demo --force   albo inny plik: lerobot-twin demo --path <plik>",
+              file=sys.stderr)
+        return 1
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    print(f"Skopiowano {src} -> {dst}")
+    print("Stanowisko w symulacji: ramie sim, dwie kamery symulowane (sym-lewa, sym-prawa) z zaufana kalibracja.")
+    ws_flag = f" --workspace {dst}" if a.path else ""
+    print(f"Dalej: lerobot-twin ui{ws_flag}  ->  Ramie: sim, Polacz  ->  Polityka: lift-v3,"
+          f" 'lift: skad polozenie kostki' = kamery.")
     return 0
 
 
@@ -267,16 +367,55 @@ def _ui(a: argparse.Namespace) -> int:
     return ui_main(argv)
 
 
+def _use_config(path: str) -> None:
+    """Ustawia LEROBOT_MP_CONFIG (sciezka bezwzgledna) i od razu sprawdza plik.
+
+    Zmienna, a nie argument, bo blizniak wola `load_config()` w wielu miejscach,
+    a trening z panelu idzie w osobnym procesie - dziedziczy ja ze srodowiska.
+    """
+    import yaml
+
+    from ..config import load_config
+    from ..paths import CONFIG_ENV
+
+    cfg = Path(path).expanduser().resolve()
+    if not cfg.is_file():
+        raise SystemExit(f"lerobot-twin: --config {path}: nie ma takiego pliku")
+    os.environ[CONFIG_ENV] = str(cfg)
+    try:
+        load_config()                                  # nieznany klucz = blad teraz, nie w polowie sesji
+    except (ValueError, TypeError, yaml.YAMLError) as exc:
+        raise SystemExit(f"lerobot-twin: --config {path}: {exc}") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     a = parser().parse_args(argv)
+    if getattr(a, "config", None):
+        _use_config(a.config)
     return a.fn(a)
 
 
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lerobot-twin", description="Cyfrowy blizniak stanowiska SO-101.")
+    config_help = ("plik YAML konfiguracji (np. configs/local.yaml: robot.center_ticks, "
+                   "gripper_*_ticks, baudrate); ustawia LEROBOT_MP_CONFIG")
+    ap.add_argument("--config", default=None, help=config_help)
+    # To samo po nazwie polecenia (`lerobot-twin ui --config ...`); SUPPRESS nie nadpisuje wartosci sprzed niej.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=argparse.SUPPRESS, help=config_help)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    _add_parser = sub.add_parser
 
-    sub.add_parser("check", help="sprawdz srodowisko (bez renderu)").set_defaults(fn=_check)
+    def add_parser(*args, **kw):
+        return _add_parser(*args, parents=[common], **kw)
+    sub.add_parser = add_parser  # type: ignore[method-assign]
+
+    sub.add_parser("check", help="sprawdz srodowisko (bez renderu), takze GPU do treningu").set_defaults(fn=_check)
+
+    p = sub.add_parser("demo", help="przykladowe stanowisko w symulacji -> workspace/twin.json")
+    p.add_argument("--path", default=None, help="plik docelowy (domyslnie workspace/twin.json)")
+    p.add_argument("--force", action="store_true", help="nadpisz istniejacy plik stanowiska")
+    p.set_defaults(fn=_demo)
 
     p = sub.add_parser("card", help="arkusz karty kalibracyjnej do druku")
     p.add_argument("--out", default="karta_kalibracyjna.png")

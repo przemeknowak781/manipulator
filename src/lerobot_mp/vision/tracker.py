@@ -14,15 +14,32 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import TrackerConfig
+from ..config import ArmTrackingConfig, TrackerConfig
+from ..paths import data_path
 from .landmarks import HandSample, TrackResult
 
 logger = logging.getLogger(__name__)
 
+#: Domyslne sciezki modeli z konfiguracji - te pliki sa w repozytorium (models/README.md).
+_DEFAULT_MODEL_PATHS = frozenset({TrackerConfig.model_path, ArmTrackingConfig.model_path})
+
+
+def model_location(model_path: str | Path) -> Path:
+    """Gdzie szukac modelu: domyslna sciezka z konfiguracji liczy sie od korzenia klonu.
+
+    Tylko wartosci domyslne (`models/hand_landmarker.task`,
+    `models/pose_landmarker_lite.task`) - modele dostarczone w repozytorium -
+    ida przez `paths.data_path`. Inna sciezka wzgledna zostaje wzgledem CWD.
+    """
+    path = Path(model_path).expanduser()
+    if not path.is_absolute() and path.as_posix() in _DEFAULT_MODEL_PATHS:
+        return data_path(path)
+    return path
+
 
 def download_model(model_path: str, url: str, label: str = "MediaPipe") -> Path:
     """Zwraca sciezke do modelu `.task`, pobierajac go przy pierwszym uzyciu."""
-    path = Path(model_path).expanduser()
+    path = model_location(model_path)
     if path.is_file() and path.stat().st_size > 0:
         return path
 

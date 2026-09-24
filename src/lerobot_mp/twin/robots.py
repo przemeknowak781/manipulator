@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-#: Korzen repozytorium - `src/lerobot_mp/twin/robots.py` -> trzy poziomy wyzej.
-REPO_ROOT = Path(__file__).resolve().parents[3]
+#: Korzen repozytorium (wspolny dla calego pakietu, patrz `lerobot_mp.paths`).
+from ..paths import REPO_ROOT
 
 
 def resolve_asset(path: str | Path) -> Path:
