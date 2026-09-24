@@ -27,7 +27,7 @@ from lerobot_mp.twin.rl.env import TwinEnv  # noqa: E402
 from lerobot_mp.twin.rl.policy import Policy, bundled_dir  # noqa: E402
 from lerobot_mp.twin.rl.randomize import Randomization  # noqa: E402
 
-REACH = bundled_dir() / "reach-v2" / "policy.pt"
+REACH = bundled_dir() / "reach-v3" / "policy.pt"
 LIFT = bundled_dir() / "lift-v3" / "policy.pt"
 #: "Przy limicie" = rozkaz stawu blizej niz 1 st. od limitu (`task.Limits`).
 NEAR_LIMIT = np.radians(1.0)
@@ -108,15 +108,17 @@ def test_shipped_lift_lifts_ends_and_keeps_the_arm_calm(rand, episodes):
     check_lift(lift_report(pol, rand, episodes), pol.task.lift_height)
 
 
-@pytest.mark.skipif(not REACH.is_file(), reason="brak bazowej polityki reach-v2 w assets/policies")
+@pytest.mark.skipif(not REACH.is_file(), reason="brak bazowej polityki reach-v3 w assets/policies")
 def test_shipped_reach_ends_near_the_goal():
     pol = Policy.load(REACH)
     eps, limits = run(pol, Randomization.nominal(), 20)
     dist = np.array([e.end for e in eps])
     assert all(e.info["success"] for e in eps)
     assert dist.max() < 0.005 and np.median(dist) < 0.003, dist           # zmierzone: mediana 1,8 mm, max 2,9 mm
-    # Ramie (bez obrotu nadgarstka) nie jedzie na limity. `wrist_roll` reach-v2 kreci do +150 st.
-    # w kazdym epizodzie (643 takty z 2000 przy limicie) - obrot nie zmienia TCP, wiec nagroda
-    # reach go nie widzi. Nie blokujemy tego testem, bo to wymaga douczenia, a nie poprawki kodu.
-    near = sum(int(e.near_limit(limits, slice(0, 4)).sum()) for e in eps)
+    # Zaden staw ramienia nie jedzie na limit - takze obrot nadgarstka. Obrot nie zmienia TCP,
+    # wiec nagroda reach go nie widziala: reach-v2 krecila nim do +150 st. w kazdym epizodzie
+    # (729 z 2000 taktow przy limicie). reach-v3 uczona z `roll_penalty`: mediana 13 st., max 48.
+    near = sum(int(e.near_limit(limits).sum()) for e in eps)
     assert near == 0, near
+    roll = np.degrees(np.abs(np.concatenate([e.q_cmd[:, 4] for e in eps]) - limits.home[4]))
+    assert roll.max() < 90.0 and np.median(roll) < 30.0, (np.median(roll), roll.max())

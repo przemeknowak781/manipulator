@@ -96,7 +96,7 @@ def test_observation_and_reward_are_the_same_in_numpy_and_torch(name):
     act, prev = rng.uniform(-1, 1, (n, 6)), rng.uniform(-1, 1, (n, 6))
     jaws = rng.integers(0, 2, (n, 2)).astype(float)
 
-    task = tk.make_task(name, limit_penalty=0.5, hold_still=0.5, end_on_success=2)
+    task = tk.make_task(name, limit_penalty=0.5, hold_still=0.5, end_on_success=2, roll_penalty=0.3)
     cube[: n // 2, 2] = 0.09                                   # polowa "podniesiona" - sukces i kara za ruch
     streak = rng.integers(0, 3, n)
 
@@ -258,6 +258,23 @@ def test_old_lift_policy_file_stops_on_success_too():
         old.pop(k)
     meta = PolicyMeta(task=old, hidden=[8], obs_dim=tk.OBS_DIMS["lift"], act_dim=6)
     assert meta.task_config().end_on_success == 10
+
+
+def test_reach_reward_keeps_the_wrist_roll_near_home():
+    """Obrot nadgarstka nie zmienia TCP - bez kary reach-v2 krecila nim do limitu +150 st."""
+    task = tk.make_task("reach")
+    env = TwinEnv(task, randomization=Randomization.none())
+    lim = env.limits
+    env.close()
+    tcp = goal = np.zeros((2, 3))
+    act = prev = np.zeros((2, 6))
+    q = np.repeat(lim.home[None], 2, axis=0)
+    q[1, 4] = np.radians(150.0)
+    r, s, _ = tk.reward(np, task, tcp, act, prev, goal=goal, q_cmd=q, limits=lim)
+    assert s.all() and r[0] - r[1] > 0.1                      # 150 st. kosztuje wyraznie
+    q[1, 4] = lim.home[4] + np.radians(20.0)
+    r, _, _ = tk.reward(np, task, tcp, act, prev, goal=goal, q_cmd=q, limits=lim)
+    assert r[0] - r[1] < 0.01                                 # 20 st. prawie nic
 
 
 def test_lift_reward_pushes_away_from_joint_limits_and_holds_still_after_success():

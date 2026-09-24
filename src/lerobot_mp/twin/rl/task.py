@@ -76,6 +76,10 @@ class TaskConfig:
     #: Kara za ruch ramienia, gdy zadanie jest juz wykonane: waga * ||a_ramie||^2.
     #: Seria `end_on_success` ma byc trzymaniem kostki, a nie wymachem z nia.
     hold_still: float = 0.0
+    #: Kara za obrot nadgarstka od pozy domowej: waga * ((q_roll - dom) / pi)^2. W reach
+    #: nagroda liczy tylko polozenie TCP, a obrot nadgarstka go nie zmienia - reach-v2
+    #: krecila nim do limitu +150 st. w kazdym epizodzie (643 z 2000 taktow przy limicie).
+    roll_penalty: float = 0.0
 
     @property
     def obs_dim(self) -> int:
@@ -102,6 +106,8 @@ def make_task(name: str = "reach", **overrides) -> TaskConfig:
     if name not in TASKS:
         raise ValueError(f"nieznane zadanie {name!r}; dostepne: {', '.join(TASKS)}")
     base = TaskConfig(name=name, episode_steps=100 if name == "reach" else 200)
+    if name == "reach":
+        base = replace(base, roll_penalty=0.5)
     if name == "lift":
         base = replace(base, end_on_success=10, limit_penalty=0.5, hold_still=0.5)
     return replace(base, **overrides)
@@ -208,6 +214,9 @@ def reward(xp, task: TaskConfig, tcp, action, prev_action, goal=None, cube_pos=N
     cost = task.action_rate * ((action - prev_action) ** 2).sum(-1)
     if task.limit_penalty > 0 and q_cmd is not None and limits is not None:
         cost = cost + limit_cost(xp, task, limits, q_cmd)
+    if task.roll_penalty > 0 and q_cmd is not None and limits is not None:
+        roll = (q_cmd[..., 4] - float(limits.home[4])) / np.pi
+        cost = cost + task.roll_penalty * roll * roll
     if task.name == "reach":
         d = _norm(goal - tcp)
         # Dwie skale: zgrubna ciagnie z daleka, dokladna nagradza ostatnie milimetry.

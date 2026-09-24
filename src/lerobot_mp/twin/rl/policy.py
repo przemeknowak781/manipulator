@@ -130,7 +130,7 @@ class Policy(nn.Module):
 
 
 def bundled_dir() -> Path:
-    """Polityki bazowe z repozytorium (`reach-v2`, `lift-v3`) - start do douczania na swoim ramieniu."""
+    """Polityki bazowe z repozytorium (`reach-v3`, `lift-v3`) - start do douczania na swoim ramieniu."""
     from ..robots import REPO_ROOT
 
     return REPO_ROOT / "assets" / "policies"
