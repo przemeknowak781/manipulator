@@ -52,6 +52,15 @@ class FakeBusLink:
         }
         #: Slad operacji: ("ping"|"read"|"write"|"sync", id, addr, wartosc).
         self.log: list[tuple] = []
+        #: Bajt bledu, ktory serwo wpisuje w kazda odpowiedz (0x20 = przeciazenie).
+        self.status: dict[int, int] = {}
+        #: Serwa, ktore przestaly odpowiadac (odlaczony przewod, zgubione ramki).
+        self.mute: set[int] = set()
+        #: Cala magistrala milczy - tak wyglada zerwany most sieciowy.
+        self.silent = False
+        #: Serwa, ktorych NASTEPNA odpowiedz z danymi dostanie przeklamany bit
+        #: przy niezmienionej sumie kontrolnej - zaklocenie na linii TTL.
+        self.corrupt_next: set[int] = set()
         self._out = bytearray()
         self.closed = False
 
@@ -126,8 +135,14 @@ class FakeBusLink:
         return len(data)
 
     def _reply(self, dev_id: int, payload: bytes) -> None:
-        body = bytes([dev_id, len(payload) + 2, 0x00]) + payload
-        self._out += b"\xff\xff" + body + bytes([checksum(body)])
+        if self.silent or dev_id in self.mute:
+            return
+        body = bytes([dev_id, len(payload) + 2, self.status.get(dev_id, 0)]) + payload
+        packet = bytearray(b"\xff\xff" + body + bytes([checksum(body)]))
+        if dev_id in self.corrupt_next and payload:
+            self.corrupt_next.discard(dev_id)
+            packet[-2] ^= 0x08                       # bit 3 starszego bajtu: 2048 tikow -> 0
+        self._out += packet
 
     # ------------------------------------------------------------- pomocnicze
     def ops(self, kind: str) -> list[tuple]:
@@ -244,20 +259,197 @@ def test_all_six_targets_go_out_in_a_single_packet(arm_cfg):
     assert link.ops("write") == []
 
 
-def test_a_lost_reply_keeps_the_previous_position(arm_cfg):
-    """Zgubiona ramka nie ma prawa udawac skoku stawu."""
+def test_a_servo_lost_inside_sync_read_keeps_its_previous_position(arm_cfg):
+    """Zgubiona ramka nie ma prawa udawac skoku stawu - ani zamrozic pozostalych.
+
+    Rejestry zmieniaja sie PO pierwszym odczycie: inaczej "poprzednia wartosc"
+    i swiezy odczyt bylyby tym samym i test niczego by nie sprawdzal (tak bylo,
+    odkad odczyt przeszedl na SYNC READ - zgubiona ramke wchlanial ponowny odczyt).
+    """
     arm, link = connected(arm_cfg)
-    link.registers[1][ADDR_PRESENT_POSITION] = 2048 + 512
     before = arm.read_joints()["shoulder_pan"]
+    link.registers[1][ADDR_PRESENT_POSITION] = 2048 + 512
+    link.registers[3][ADDR_PRESENT_POSITION] = 2048 + 256
+    link.mute = {1}
+    positions = arm.read_joints()
+    assert positions["shoulder_pan"] == pytest.approx(before)
+    assert positions["elbow_flex"] == pytest.approx(22.5)          # reszta czytana dalej
 
-    original_read = link.read
 
-    def drop_first(size: int = 1) -> bytes:
-        link.read = original_read
-        return b""
+def test_a_lost_single_read_keeps_the_previous_position(arm_cfg):
+    """To samo na starym firmware, ktory czyta stawy po kolei."""
+    link = FakeBusLink()
+    link.knows_sync_read = False
+    arm, _ = connected(arm_cfg, link)
+    for _ in range(3):
+        before = arm.read_joints()
+    assert not arm._sync_read_ok
+    link.registers[1][ADDR_PRESENT_POSITION] = 2048 + 512
+    link.registers[3][ADDR_PRESENT_POSITION] = 2048 + 256
+    link.mute = {1}
+    positions = arm.read_joints()
+    assert positions["shoulder_pan"] == pytest.approx(before["shoulder_pan"])
+    assert positions["elbow_flex"] == pytest.approx(22.5)
 
-    link.read = drop_first
-    assert arm.read_joints()["shoulder_pan"] == pytest.approx(before)
+
+def test_a_reply_with_a_bad_checksum_is_rejected(arm_cfg):
+    """Jeden przeklamany bit na linii TTL dawal -180 stopni zamiast 0 - i to szlo jako rozkaz."""
+    arm, link = connected(arm_cfg)
+    before = arm.read_joints()
+    link.corrupt_next = {1}
+    positions = arm.read_joints()
+    assert positions["shoulder_pan"] == pytest.approx(before["shoulder_pan"])
+    assert arm.bus.corrupt_replies == 1
+
+
+def test_a_corrupted_frame_inside_sync_read_does_not_drop_the_rest(arm_cfg):
+    """Cala ramka przeczytana (tylko tresc zla) - strumien jest rowny, reszta serw sie liczy."""
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    link.corrupt_next = {1}
+    got = arm.bus.sync_read(ADDR_PRESENT_POSITION, 2, [1, 2, 3, 4, 5, 6])
+    assert set(got) == {2, 3, 4, 5, 6}
+
+
+def test_a_reply_too_short_to_hold_a_checksum_does_not_crash():
+    """LEN < 2 to nie odpowiedz - wczesniej konczylo sie IndexError w petli sterowania."""
+    link = FakeBusLink()
+    bus = FeetechBus("COM_TEST")
+    bus.open(link=link)
+
+    def garbage(data: bytes) -> int:
+        link._out += b"\xff\xff\x01\x00"
+        return len(data)
+
+    link.write = garbage
+    assert bus.read(1, ADDR_PRESENT_POSITION, 2) is None
+
+
+def test_connect_takes_the_start_position_only_from_two_matching_reads(arm_cfg):
+    """Pozycja startowa staje sie celem przed zalaczeniem momentu - jeden zly odczyt to skok ramienia."""
+    link = FakeBusLink()
+    real_write = link.write
+    glitches = {"left": 1}
+
+    def glitchy(data: bytes) -> int:
+        n = real_write(data)
+        # Pierwszy odczyt pozycji barku wraca z inna wartoscia (z poprawna suma) - raz.
+        if data[4] == INST_READ and data[2] == 1 and data[5] == ADDR_PRESENT_POSITION and glitches["left"]:
+            glitches["left"] -= 1
+            link._out.clear()
+            link._reply(1, (100).to_bytes(2, "little"))
+        return n
+
+    link.write = glitchy
+    connected(arm_cfg, link)
+    assert link.registers[1][ADDR_GOAL_POSITION] == REST_TICKS
+
+
+def test_connect_refuses_an_arm_that_keeps_moving(arm_cfg):
+    link = FakeBusLink()
+    real_write = link.write
+
+    def drifting(data: bytes) -> int:
+        if data[4] == INST_READ and data[2] == 2 and data[5] == ADDR_PRESENT_POSITION:
+            link.registers[2][ADDR_PRESENT_POSITION] += 100
+        return real_write(data)
+
+    link.write = drifting
+    with pytest.raises(RuntimeError, match="shoulder_lift"):
+        connected(arm_cfg, link)
+    assert all(regs[ADDR_TORQUE_ENABLE] == 0 for regs in link.registers.values())
+
+
+def test_servo_protection_bits_are_reported_as_faults(arm_cfg):
+    """Serwo w ochronie zwalnia moment, ale dalej odpowiada - bez tego wygladalo na zdrowe."""
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    assert arm.faults() == []
+    link.status[2] = 0x20
+    arm.read_joints()
+    faults = arm.faults()
+    assert len(faults) == 1
+    assert "shoulder_lift" in faults[0] and "przeciazenie" in faults[0]
+    link.status[2] = 0
+    arm.read_joints()
+    assert arm.faults() == []
+
+
+def test_a_dead_link_is_reported_after_consecutive_failed_reads(arm_cfg):
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    link.silent = True
+    for _ in range(4):
+        arm.read_joints()
+    assert arm.faults() == []                       # kilka zgubionych ramek to jeszcze nie awaria
+    arm.read_joints()
+    assert any("brak odpowiedzi serw od" in fault for fault in arm.faults())
+    link.silent = False
+    arm.read_joints()
+    assert arm.faults() == []
+
+
+def test_a_single_dead_servo_is_named_in_the_fault(arm_cfg):
+    arm, link = connected(arm_cfg)
+    link.mute = {4}
+    for _ in range(5):
+        arm.read_joints()
+    faults = arm.faults()
+    assert len(faults) == 1 and "wrist_flex" in faults[0]
+
+
+def test_a_silent_link_costs_one_timeout_not_six(arm_cfg):
+    """Przez most kazda cisza to 0,25 s - szesc pojedynczych odczytow trzymalo petle 1,75 s."""
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    link.silent = True
+    link.log.clear()
+    arm.read_joints()
+    assert len(link.ops("syncread")) == 1
+    assert link.ops("read") == []
+
+
+def test_no_goals_are_queued_while_the_link_is_silent(arm_cfg):
+    """Zapis przez `socket://` "udaje sie" do bufora TCP, a po powrocie sieci cala
+    kolejka celow dochodzila naraz - ramie skakalo do rozkazu sprzed STOP-u."""
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    link.silent = True
+    arm.read_joints()
+    link.log.clear()
+    assert arm.send_joints({"shoulder_pan": 30.0}) == {}
+    assert link.ops("sync") == []
+    link.silent = False
+    arm.read_joints()
+    assert arm.send_joints({"shoulder_pan": 30.0})["shoulder_pan"] == pytest.approx(30.0)
+    assert link.ops("sync")
+
+
+def test_occasional_sync_read_misses_do_not_disable_it(arm_cfg):
+    """Trzy czkawki sieci w calej sesji wylaczaly SYNC READ na zawsze - petla spadala do ~7 Hz."""
+    arm, link = connected(arm_cfg)
+    for _ in range(5):
+        arm.read_joints()
+        link.silent = True
+        arm.read_joints()
+        arm.read_joints()
+        link.silent = False
+    link.log.clear()
+    arm.read_joints()
+    assert len(link.ops("syncread")) == 1
+    assert link.ops("read") == []
+
+
+def test_joint_limits_report_the_servo_eeprom_limits_in_app_units(arm_cfg):
+    link = FakeBusLink()
+    link.registers[2][ADDR_MIN_ANGLE_LIMIT] = 2025
+    link.registers[2][ADDR_MAX_ANGLE_LIMIT] = 3006
+    arm, _ = connected(arm_cfg, link)
+    limits = arm.joint_limits()
+    assert set(limits) == {"shoulder_lift"}
+    lo, hi = limits["shoulder_lift"]
+    assert lo == pytest.approx(arm._to_units("shoulder_lift", 2025))
+    assert hi == pytest.approx(arm._to_units("shoulder_lift", 3006))
 
 
 def test_joints_are_read_with_one_sync_read_packet(arm_cfg):
@@ -303,6 +495,26 @@ def test_socket_url_opens_through_pyserial_url_handler(monkeypatch):
     bus.open()
     assert seen["url"] == "socket://10.0.0.5:5555"
     assert seen["timeout"] >= 0.25
+
+
+def test_socket_link_disables_nagle():
+    """SYNC WRITE nie ma odpowiedzi, wiec z Nagle'em kazdy nastepny pakiet czekal
+    na opozniony ACK mostu (200 ms na Windowsie) - rozkazy szly paczkami ~5 Hz."""
+    pytest.importorskip("serial")
+    import socket
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    bus = FeetechBus(f"socket://127.0.0.1:{server.getsockname()[1]}")
+    try:
+        bus.open()
+        conn, _ = server.accept()
+        assert bus._link._socket.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+        conn.close()
+    finally:
+        bus.close()
+        server.close()
 
 
 def test_disconnect_leaves_the_arm_holding_by_default(arm_cfg):

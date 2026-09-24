@@ -25,6 +25,8 @@ a zwrot przez `joints.<nazwa>.invert`.
 from __future__ import annotations
 
 import logging
+import socket
+import time
 from typing import Any
 
 from ..config import GRIPPER, JOINT_NAMES, AppConfig
@@ -62,6 +64,26 @@ DEFAULT_IDS: dict[str, int] = {name: index for index, name in enumerate(JOINT_NA
 #: szukac bledu w konfiguracji.
 MIN_SANE_VOLTAGE = 9.0
 
+#: Bity bajtu bledu w kazdej odpowiedzi serwa (jak ERRBIT_* w scservo_sdk).
+#: Serwo w ochronie zwalnia moment, ale dalej odpowiada - bez tych bitow staw,
+#: ktory opadl, wyglada na zdrowy (odtworzone: przeciazony bark 0x20, a fala
+#: kalibracyjna jechala dalej z 63 stopniami roznicy rozkaz-pomiar).
+SERVO_ERROR_BITS: tuple[tuple[int, str], ...] = (
+    (0x01, "napiecie zasilania poza zakresem"),
+    (0x02, "blad czujnika kata / kat poza zakresem"),
+    (0x04, "przegrzanie"),
+    (0x08, "za duzy prad"),
+    (0x20, "przeciazenie"),
+)
+
+#: Tyle kolejnych nieudanych odczytow ramienia = lacze zerwane (a nie jedna zgubiona ramka).
+LINK_LOSS_CYCLES = 5
+
+#: O tyle tikow (~1 stopien) moga sie roznic dwa odczyty pozycji przy starcie.
+#: Z tej pozycji robi sie cel serwa tuz przed zalaczeniem momentu - jeden
+#: przeklamany odczyt oznaczalby skok ramienia z pelna predkoscia.
+START_TOLERANCE_TICKS = 12
+
 
 def checksum(payload: bytes) -> int:
     """Suma kontrolna pakietu: negacja sumy wszystkiego po naglowku."""
@@ -76,6 +98,13 @@ class FeetechBus:
         self.baudrate = baudrate
         self.timeout = timeout
         self._link: Any = None
+        #: Ostatni bajt bledu z poprawnej odpowiedzi kazdego serwa {id: bity}.
+        self.errors: dict[int, int] = {}
+        #: Odpowiedzi odrzucone przez zla sume kontrolna (diagnostyka).
+        self.corrupt_replies = 0
+        #: Jak skonczyl sie ostatni `_receive`: "ok", "lost" (brak/ucieta ramka,
+        #: strumien moze byc przesuniety) albo "corrupt" (cala ramka, zla tresc).
+        self._last_rx = "ok"
 
     # ------------------------------------------------------------------ port
     def open(self, link: Any = None) -> None:
@@ -97,10 +126,29 @@ class FeetechBus:
             self.timeout = max(self.timeout, 0.25)
             self._link = serial.serial_for_url(self.port, baudrate=self.baudrate, timeout=self.timeout,
                                                write_timeout=1.0)
+            self._disable_nagle()
         else:
             self._link = serial.Serial(self.port, self.baudrate, timeout=self.timeout, write_timeout=1.0)
         self._link.reset_input_buffer()
         self._link.reset_output_buffer()
+
+    def _disable_nagle(self) -> None:
+        """Wylacza algorytm Nagle'a na gniezdzie `socket://` (pyserial go nie rusza).
+
+        SYNC WRITE nie ma odpowiedzi, wiec most nie ma czym potwierdzic go od razu
+        i czeka ze swoim ACK do konca opoznienia (200 ms na Windowsie, 40 ms na
+        Linuksie). Z wlaczonym Nagle'em kazdy nastepny rozkaz i odczyt czeka na
+        ten ACK - cele dochodza do serw paczkami ~5 razy na sekunde, a odczyty
+        zjadaja caly limit 0,25 s. Most ustawia TCP_NODELAY tylko po swojej
+        stronie, a to dotyczy odpowiedzi, nie rozkazow.
+        """
+        sock = getattr(self._link, "_socket", None)
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:  # pragma: no cover - zalezne od systemu
+            logger.warning("Nie udalo sie wylaczyc Nagle'a na %s - rozkazy moga isc paczkami.", self.port)
 
     def close(self) -> None:
         if self._link is not None:
@@ -118,18 +166,46 @@ class FeetechBus:
         self._link.write(b"\xff\xff" + body + bytes([checksum(body)]))
         self._link.flush()
 
-    def _receive(self, dev_id: int) -> bytes | None:
-        """Odbiera odpowiedz i zwraca same dane (bez naglowka, dlugosci i sumy)."""
+    def _receive_frame(self) -> tuple[int, bytes] | None:
+        """Czyta jedna ramke odpowiedzi: (id serwa, dane bez bajtu bledu i sumy).
+
+        Ramka z zla suma kontrolna jest traktowana jak zgubiona. Na magistrali
+        TTL miedzy adapterem a serwami to jedyna ochrona danych (TCP mostu
+        chroni tylko odcinek sieciowy) - bez niej przeklamany bit w starszym
+        bajcie pozycji dawal -180 stopni zamiast 0, a twin robil z tego
+        pierwszy rozkaz i ramie skakalo o 105 stopni z pelna predkoscia.
+        """
+        self._last_rx = "lost"
         head = self._link.read(4)
-        if len(head) < 4 or head[0] != 0xFF or head[1] != 0xFF or head[2] != dev_id:
+        if len(head) < 4 or head[0] != 0xFF or head[1] != 0xFF:
             return None
-        rest = self._link.read(head[3])
-        if len(rest) < head[3]:
+        dev_id, length = head[2], head[3]
+        if length < 2:
+            return None                     # nie ma nawet bajtu bledu i sumy - to nie jest odpowiedz
+        rest = self._link.read(length)
+        if len(rest) < length:
             return None
+        if checksum(bytes(head[2:4]) + bytes(rest[:-1])) != rest[-1]:
+            self.corrupt_replies += 1
+            self._last_rx = "corrupt"
+            logger.debug("Odpowiedz serwa %d z zla suma kontrolna - odrzucam", dev_id)
+            return None
+        self._last_rx = "ok"
         error = rest[0]
-        if error:
-            logger.debug("Serwo %d zglosilo blad 0x%02X", dev_id, error)
-        return rest[1:-1]
+        if error and error != self.errors.get(dev_id, 0):
+            logger.warning("Serwo %d zglasza blad 0x%02X", dev_id, error)
+        self.errors[dev_id] = error
+        return dev_id, bytes(rest[1:-1])
+
+    def _receive(self, dev_id: int) -> bytes | None:
+        """Odbiera odpowiedz serwa `dev_id` i zwraca same dane (bez naglowka, dlugosci i sumy)."""
+        frame = self._receive_frame()
+        if frame is None:
+            return None
+        if frame[0] != dev_id:
+            self._last_rx = "lost"          # cudza ramka - nie ta transakcja
+            return None
+        return frame[1]
 
     def ping(self, dev_id: int) -> bool:
         self._send(dev_id, INST_PING)
@@ -155,11 +231,20 @@ class FeetechBus:
         params = bytes([addr, length, *ids])
         self._send(BROADCAST_ID, INST_SYNC_READ, params)
         out: dict[int, int] = {}
-        for dev_id in ids:
-            data = self._receive(dev_id)
-            if data is None or len(data) < length:
-                break                       # kolejne odpowiedzi i tak sie przesunely - reszte odrzucamy
-            out[dev_id] = int.from_bytes(data[:length], "little")
+        # Serwa odpowiadaja po kolei, ale to, ktore milczy, nie moze zabrac ze
+        # soba reszty: ramki dopasowujemy po ID, nie po pozycji w strumieniu.
+        # Inaczej jedno gluche serwo nr 1 wygladalo jak zerwane lacze.
+        for _ in ids:
+            frame = self._receive_frame()
+            if frame is None:
+                if self._last_rx == "lost":
+                    break                   # cisza albo ucieta ramka - dalej nic juz nie przyjdzie rowno
+                continue                    # cala ramka przeczytana, strumien rowny - nastepne sa dobre
+            dev_id, data = frame
+            if dev_id in ids and dev_id not in out and len(data) >= length:
+                out[dev_id] = int.from_bytes(data[:length], "little")
+            if dev_id == ids[-1]:
+                break                       # ostatnie serwo odpowiedzialo - nie czekamy na brakujace
         return out
 
     def sync_write(self, addr: int, length: int, values: dict[int, int]) -> None:
@@ -197,7 +282,18 @@ class FeetechArm(RobotBackend):
         #: Limity odczytane z serw [tiki]. Pusty wpis = serwo nie ogranicza.
         self.servo_limits: dict[str, tuple[int, int]] = {}
         self._sync_read_ok = True
+        #: SYNC READ odpowiedzial choc raz w tej sesji - wtedy cisza na niego to
+        #: lacze, a nie stary firmware, i nie wolno go wylaczyc na stale.
+        self._sync_ever_ok = False
+        #: KOLEJNE cykle, w ktorych serwa odpowiedzialy na pojedyncze odczyty,
+        #: a na SYNC READ nie (liczone tylko, zanim SYNC READ raz zadzialal).
         self._sync_misses = 0
+        #: Kolejne cykle odczytu, w ktorych choc jeden staw nie dostal swiezej pozycji.
+        self._failed_cycles = 0
+        self._last_full_read = 0.0
+        self._stale: list[str] = []
+        #: Ostatni cykl odczytu bez ANI JEDNEJ odpowiedzi - lacze stoi.
+        self._link_silent = False
         self.info = RobotInfo(
             name="SO-101 (feetech)",
             description=f"port {rc.port} @ {rc.baudrate} bd",
@@ -230,8 +326,11 @@ class FeetechArm(RobotBackend):
         # albo wspoldzielona z diagnostyka. Powtorne otwarcie zerwaloby ja.
         if not self.bus.is_open:
             self.bus.open()
+        # Nowa sesja - bledy i liczniki poprzedniej nie maja tu nic do powiedzenia.
+        self.bus.errors.clear()
+        self._sync_read_ok, self._sync_ever_ok, self._sync_misses = True, False, 0
 
-        missing = [name for name, dev_id in self.ids.items() if not self.bus.ping(dev_id)]
+        missing =[name for name, dev_id in self.ids.items() if not self.bus.ping(dev_id)]
         if missing:
             self.bus.close()
             raise RuntimeError(
@@ -241,11 +340,7 @@ class FeetechArm(RobotBackend):
 
         self._check_power()
         self._read_servo_limits()
-
-        ticks = {name: self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2) for name, dev_id in self.ids.items()}
-        if any(value is None for value in ticks.values()):
-            self.bus.close()
-            raise RuntimeError("Nie udalo sie odczytac pozycji wszystkich stawow.")
+        ticks = self._read_start_positions()
 
         # KOLEJNOSC MA ZNACZENIE. Rejestr celu pamieta wartosc z poprzedniej
         # sesji, wiec samo zalaczenie momentu szarpneloby ramie do tamtej pozy.
@@ -257,12 +352,37 @@ class FeetechArm(RobotBackend):
             self.bus.write(dev_id, ADDR_TORQUE_ENABLE, 1, 1)
 
         self._positions = {name: self._to_units(name, int(value)) for name, value in ticks.items()}
+        self._failed_cycles, self._stale, self._link_silent = 0, [], False
+        self._last_full_read = time.monotonic()
         self._connected = True
         logger.info(
             "Polaczono z ramieniem na %s. Pozycja startowa: %s",
             self.cfg.robot.port,
             ", ".join(f"{name}={value:.1f}" for name, value in self._positions.items()),
         )
+
+    def _read_start_positions(self) -> dict[str, int]:
+        """Pozycja startowa z DWOCH zgodnych odczytow kazdego stawu.
+
+        Ta pozycja staje sie celem serw tuz przed zalaczeniem momentu, wiec
+        jeden przeklamany odczyt (8-bitowa suma kontrolna nie lapie kazdego
+        zaklocenia) oznaczalby skok ramienia z pelna predkoscia. Dwa niezalezne
+        odczyty, ktore sie zgadzaja, praktycznie to wykluczaja.
+        """
+        problem = "Nie udalo sie odczytac pozycji wszystkich stawow."
+        for _ in range(3):
+            first = {name: self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2) for name, dev_id in self.ids.items()}
+            second = {name: self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2) for name, dev_id in self.ids.items()}
+            if any(v is None for v in (*first.values(), *second.values())):
+                problem = "Nie udalo sie odczytac pozycji wszystkich stawow."
+                continue
+            moving = [name for name in self.ids if abs(first[name] - second[name]) > START_TOLERANCE_TICKS]
+            if not moving:
+                return {name: int(value) for name, value in second.items()}
+            problem = (f"Kolejne odczyty pozycji sie nie zgadzaja ({', '.join(moving)}) - ramie sie "
+                       "rusza albo magistrala przeklamuje. Unieruchom ramie i polacz ponownie.")
+        self.bus.close()
+        raise RuntimeError(problem)
 
     def _read_servo_limits(self) -> None:
         """Odczytuje wlasne limity serw i mowi glosno, gdy sa ciasniejsze niz konfiguracja.
@@ -334,30 +454,103 @@ class FeetechArm(RobotBackend):
 
     # ------------------------------------------------------------------ wymiana
     def read_joints(self) -> dict[str, float]:
+        """Pozycje stawow; staw bez swiezej odpowiedzi zostaje przy poprzedniej wartosci.
+
+        Nie rzuca z powodu zgubionych ramek - jedna zgubiona ramka nie ma prawa
+        udawac skoku stawu ani zatrzymywac petli. Za to liczy KOLEJNE nieudane
+        cykle, a `faults()` mowi glosno, gdy lacze padlo.
+        """
         if not self._connected:
             raise RuntimeError("Ramie nie jest polaczone")
+        fresh: dict[str, int] = {}
+        sync_silent = False
         if self._sync_read_ok:
             got = self.bus.sync_read(ADDR_PRESENT_POSITION, 2, list(self.ids.values()))
-            if len(got) == len(self.ids):
-                for name, dev_id in self.ids.items():
-                    self._positions[name] = self._to_units(name, got[dev_id])
-                return dict(self._positions)
-            self._sync_misses += 1
-            if self._sync_misses >= 3:
-                # Starsze wersje firmware'u nie znaja SYNC READ - wtedy zostajemy przy odczytach po kolei.
-                self._sync_read_ok = False
-                logger.info("Serwa nie odpowiadaja na SYNC READ - odczyt po kolei.")
-        for name, dev_id in self.ids.items():
-            ticks = self.bus.read(dev_id, ADDR_PRESENT_POSITION, 2)
-            if ticks is not None:
-                # Odczyt, ktory sie nie udal, zostawia poprzednia wartosc -
-                # jedna zgubiona ramka nie ma prawa udawac skoku stawu.
-                self._positions[name] = self._to_units(name, ticks)
+            fresh = {name: got[dev_id] for name, dev_id in self.ids.items() if dev_id in got}
+            sync_silent = not fresh
+            if fresh:
+                # Choc jedna odpowiedz = firmware zna SYNC READ; brak reszty to juz lacze albo serwo.
+                self._sync_ever_ok, self._sync_misses = True, 0
+
+        missing = [name for name in self.ids if name not in fresh]
+        # Cisza na SYNC READ, ktory juz w tej sesji dzialal, to stojace lacze, nie
+        # firmware: szesc kolejnych odczytow po 0,25 s przez most trzymaloby
+        # petle 1,75 s na cykl i nic by nie dalo. Wtedy nie probujemy po kolei.
+        if missing and not (sync_silent and self._sync_ever_ok):
+            failures = 0
+            for name in missing:
+                ticks = self.bus.read(self.ids[name], ADDR_PRESENT_POSITION, 2)
+                if ticks is None:
+                    failures += 1
+                    if failures >= 2:
+                        break                   # drugie milczenie w cyklu - nie placimy dalej timeoutami
+                    continue
+                fresh[name] = ticks
+            if sync_silent and not self._sync_ever_ok and fresh:
+                # Serwa odpowiadaja po kolei, a na SYNC READ milcza. Liczone KOLEJNE
+                # cykle - wczesniej trzy przypadkowe czkawki sieci w calej sesji
+                # wylaczaly SYNC READ na zawsze i petla przez most spadala do ~7 Hz.
+                self._sync_misses += 1
+                if self._sync_misses >= 3:
+                    # Starsze wersje firmware'u nie znaja SYNC READ - wtedy zostajemy przy odczytach po kolei.
+                    self._sync_read_ok = False
+                    logger.info("Serwa nie odpowiadaja na SYNC READ - odczyt po kolei.")
+
+        for name, ticks in fresh.items():
+            self._positions[name] = self._to_units(name, ticks)
+        self._stale = [name for name in self.ids if name not in fresh]
+        self._link_silent = not fresh
+        if self._stale:
+            self._failed_cycles += 1
+            if self._failed_cycles == LINK_LOSS_CYCLES:
+                logger.warning("Serwa nie odpowiadaja (%s) od %d cykli odczytu.",
+                               ", ".join(self._stale), self._failed_cycles)
+        else:
+            self._failed_cycles = 0
+            self._last_full_read = time.monotonic()
         return dict(self._positions)
+
+    def faults(self) -> list[str]:
+        """Bity bledu z ostatnich odpowiedzi serw i utrata lacza - zdania dla operatora."""
+        try:
+            out: list[str] = []
+            for name, dev_id in self.ids.items():
+                bits = self.bus.errors.get(dev_id, 0)
+                if not bits:
+                    continue
+                what = [text for bit, text in SERVO_ERROR_BITS if bits & bit]
+                known = sum(bit for bit, _ in SERVO_ERROR_BITS)
+                if bits & ~known:
+                    what.append(f"nieznany blad 0x{bits & ~known:02X}")
+                out.append(f"{name} (serwo {dev_id}): {', '.join(what)}")
+            if self._connected and self._failed_cycles >= LINK_LOSS_CYCLES:
+                ms = (time.monotonic() - self._last_full_read) * 1000.0
+                which = "" if len(self._stale) == len(self.ids) else f" ({', '.join(self._stale)})"
+                out.append(f"brak odpowiedzi serw od {ms:.0f} ms{which}")
+            return out
+        except Exception as exc:  # pragma: no cover - wolane co cykl petli, nie moze jej wysypac
+            logger.exception("Nie udalo sie sprawdzic stanu serw")
+            return [f"nie udalo sie sprawdzic stanu serw: {exc}"]
+
+    def joint_limits(self) -> dict[str, tuple[float, float]]:
+        """Limity kata z EEPROM serw w jednostkach aplikacji (tylko stawy, ktore je maja)."""
+        out: dict[str, tuple[float, float]] = {}
+        for name, (low, high) in self.servo_limits.items():
+            a, b = self._to_units(name, low), self._to_units(name, high)
+            out[name] = (min(a, b), max(a, b))
+        return out
 
     def send_joints(self, targets: dict[str, float]) -> dict[str, float]:
         if not self._connected:
             raise RuntimeError("Ramie nie jest polaczone")
+        if self._link_silent:
+            # Ostatni odczyt nie dostal ANI JEDNEJ odpowiedzi - lacze stoi. Przez
+            # most `socket://` zapis i tak by sie "udal" (laduje w buforze TCP),
+            # a po powrocie sieci cala kolejka celow dochodzi do serw naraz i
+            # ramie skacze do ostatniego z nich z pelna predkoscia - takze po
+            # STOP-ie wcisnietym w trakcie przestoju. Nic nie wysylamy, dopoki
+            # odczyt nie potwierdzi, ze serwa znow slysza.
+            return {}
         sent: dict[str, float] = {}
         ticks: dict[int, int] = {}
         for name in JOINT_NAMES:

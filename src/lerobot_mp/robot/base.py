@@ -39,12 +39,37 @@ class RobotBackend(ABC):
 
     @abstractmethod
     def send_joints(self, targets: dict[str, float]) -> dict[str, float]:
-        """Wysyla zadane pozycje stawow. Zwraca to, co faktycznie poszlo do robota."""
+        """Wysyla zadane pozycje stawow. Zwraca to, co faktycznie poszlo do robota.
+
+        Moze zwrocic mniej stawow niz dostal - albo nic, gdy backend wstrzymal
+        wysylke (np. `feetech` przy zerwanym laczu, zeby rozkazy nie czekaly
+        w kolejce sieci i nie dojechaly potem do serw seria). Wolajacy zostaje
+        wtedy przy poprzednim rozkazie.
+        """
 
     @property
     @abstractmethod
     def is_connected(self) -> bool:
         ...
+
+    def faults(self) -> list[str]:
+        """Usterki sprzetu widziane w ostatnich odpowiedziach - czytelne zdania po polsku.
+
+        Pusta lista = wszystko w porzadku. Serwo w ochronie (przeciazenie,
+        przegrzanie, napiecie) zwalnia moment, ale dalej grzecznie odpowiada,
+        wiec bez tego wyglada na zdrowe, a reszta ramienia jedzie dalej.
+        Nigdy nie rzuca wyjatkiem - wola to petla sterowania co cykl.
+        """
+        return []
+
+    def joint_limits(self) -> dict[str, tuple[float, float]]:
+        """Twarde limity samego sprzetu w jednostkach aplikacji: {staw: (min, max)}.
+
+        Tylko stawy, ktore sprzet naprawde ogranicza (np. limity kata w EEPROM
+        serw). Wyzsze warstwy zawezaja nimi swoje zakresy, zeby rozkaz nigdy
+        nie byl przycinany po cichu przez serwo.
+        """
+        return {}
 
     def step(self, dt: float) -> None:  # noqa: B027 - domyslnie nic nie robi
         """Krok symulacji. Prawdziwy robot ignoruje (rzeczywistosc liczy sie sama)."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import inspect
 import logging
 from typing import Any
 
@@ -86,6 +87,9 @@ class LeRobotArm(RobotBackend):
             "id": rc.robot_id,
             "use_degrees": rc.use_degrees,
             "max_relative_target": rc.max_relative_target,
+            # LeRobot domyslnie zdejmuje moment przy rozlaczeniu - ramie opada pod
+            # wlasnym ciezarem. U nas decyduje o tym ta sama opcja co w `feetech`.
+            "disable_torque_on_disconnect": rc.torque_off_on_exit,
         }
         if rc.calibration_dir:
             from pathlib import Path
@@ -109,9 +113,11 @@ class LeRobotArm(RobotBackend):
         logger.info("Uzywam klas LeRobot z modulu %s", module_name)
 
         config = self._build_config(config_cls)
-        self._robot = robot_cls(config)
+        robot = robot_cls(config)
+        self._require_calibration_file(robot)
         logger.info("Lacze z ramieniem na porcie %s ...", self.cfg.robot.port)
-        self._robot.connect()
+        self._connect_without_calibration(robot)
+        self._robot = robot
         self._connected = True
 
         motors = self.motor_names()
@@ -121,6 +127,87 @@ class LeRobotArm(RobotBackend):
                 "Robot nie raportuje stawow %s - beda pomijane przy wysylaniu.", missing
             )
         logger.info("Polaczono. Stawy: %s", ", ".join(motors))
+
+    def _calibrate_hint(self) -> str:
+        rc = self.cfg.robot
+        return (f"Skalibruj ramie w konsoli:  lerobot-calibrate --robot.type={self._kind}_follower "
+                f"--robot.port={rc.port} --robot.id={rc.robot_id}  - albo uzyj backendu `feetech`.")
+
+    def _require_calibration_file(self, robot: Any) -> None:
+        """Odmawia polaczenia, zanim cokolwiek dotknie portu, gdy LeRobot nie ma pliku kalibracji.
+
+        Bez pliku `SOFollower.connect()` wola `calibrate()`: zdejmuje moment ze
+        wszystkich serw (ramie trzymane przez poprzednia sesje opada na stol)
+        i czeka na `input()` w konsoli serwera - w panelu nic nie widac, a watek
+        wisi. Dokonczona kalibracja nadpisalaby jeszcze Homing_Offset i limity
+        w EEPROM, czyli zero i zakresy, na ktorych stoi backend `feetech`.
+        """
+        if getattr(robot, "calibration", None):
+            return
+        where = getattr(robot, "calibration_fpath", None) or "katalog kalibracji LeRobota"
+        raise RuntimeError(
+            f"Brak kalibracji LeRobota dla ramienia '{self.cfg.robot.robot_id}' ({where}). "
+            "Bez niej LeRobot przy laczeniu zdejmuje moment ze wszystkich serw i czeka na Enter "
+            "w konsoli. " + self._calibrate_hint()
+        )
+
+    def _connect_without_calibration(self, robot: Any) -> None:
+        """Laczy tak, zeby LeRobot nigdy nie zdjal momentu ani nie zapytal o nic w konsoli."""
+        bus = getattr(robot, "bus", None)
+        if bus is not None and hasattr(bus, "connect") and hasattr(bus, "is_calibrated"):
+            bus.connect()
+            try:
+                calibrated = bool(bus.is_calibrated)
+                holding = calibrated and self._torque_on(bus)
+            except Exception:
+                self._close_bus_keeping_torque(bus)
+                raise
+            if not calibrated:
+                self._close_bus_keeping_torque(bus)
+                raise RuntimeError(
+                    "Kalibracja LeRobota w pliku nie zgadza sie z zapisana w serwach (inne ramie "
+                    "albo kalibracja zmieniona gdzie indziej). " + self._calibrate_hint()
+                )
+            if holding:
+                # `configure()` LeRobota robi swoje zapisy pod `torque_disabled()` - przy
+                # ramieniu trzymajacym poze (np. zaraz po sesji `feetech`) to zdjety moment
+                # na czas kilkudziesieciu transakcji, a przez most sekunda swobodnego spadku.
+                # Ustawienia z poprzednich polaczen LeRobota i tak siedza w EEPROM serw.
+                logger.warning("Serwa trzymaja pozycje - pomijam konfiguracje LeRobota, "
+                               "zeby nie zdejmowac momentu (ustawienia zostaja z EEPROM).")
+                return
+            self._close_bus_keeping_torque(bus)
+
+        if "calibrate" not in inspect.signature(robot.connect).parameters:
+            raise RuntimeError(
+                "Ta wersja LeRobota nie pozwala polaczyc bez interaktywnej kalibracji - "
+                "zaktualizuj ja albo uzyj backendu `feetech`."
+            )
+        robot.connect(calibrate=False)
+        if not robot.is_calibrated:
+            try:
+                robot.disconnect()
+            except Exception:  # pragma: no cover - rozlaczenie nie moze przykryc wlasciwego bledu
+                logger.exception("Blad przy rozlaczaniu robota")
+            raise RuntimeError(
+                "Kalibracja LeRobota w pliku nie zgadza sie z zapisana w serwach. " + self._calibrate_hint()
+            )
+
+    @staticmethod
+    def _torque_on(bus: Any) -> bool:
+        """Czy ktores serwo trzyma moment. W razie watpliwosci - tak (bezpieczniej)."""
+        try:
+            return any(int(v) for v in bus.sync_read("Torque_Enable").values())
+        except Exception:
+            logger.debug("Nie udalo sie odczytac Torque_Enable - zakladam, ze serwa trzymaja", exc_info=True)
+            return True
+
+    @staticmethod
+    def _close_bus_keeping_torque(bus: Any) -> None:
+        try:
+            bus.disconnect(disable_torque=False)
+        except Exception:  # pragma: no cover - rozlaczenie nie moze przykryc wlasciwego bledu
+            logger.exception("Blad przy zamykaniu magistrali LeRobota")
 
     def motor_names(self) -> list[str]:
         """Nazwy stawow zgloszone przez LeRobot (kolejnosc jak w sterowniku)."""
