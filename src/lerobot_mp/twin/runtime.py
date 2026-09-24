@@ -86,6 +86,32 @@ class SceneBackend(RobotBackend):
     def joint_limits(self) -> dict[str, tuple[float, float]]:
         return {}
 
+    def goal_positions(self) -> dict[str, float]:
+        """Cel, ktory serwa sceny (aktuatory MuJoCo) wciaz trzymaja - jak Goal_Position na serwie.
+
+        Po "Polacz" w trakcie lift szczeki dalej sciskaly kostke, a nadzor startowal od
+        ZMIERZONEGO kata szczeki: pierwszy rozkaz po sprzegle puszczal chwyt (verify2, s1).
+        """
+        with self.twin.lock:
+            s = self.twin.scene
+            return s.kin.from_q(s.data.ctrl[s.act_ids])
+
+
+@dataclass(frozen=True)
+class TickSample:
+    """Jeden takt petli ramienia dla sluchaczy (`Twin.add_tick_listener`).
+
+    `t` - czas petli tego taktu (monotoniczny; w `threaded=False` - zegar `step`),
+    `sent` - rozkaz, ktory NAPRAWDE poszedl do serw w tym takcie ({} = nic nie poszlo),
+    `measured` / `measured_t` - ostatni pomiar i jego chwila, `fresh` - ten takt mial swiezy odczyt.
+    """
+
+    t: float
+    sent: dict[str, float]
+    measured: dict[str, float]
+    measured_t: float
+    fresh: bool
+
 
 @dataclass
 class RobotStatus:
@@ -321,6 +347,10 @@ class Twin:
         self._grip_floor: float | None = None
         #: STOP z powodu bledu chwytaka: szczeka trzyma zmierzone rozwarcie, bez docisku.
         self._grip_release = False
+        #: Sluchacze taktow petli (`add_tick_listener`): uchwyt -> funkcja.
+        self._listeners: dict[int, Callable[[TickSample], None]] = {}
+        self._listener_seq = 0
+        self._listeners_lock = threading.Lock()
 
     # ------------------------------------------------------------ scena
     def rebuild(self) -> None:
@@ -404,23 +434,55 @@ class Twin:
             return f"ramie ma: {self._owner}"
         return self._lost.get(owner) or "nikt go nie ma"
 
-    def claim(self, owner: str, preempt: Callable[[], None] | None = None) -> None:
+    @property
+    def preempt_gen(self) -> int:
+        """Licznik odebran ramienia (STOP, Dom, preempt, (roz)laczenie, smierc petli).
+
+        Zapamietany przed dlugim startem (ladowanie polityki) i podany do `claim(gen=...)`
+        mowi, czy w tym czasie ktos ramie zatrzymal.
+        """
+        return self._gen
+
+    def claim(self, owner: str, preempt: Callable[[], None] | None = None, *,
+              gen: int | None = None, guard: Callable[[], bool] | None = None) -> None:
         """Bierze ramie dla `owner`. Inny wlasciciel -> RuntimeError; ten sam - podmienia `preempt`.
+
+        Aktywny STOP -> RuntimeError "aktywny STOP": nikt nie bierze zatrzymanego ramienia.
+        Zmierzone (verify2, s15): STOP 0,1 s po "Uruchom" trafial w okno ladowania polityki
+        (108-142 ms), polityka brala ramie POD STOP-em, a po "Skasuj STOP" jechala - 83,7 st.
+        ruchu stawu pod polityka, ktora operator zatrzymal.
+
+        `gen` (z `preempt_gen`) - od tamtej chwili ramie nikomu nie odebrano; `guard()` -
+        wlasny warunek wolajacego (np. licznik ruchu panelu). Oba sprawdzane pod blokada
+        wlasnosci razem z wzieciem ramienia; nie spelnione -> RuntimeError, nic nie zmienione.
+        Bez tego Dom wcisniety w trakcie startu polityki byl przerywany przez jej `claim`.
 
         Jazda do domu w toku jest przerywana w miejscu: nowy wlasciciel zaczyna
         od zmierzonej pozy. Inaczej po koncu rampy nadzor przechodzil prosto do
-        ACTIVE i doganial cel sterownika z pelna predkoscia.
+        ACTIVE i doganial cel sterownika z pelna predkoscia. Tylko gdy od wziecia ramienia
+        nikt go nie odebral - Dom wcisniety tuz po `claim` (inny watek) nie jest przerywany.
         """
         with self._own_lock:
+            sup = self._supervisor
+            if sup is not None and sup.estopped:
+                raise RuntimeError("aktywny STOP - najpierw Skasuj STOP")
+            if gen is not None and self._gen != gen:
+                raise RuntimeError(f"ramie odebrane w trakcie startu ({self._gen_reason or 'ponowne laczenie'})")
+            if guard is not None and not guard():
+                raise RuntimeError("przerwane w trakcie startu (STOP, Dom, Polacz albo Zatrzymaj)")
             if self._owner is not None and self._owner != owner:
                 raise RuntimeError(f"ramie zajete: {self._owner}")
             if self._owner is None:
                 self._new_owner()
             self._owner, self._preempt_cb = owner, preempt
             self._lost.pop(owner, None)
-        sup = self._supervisor
+            mine = self._gen
         if sup is not None and not sup.is_homing_done:
-            self.hold_measured()
+            with self._sup_lock:
+                # Pod blokada nadzoru, jak `home` (preempt + begin_homing): Dom po naszym
+                # wzieciu ramienia albo juz przerwal nas (inny `_gen`), albo przyjdzie po tym.
+                if self._gen == mine and self._owner == owner and not sup.is_homing_done:
+                    self.hold_measured()
 
     def release(self, owner: str) -> None:
         with self._own_lock:
@@ -628,6 +690,15 @@ class Twin:
         self._supervisor = SafetySupervisor(copy.deepcopy(cfg))
         # Staw poza limitami nie jest przycinany na starcie - patrz `SafetySupervisor.start`.
         self._supervisor.start(measured, go_home=go_home, keep_outside=True)
+        keep = self._squeeze_at_connect(b, measured)
+        if keep:
+            # Chwytak, ktory sciskal przed "Polacz", sciska dalej: rozkaz od celu serwa, nie od
+            # zmierzonego kata szczeki. Zmierzone (verify2, s1): po Polacz w trakcie lift pierwsze
+            # sprzeglo wysylalo zmierzony kat jako cel i kostka zsuwala sie 3,8 -> 2,3 cm.
+            self._supervisor.reseed(keep)
+            if go_home:                                    # rampa startowa nie otwiera szczek po drodze
+                self._supervisor.begin_homing(keep=keep)
+                self._supervisor.state = SafetyState.STARTING
         self._target, self._engaged = None, False
         self._latest = dict(measured)
         self._fault, self._note = "", ""
@@ -662,6 +733,29 @@ class Twin:
             self._thread = threading.Thread(target=self._loop, name="blizniak-petla", daemon=True)
             self._thread.start()
         logger.info("Polaczono z ramieniem: %s", b.info.name)
+
+    def _squeeze_at_connect(self, b: RobotBackend, measured: Mapping[str, float]) -> dict[str, float]:
+        """{chwytak: cel serwa}, gdy przy polaczeniu serwo chwytaka sciska (cel ciasniejszy od pomiaru).
+
+        Cel z `backend.goal_positions()` (jednostki aplikacji, jak `read_joints`) - backend
+        bez tej metody (albo z bledem w niej): {} i nadzor startuje od pomiaru, czyli
+        "Polacz" puszcza trzymany przedmiot przy pierwszym ruchu (docs/TWIN.md).
+        """
+        fn = getattr(b, "goal_positions", None)
+        if fn is None:
+            return {}
+        try:
+            goal = fn() if callable(fn) else fn
+        except Exception:                                  # diagnostyka nie moze psuc polaczenia
+            logger.exception("goal_positions() backendu rzucilo wyjatek")
+            return {}
+        if not goal or GRIPPER not in goal or GRIPPER not in measured:
+            return {}
+        g, m = float(goal[GRIPPER]), float(measured[GRIPPER])
+        if not np.isfinite(g) or m - g <= self.grip_squeeze_margin:
+            return {}
+        logger.info("Chwytak sciska przy polaczeniu (cel %.1f, pomiar %.1f) - rozkaz od celu serwa.", g, m)
+        return {GRIPPER: g}
 
     def disconnect(self) -> None:
         if self._backend is not None:
@@ -703,9 +797,15 @@ class Twin:
         razem, pod blokada wlasnosci); zwraca, czy sprzeglo zmieniono. Bez tego
         runner odebrany STOP-em miedzy `claim` a sprzeglem wylaczal sprzeglo
         NOWEGO wlasciciela (panel), a jego pole wyboru dalej pokazywalo "wlaczone".
+
+        Wlaczenie przy aktywnym STOP-ie - False (jak `claim`): sprzeglo wlaczone pod STOP-em
+        zostawalo wlaczone po "Skasuj STOP" i ramie ruszalo za celem sprzed STOP-u.
         """
         with self._own_lock:
             if owner is not None and self._owner != owner:
+                return False
+            sup = self._supervisor
+            if engaged and sup is not None and sup.estopped:
                 return False
             self._engaged = engaged
             if not engaged:
@@ -785,6 +885,10 @@ class Twin:
             raise RuntimeError("ramie nie jest polaczone")
         self._wait_for_homing()
         with self._own_lock:
+            sup = self._supervisor
+            if sup is not None and sup.estopped:
+                # Jak `claim`: pod STOP-em ramie nie jest brane (sprzeglo zostawalo wlaczone).
+                raise RuntimeError("aktywny STOP - najpierw Skasuj STOP")
             if self._owner is None:
                 if not take:
                     raise RuntimeError(f"ruch przerwany: ramie odebrane ({self._refusal(owner)})")
@@ -891,6 +995,35 @@ class Twin:
                 raise RuntimeError("ramie wciaz jedzie do domu")
             time.sleep(0.02)
 
+    # ---------------------------------------------------------- sluchacze taktow
+    def add_tick_listener(self, fn: Callable[[TickSample], None]) -> int:
+        """`fn(TickSample)` po kazdym takcie petli, z watku petli; zwraca uchwyt do `remove_tick_listener`.
+
+        Dla nagrywania (identyfikacja): rozkaz, ktory NAPRAWDE poszedl, i pomiar ze stemplem
+        taktu petli, a nie z zegara nagrywajacego watku. `fn` ma byc szybka (petla czeka na
+        nia) i nie rzucac - wyjatek jest logowany, a sluchacz usuwany.
+        """
+        with self._listeners_lock:
+            self._listener_seq += 1
+            handle = self._listener_seq
+            self._listeners[handle] = fn
+        return handle
+
+    def remove_tick_listener(self, handle: int) -> None:
+        with self._listeners_lock:
+            self._listeners.pop(handle, None)
+
+    def _notify_tick(self, sample: TickSample) -> None:
+        with self._listeners_lock:
+            items = list(self._listeners.items())
+        for handle, fn in items:
+            try:
+                fn(sample)
+            except Exception:
+                # Blad sluchacza nie moze zatrzymac petli ramienia (ta sama petla trzyma STOP).
+                logger.exception("Sluchacz taktow petli rzucil wyjatek - usuniety")
+                self.remove_tick_listener(handle)
+
     # ---------------------------------------------------------- petla
     def step(self, dt: float) -> None:
         """Jeden takt petli w czasie symulowanym - tylko po `connect(threaded=False)`."""
@@ -921,6 +1054,7 @@ class Twin:
         # rozkazie, a serwo jechalo tam z wlasna, pelna predkoscia.
         dt = min(max(gap, 0.0), 1.5 * period)
         ls.prev = now
+        sent_now: dict[str, float] = {}
         try:
             fresh = False
             if b.info.simulated or now - ls.last_read >= self._read_period:
@@ -1036,7 +1170,7 @@ class Twin:
                         # tego, co naprawde poszlo, i tak samo nagrywa to identyfikacja.
                         with self._sup_lock:
                             sup.reseed(off)
-                    ls.last_sent = sent_cmd
+                    ls.last_sent = sent_now = sent_cmd
             b.step(dt)
             if not b.info.simulated and self.lock.acquire(blocking=False):
                 try:                                       # prawdziwe ramie: scena je tylko odzwierciedla
@@ -1057,6 +1191,8 @@ class Twin:
                                       error=self._fault or self._note, measured_t=ls.measured_t,
                                       owner=self._owner or "", faults=list(faults),
                                       warnings=list(self._warnings.values()))
+            if self._listeners:
+                self._notify_tick(TickSample(now, dict(sent_now), dict(ls.measured), ls.measured_t, fresh))
             return True
         except Exception as exc:                           # odczyt z portu padl, kabel wypadl...
             logger.exception("Petla ramienia przerwana")

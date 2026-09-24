@@ -39,6 +39,12 @@ HOW_TO_STOP = {
 }
 WAVE_OWNERS = ("fala kalibracyjna", "kalibracja")
 SYSID_OWNERS = ("identyfikacja dynamiki", "identyfikacja")
+#: Najwieksza niepewnosc dopasowanego parametru (wzglednie; 0,3 = +-30%), przy ktorej wynik
+#: identyfikacji jest przydatny (kontrakt E2, `FitResult.useful`).
+MAX_BAND = 0.3
+#: Znacznik w `Dynamics.source` dynamiki zapisanej MIMO werdyktu "nie wyjasnia" (panel dopisuje go
+#: przy zapisie) - przewodnik nie zalicza wtedy kroku 5.
+USELESS_MARK = "NIEPRZYDATNA"
 
 
 def dynamics_backend(source: str) -> str:
@@ -48,6 +54,29 @@ def dynamics_backend(source: str) -> str:
     """
     m = re.match(r"\s*identyfikacja\b[^(;]*\(([\w-]+)\)", source or "")
     return m.group(1) if m else ""
+
+
+def dynamics_useful(dyn: dict | None) -> bool:
+    """Czy zapisana dynamika (`Workspace.dynamics`) cos wyjasnia - krok 5 liczy sie tylko wtedy.
+
+    Zmierzone (verify2, s6): dopasowanie 0,55 -> 0,51 st. z armatura +-inf dalo sie zapisac
+    i przewodnik zaliczal krok 5, a trening centrowal randomizacje na armaturze x0,45 przy
+    prawdzie 1,0. Nieprzydatna: znacznik `USELESS_MARK` w zrodle albo niepewnosc (`band`,
+    kontrakt E2) dopasowanego parametru nieskonczona lub ponad `MAX_BAND`.
+    """
+    if not dyn:
+        return True
+    if USELESS_MARK in str(dyn.get("source") or ""):
+        return False
+    band = dyn.get("band") or {}
+    for name in dyn.get("fitted") or list(band):
+        v = band.get(name)
+        try:
+            if v is not None and not float(v) <= MAX_BAND:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -87,6 +116,8 @@ class GuideSnapshot:
     dynamics: str = ""
     #: Backend, na ktorym ja zmierzono (`dynamics_backend`); "" = nie wiadomo.
     dynamics_backend: str = ""
+    #: Zapisana dynamika cos wyjasnia (`dynamics_useful`); False - krok 5 nie jest zrobiony.
+    dynamics_useful: bool = True
     #: (nazwa, zadanie, bazowa z repozytorium).
     policies: tuple[tuple[str, str, bool], ...] = ()
     #: Zadania w tle: "fala kalibracyjna", "intrynsyki", "identyfikacja", "trening", "ewaluacja".
@@ -96,6 +127,8 @@ class GuideSnapshot:
     policy_from_cameras: bool = False
     calib_result_pending: bool = False
     dyn_result_pending: bool = False
+    #: Czekajacy wynik identyfikacji cos wyjasnia (`jobs.fit_verdict`) - inaczej "powtorz", nie "Zapisz".
+    dyn_result_useful: bool = True
     #: Postep fali kalibracyjnej 0..1 (None = nie jedzie).
     calib_progress: float | None = None
     #: Co juz jechalo na tym backendzie w tej sesji panelu: "reach", "lift-kamery".
@@ -165,6 +198,11 @@ def _step_cameras(s: GuideSnapshot) -> Step:
         return Step(1, title, DONE, det)
     if s.simulated:
         act = "Kamery > Dodaj kamere: **Dodaj symulowana przed ramieniem** (dwa razy - dwie kamery to lepsza mapa)"
+        if not s.cameras:
+            # Gotowe stanowisko z pakietu (examples/twin.sim.json): dwie kamery z zaufana kalibracja,
+            # "kostka z kamer" od razu - bez przechodzenia fali w symulacji.
+            act += ("; albo gotowy przyklad: zamknij panel, w konsoli `lerobot-twin demo` "
+                    "(examples/twin.sim.json), uruchom panel ponownie")
     else:
         act = "Kamery > Dodaj kamere: **Szukaj kamer USB**, wybierz w Znalezione, **Dodaj kamere USB**"
     det = ("kamery sa, ale zadna nie daje kadru" if cams else
@@ -255,11 +293,16 @@ def _step_dynamics(s: GuideSnapshot) -> Step:
     title = "Dynamika serw (identyfikacja)"
     # W symulacji wystarczy proba na blizniaku; na prawdziwym ramieniu dynamika z sim
     # (zapisana przy probie procedury) nie jest dynamika serw.
-    if s.dynamics and (s.simulated or s.dynamics_backend != "sim"):
+    measured_here = s.dynamics and (s.simulated or s.dynamics_backend != "sim")
+    if measured_here and s.dynamics_useful:
         return Step(5, title, DONE, f"zmierzona na {s.dynamics_backend}" if s.dynamics_backend else "zmierzona")
     act = ("Trening > Dynamika serw: " + ("" if s.simulated else "zaznacz 'przestrzen wokol wolna', ")
            + "**Identyfikuj** (~20 s ruchu), potem **Zapisz jako dynamike stanowiska**")
-    det = "zmierzona na sim - zmierz na ramieniu" if s.dynamics else "model Menagerie (nie zmierzona)"
+    if measured_here:
+        # Zapisana mimo werdyktu "nic nie wyjasnia" - trening centrowalby sie na zgadywance.
+        det = "zapisana dynamika nic nie wyjasnia - powtorz identyfikacje (albo Wroc do modelu Menagerie)"
+    else:
+        det = "zmierzona na sim - zmierz na ramieniu" if s.dynamics else "model Menagerie (nie zmierzona)"
     return Step(5, title, TODO, det, act)
 
 
@@ -343,7 +386,8 @@ def blockers(s: GuideSnapshot) -> list[str]:
             out.append(f"kamera {c.name} przestawiona - Kalibracja > **Relokalizuj wybrana**")
         if not c.has_frame:
             out.append(f"kamera {c.name} nie daje kadru" + ("" if c.simulated else
-                                                           " (na Shadow: przepuszczenie USB w kliencie)"))
+                                                           " (na maszynie wirtualnej/zdalnej, np. Shadow: "
+                                                           "przepusc kamere USB w kliencie)"))
     if s.cameras and not _relevant(s) and s.connected:
         kind = "symulowane" if s.simulated else "prawdziwe (USB)"
         out.append(f"ramie {s.backend}: do procedury potrzebne kamery {kind}")
@@ -379,6 +423,9 @@ def _now(s: GuideSnapshot, steps: list[Step]) -> str:
         return f"Ramie ma: {s.owner} - poczekaj na koniec albo STOP."
     if s.calib_result_pending:
         return "Kalibracja > 2. Polozenie: sprawdz werdykt w tabeli i kliknij **Zapisz wynik kalibracji**."
+    if s.dyn_result_pending and not s.dyn_result_useful:
+        return ("Trening > Dynamika serw: wynik identyfikacji nic nie wyjasnia (opis pod paskiem) - powtorz "
+                "**Identyfikuj** z wolnym ramieniem, bez obciazenia i kontaktu; nie zapisuj go.")
     if s.dyn_result_pending:
         return "Trening > Dynamika serw: sprawdz wynik i kliknij **Zapisz jako dynamike stanowiska**."
     if "identyfikacja" in s.jobs:
