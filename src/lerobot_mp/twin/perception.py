@@ -462,10 +462,10 @@ class CubeDetector:
         if not prepared:
             return None
 
-        def stats(p) -> tuple[float, int, int]:
-            """(suma IoU, ile kamer liczy sie do sredniej, ile widzi wiekszosc sylwetki)."""
+        def per_camera(p) -> list[tuple[int, int, int, int, int]]:
+            """Na kamere: (czesc wspolna, suma, przewidziana widoczna, cala przewidziana, widziana) [px]."""
             corners = self._corners(*p)
-            total, n_used, n_seen = 0.0, 0, 0
+            out = []
             for obs, valid, Ks, dist, Ti in prepared:
                 pc = corners @ Ti[:3, :3].T + Ti[:3, 3]
                 if (pc[:, 2] < 0.05).any():
@@ -475,19 +475,23 @@ class CubeDetector:
                 full = np.zeros(obs.shape, np.uint8)
                 cv2.fillConvexPoly(full, hull, 1)
                 pred = (full > 0) & valid
-                union = (pred | obs).sum()
-                if union == 0 or pred.sum() < 4:
-                    continue
-                total += (pred & obs).sum() / union
-                n_used += 1
-                # Kamera, ktorej ramie zaslania prawie cala przewidziana sylwetke, glosuje
-                # kilkoma pikselami - nie jest drugim, niezaleznym swiadkiem polozenia.
-                n_seen += int(pred.sum() >= self.min_visible * full.sum())
-            return total, n_used, n_seen
+                out.append((int((pred & obs).sum()), int((pred | obs).sum()), int(pred.sum()),
+                            int(full.sum()), int(obs.sum())))
+            return out
 
         def score(p) -> float:
-            total, n_used, _ = stats(p)
-            return -total / n_used if n_used else 0.0
+            # IoU LACZNE (piksele wszystkich kamer razem), nie srednia IoU kamer. Kamera, ktorej
+            # ramie zaslania prawie cala kostke, wchodzila do sredniej z pelna waga, gdy tylko
+            # przewidziana sylwetka wyszla spod maski ramienia na kilka pikseli - z IoU bliskim
+            # zera. Srednia spadala wtedy PO DRODZE do prawdziwej pozy i Nelder-Mead stawal
+            # przed ta bariera. Zmierzone (dwie kamery z e2e_panel, ramie w spoczynku, kostka
+            # r = 0,19 m na -45 st.): start 12 mm obok (czesc wspolna masek z jednej kamery,
+            # bo druga zaslonieta, ma boki kostki), dopasowanie konczylo na IoU 0,70 zamiast
+            # 0,96 w prawdziwej pozie - kostka "niewidoczna" dla 14 z 18 obrotow. Laczne IoU
+            # wazy kamere jej pikselami: skrawek to kilka pikseli, nie pol glosu.
+            cams = per_camera(p)
+            union = sum(c[1] for c in cams)
+            return -sum(c[0] for c in cams) / union if union else 0.0
 
         best, best_s = np.asarray(start, float), score(start)
         # Kilka startow obrotu (symetria 90 st.), potem Nelder-Mead po (x, y, obrot).
@@ -497,7 +501,22 @@ class CubeDetector:
             if s < best_s:
                 best, best_s = p, s
         best, best_s = _nelder_mead3(score, best, np.array([0.006, 0.006, np.radians(12)]), iters=90)
-        iou = -best_s
+        cams = [c for c in per_camera(best) if c[1] > 0]
+        # Kamera, ktorej ramie zaslania ponad polowe przewidzianej sylwetki, glosuje
+        # kilkoma pikselami - nie jest drugim, niezaleznym swiadkiem polozenia.
+        n_seen = sum(c[2] >= 4 and c[2] >= self.min_visible * c[3] for c in cams)
+        # Bramka to dalej srednia IoU kamer, ale kazda kamera glosuje waga tego, ile kostki
+        # widzi (przewidzianej albo zobaczonej): pelny glos od `min_visible` sylwetki, skrawek -
+        # ulamek glosu. IoU skrawka zaslonietego ramieniem to szum krawedzi maski ramienia:
+        # w prawdziwej pozie 0,67 przy 0,97 drugiej kamery (r = 0,25 m, -40 st., obrot 60 st.),
+        # a rowna waga dawala srednia 0,65 i odrzucala kostke lezaca na blacie. Dwoch swiadkow
+        # (obie wagi 1) - bramka dokladnie jak wczesniej. Samo wyrzucenie skrawkow nie wystarcza:
+        # skrawek, ktory NIE widzi czerwieni tam, gdzie model ja przewiduje (albo widzi ja obok),
+        # to prawdziwy glos przeciw. Kostka unoszaca sie 2-8 cm nad blatem przy ramieniu
+        # w spoczynku (160 polozen): bez skrawkow przechodzila jako jeden swiadek 34 razy,
+        # z waga 9 razy (przed zmiana 6); jako dwoch swiadkow nigdy - IoU jak wczesniej, max 0,56.
+        w = [min(1.0, max(c[2], c[4]) / (self.min_visible * c[3])) if c[3] else 1.0 for c in cams]
+        iou = float(np.dot(w, [c[0] / c[1] for c in cams]) / sum(w)) if sum(w) > 0 else 0.0
         # Model zaklada kostke LEZACA na blacie. Kostke w powietrzu (w szczekach) da sie
         # "wcisnac" w jakas poze na blacie, ktora czesciowo pasuje - zmierzone wzdluz
         # epizodow lift: prawdziwe detekcje na blacie IoU 0,88-0,96, falszywe przy
@@ -507,7 +526,6 @@ class CubeDetector:
         # (IoU 0,96-0,82 przy 26-92 mm bledu) - stad `n_cameras` w detekcji.
         if iou < self.min_iou:
             return None
-        n_seen = stats(best)[2]
         yaw = (best[2] + np.pi / 4) % (np.pi / 2) - np.pi / 4
         c_, s_ = np.cos(yaw), np.sin(yaw)
         R = np.array([[c_, -s_, 0.0], [s_, c_, 0.0], [0.0, 0.0, 1.0]])
