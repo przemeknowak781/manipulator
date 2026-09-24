@@ -23,7 +23,8 @@ Straznicy, ktorych srodowisko treningowe nie ma, a prawdziwe ramie potrzebuje:
 * **limit czasu** - epizod na ramieniu trwa tyle, ile w treningu;
 * **koniec po sukcesie** - `end_on_success` taktow sukcesu z rzedu konczy
   epizod (lift: kostka nad blatem), zamiast pozwalac polityce krecic ramieniem
-  z kostka do limitow stawow przez reszte epizodu;
+  z kostka do limitow stawow przez reszte epizodu; sukces lift liczy sie tylko
+  z pozy swiezej (kamery albo "w dloni"), nigdy z "ostatnie widziane";
 * **cel reach w obszarze treningu** - cel spoza niego (pod blatem, za
   podstawa) jest rzutowany na obszar, z ktorego losowano cele w treningu.
 """
@@ -45,6 +46,10 @@ logger = logging.getLogger(__name__)
 
 #: Nazwa wlasciciela ramienia (`Twin.claim`).
 OWNER = "polityka"
+
+#: Zrodla pozy kostki (`CubeTracker.source`), z ktorych wolno liczyc sukces lift: swieza
+#: detekcja z kamer, kostka niesiona w szczekach albo prawda symulacji.
+FRESH_CUBE_SOURCES = ("kamery", "w dloni", "symulacja")
 
 
 class NoCube(RuntimeError):
@@ -86,8 +91,8 @@ def project_goal(task: tk.TaskConfig, goal: np.ndarray) -> np.ndarray:
 
 class PolicyRunner:
     def __init__(self, twin, policy: Policy, *, max_tracking_deg: float = 25.0,
-                 cube_provider: Callable[[], tuple[np.ndarray, np.ndarray] | None] | None = None,
-                 episode_limit: bool = True):
+                 cube_provider: Callable[[], tuple | None] | None = None,
+                 episode_limit: bool = True, cube_source: Callable[[], str] | None = None):
         from ..kinematics import RobotKinematics
 
         self.twin = twin
@@ -100,7 +105,12 @@ class PolicyRunner:
         self.status = RunnerStatus()
         self._goal = np.array([0.22, 0.0, 0.12])
         #: lift: (polozenie (3,), obrot (3, 3)) kostki w ukladzie podstawy - z wizji albo z symulacji.
+        #: Moze zwrocic trzeci element: zrodlo pozy (`CubeTracker.source`), patrz `FRESH_CUBE_SOURCES`.
         self.cube_provider = cube_provider
+        #: Zrodlo pozy kostki, gdy dostawca zwraca tylko (polozenie, obrot) - np.
+        #: `lambda: tracker.source`. Bez obu na prawdziwym ramieniu sukces lift sie nie liczy.
+        self.cube_source = cube_source
+        self._cube_src: str | None = None
         self.max_tracking = np.radians(max_tracking_deg)
         self.episode_limit = episode_limit
         #: Ile sekund ramie stoi, czekajac na pierwsza pozycje kostki z kamer.
@@ -141,7 +151,8 @@ class PolicyRunner:
             got = self.cube_provider() if self.cube_provider else None
             if got is None:
                 raise NoCube("zadanie lift potrzebuje polozenia kostki - kamery jej nie widza")
-            cube_pos, cube_rot = got
+            cube_pos, cube_rot = got[0], got[1]
+            self._cube_src = str(got[2]) if len(got) > 2 else (self.cube_source() if self.cube_source else None)
             self._cube = np.asarray(cube_pos, float).copy()
             if self.policy.meta.randomization.get("fold_yaw", False):
                 # W treningu polityka widziala obrot zlozony do +-45 st. (jak z detektora);
@@ -164,18 +175,23 @@ class PolicyRunner:
         self.q_cmd = np.clip(self.kin.to_q(measured), self._hw_lo, self._hw_hi)
         self.prev_action = np.zeros(6)
         self.status = RunnerStatus(running=True, goal_clamped=self.status.goal_clamped)
-        self._cube = None
+        self._cube, self._cube_src = None, None
         self._stop.clear()
         self._t_start, self._ticks = None, 0            # zegar startuje z pierwszym taktem
-        self.twin.set_engaged(True)
-        if self.twin.owner != OWNER:                      # odebrane (STOP, Dom) miedzy claim a sprzeglem
-            self.twin.set_engaged(False)
+        # Sprzeglo tylko, jesli ramie wciaz nasze - sprawdzenie i wlaczenie razem w `Twin`.
+        # Wczesniej STOP miedzy claim a sprzeglem, a potem panel bioracy ramie: runner
+        # wylaczal sprzeglo panelu, a pole wyboru w panelu dalej pokazywalo "wlaczone".
+        if not self.twin.set_engaged(True, owner=OWNER):
+            reason = getattr(self.twin, "preempt_reason", "") or f"ramie ma: {self.twin.owner or 'nikt'}"
             self.status.running = False
-            self.status.stopped_because = f"przerwana: {getattr(self.twin, 'preempt_reason', '')}"
-            raise RuntimeError(f"ramie odebrane ({getattr(self.twin, 'preempt_reason', '')})")
+            self.status.stopped_because = f"przerwana: {reason}"
+            raise RuntimeError(f"ramie odebrane ({reason})")
         if threaded:
-            self._thread = threading.Thread(target=self._loop, name="polityka", daemon=True)
-            self._thread.start()
+            # Watek w zmiennej lokalnej: odebranie ramienia miedzy utworzeniem a startem
+            # watku (Dom z panelu) zeruje `self._thread` w `stop()`.
+            th = threading.Thread(target=self._loop, name="polityka", daemon=True)
+            self._thread = th
+            th.start()
 
     def _hardware_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """Limity treningu przeciete z limitami, ktore naprawde obowiazuja na ramieniu (`Twin.joint_limits`).
@@ -201,8 +217,12 @@ class PolicyRunner:
 
     def stop(self, reason: str = "") -> None:
         self._stop.set()
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=2.0)
+        th = self._thread
+        # Watek jeszcze nie wystartowal (odebranie tuz po `Thread()`): join rzucal RuntimeError,
+        # `status.running` zostawal True i panel widzial "polityka" do recznego Stop.
+        # Taki watek po starcie zobaczy `_stop` i od razu wyjdzie.
+        if th is not None and th is not threading.current_thread() and th.is_alive():
+            th.join(timeout=2.0)
         self._thread = None
         if self.status.running:
             self.status.running = False
@@ -255,7 +275,8 @@ class PolicyRunner:
             else:
                 # Na ramieniu nie ma czujnikow kontaktu szczek - sukcesem jest kostka
                 # (z kamer albo "w dloni") wyzej nad blatem niz `lift_height`.
-                st.success = self._cube is not None and self._cube[2] - self.task.cube_half > self.task.lift_height
+                st.success = (self._cube is not None and self._cube_fresh()
+                              and self._cube[2] - self.task.cube_half > self.task.lift_height)
             st.success_streak = st.success_streak + 1 if st.success else 0
             self._ticks += 1
             if now - self._t_hz >= 1.0:
@@ -282,6 +303,18 @@ class PolicyRunner:
             return False
         return True
 
+    def _cube_fresh(self) -> bool:
+        """Czy poza kostki jest swieza - tylko z takiej wolno liczyc sukces lift.
+
+        Tracker trzyma ostatnia poze do 6 s jako "ostatnie widziane". Zmierzone w
+        blizniaku (kamera a): kostka wypadla ze szczek po 0,5 s niesienia, a runner
+        liczyl sukces ze starej pozy w powietrzu i konczyl "zadanie wykonane" z kostka
+        na blacie. Bez zrodla: symulacja (dostawca = prawda sceny) tak, prawdziwe ramie nie.
+        """
+        if self._cube_src is None:
+            return bool(getattr(self.twin.status, "simulated", False))
+        return self._cube_src in FRESH_CUBE_SOURCES
+
     def _halt(self, reason: str, hold_measured: bool = False) -> None:
         self.status.running = False
         self.status.stopped_because = reason
@@ -300,5 +333,5 @@ class PolicyRunner:
             return
         if hold_measured:
             self.twin.hold_measured()
-        self.twin.set_engaged(False)
+        self.twin.set_engaged(False, owner=OWNER)
         self.twin.release(OWNER)

@@ -25,11 +25,19 @@ DT = 0.02
 
 
 class FakeArm(RobotBackend):
-    """Ramie "prawdziwe" (simulated=False): stawy ida za rozkazem, chyba ze sa zablokowane."""
+    """Ramie "prawdziwe" (simulated=False): stawy ida za rozkazem, chyba ze sa zablokowane.
 
-    def __init__(self, start: dict[str, float] | None = None):
+    `vmax` - serwo jedzie do celu najwyzej tyle st./s (w `step`), zamiast byc tam od razu.
+    `silent` - ile kolejnych odczytow bez odpowiedzi: jak `FeetechArm`, oddaje wtedy stare
+    pozycje, ustawia `_link_silent` i nic nie wysyla. `glitch` - nadpisania kolejnych
+    odczytow (przeklamana ramka z poprawna suma kontrolna).
+    """
+
+    def __init__(self, start: dict[str, float] | None = None, vmax: float | None = None):
         self.info = RobotInfo(name="udawane", simulated=False)
         self.pos = dict(SO101.home, **(start or {}))
+        self.goal = dict(self.pos)
+        self.vmax = vmax
         self.blocked: dict[str, float] = {}
         self.sent: list[dict[str, float]] = []
         self.fault_list: list[str] = []
@@ -38,6 +46,11 @@ class FakeArm(RobotBackend):
         #: Jak `FeetechArm`: przycina rozkaz do limitow swojej konfiguracji (`cfg` z `create_backend`).
         self.clamp_to_cfg = False
         self.cfg = None
+        self.silent = 0
+        self._link_silent = False
+        self._last_read = dict(self.pos)
+        self.glitch: list[dict[str, float]] = []
+        self.grip_ticks: tuple[float, float, float] | None = None
         self._on = False
 
     def connect(self):
@@ -51,9 +64,20 @@ class FakeArm(RobotBackend):
         return self._on
 
     def read_joints(self):
-        return dict(self.pos)
+        if self.silent > 0:
+            self.silent -= 1
+            self._link_silent = True
+            return dict(self._last_read)
+        self._link_silent = False
+        out = dict(self.pos)
+        if self.glitch:
+            out.update(self.glitch.pop(0))
+        self._last_read = out
+        return dict(out)
 
     def send_joints(self, targets):
+        if self._link_silent:
+            return {}
         out = {}
         for k, v in targets.items():
             lo, hi = self.clamp.get(k, (-1e9, 1e9))
@@ -62,14 +86,26 @@ class FakeArm(RobotBackend):
             out[k] = min(max(v, lo), hi)
         self.sent.append(out)
         for k, v in out.items():
-            self.pos[k] = self.blocked.get(k, v)
+            self.goal[k] = v
+            if self.vmax is None:
+                self.pos[k] = self.blocked.get(k, v)
         return out
+
+    def step(self, dt):
+        if self.vmax is None:
+            return
+        for k, g in self.goal.items():
+            p = self.pos[k] + float(np.clip(g - self.pos[k], -self.vmax * dt, self.vmax * dt))
+            self.pos[k] = self.blocked.get(k, p)
 
     def faults(self):
         return list(self.fault_list)
 
     def joint_limits(self):
         return dict(self.limits)
+
+    def gripper_ticks(self):
+        return self.grip_ticks
 
 
 @pytest.fixture
@@ -368,3 +404,269 @@ def test_loop_death_preempts_the_owner(twin, monkeypatch):
     twin.step(DT)
     assert not twin.connected and "kabel" in twin.status.error
     assert called == [True] and twin.owner is None
+
+
+# ------------------------------------------------------------ krotkie milczenie lacza
+def stall(twin, arm, cycles: int, block: float = 0.27):
+    """`cycles` odczytow bez odpowiedzi; kazdy trzyma petle `block` s (timeout odczytu przez most)."""
+    arm.silent = cycles
+    for _ in range(cycles):
+        twin.step(block)
+
+
+def test_a_short_link_stall_does_not_send_a_jump_when_the_link_returns(twin, monkeypatch):
+    """Przestoj ponizej progu utraty lacza: nadzor stoi, a pierwszy rozkaz po powrocie nie skacze.
+
+    Zmierzone przed poprawka (most, przestoj 0,9 s): rozkaz 10,5 -> 27,2 st. w jednej paczce.
+    """
+    arm = FakeArm()
+    connect_fake(twin, monkeypatch, arm)
+    twin.claim("kalibracja")
+    twin.set_engaged(True)
+    twin.set_target({"shoulder_pan": 80.0}, owner="kalibracja")
+    run(twin, 0.1)
+    n, last = len(arm.sent), arm.sent[-1]["shoulder_pan"]
+    t_meas = twin.status.measured_t
+    stall(twin, arm, 3)
+    assert len(arm.sent) == n                              # nic nie poszlo w trakcie
+    # Panel i identyfikacja widza to, co naprawde poszlo, i ze pomiaru nie bylo.
+    assert twin.status.command["shoulder_pan"] == pytest.approx(last)
+    assert twin.status.measured_t == t_meas
+    run(twin, 0.5)
+    goals = [last] + [s["shoulder_pan"] for s in arm.sent[n:]]
+    assert np.abs(np.diff(goals)).max() <= 140.0 * 1.5 * DT + 1e-6
+    assert goals[-1] > last + 20                           # ruch jedzie dalej
+    assert twin.safety_state.value == "ACTIVE" and twin.owner == "kalibracja"
+
+
+def test_after_a_stall_the_command_restarts_from_the_measured_pose(twin, monkeypatch):
+    """Staw, ktory w trakcie przestoju nie dojechal (przeszkoda), nie dostaje po nim docisku."""
+    arm = FakeArm()
+    connect_fake(twin, monkeypatch, arm)
+    arm.blocked["elbow_flex"] = arm.pos["elbow_flex"] + 2.0
+    twin.set_engaged(True)
+    twin.set_target({"elbow_flex": 90.0})
+    run(twin, 0.2)                                         # rozkaz ~20 st. za przeszkoda
+    assert arm.sent[-1]["elbow_flex"] > arm.blocked["elbow_flex"] + 15
+    n = len(arm.sent)
+    stall(twin, arm, 2)
+    run(twin, 0.1)
+    assert arm.sent[n]["elbow_flex"] <= arm.blocked["elbow_flex"] + 120.0 * 1.5 * DT + 1e-6
+
+
+# ------------------------------------------------------------ straznik rozjazdu
+def test_a_limp_servo_without_an_error_bit_triggers_estop(twin, monkeypatch):
+    """Serwo bez momentu i bez bitu bledu: rozkaz jedzie, ramie stoi - STOP z nazwa stawu.
+
+    Przed poprawka `Twin.move` konczyl "normalnie" 63 st. od celu, a nastepne ruchy szly dalej.
+    """
+    arm = FakeArm()
+    connect_fake(twin, monkeypatch, arm)
+    arm.blocked["shoulder_lift"] = arm.pos["shoulder_lift"]
+    twin.claim("kalibracja")
+    twin.set_engaged(True)
+    twin.set_target({"shoulder_lift": 40.0}, owner="kalibracja")
+    run(twin, 1.5)
+    assert twin.safety_state.value == "ESTOP"
+    assert "shoulder_lift" in twin.status.error
+    assert twin.owner is None
+    assert arm.sent[-1]["shoulder_lift"] == pytest.approx(arm.blocked["shoulder_lift"], abs=0.5)
+
+
+def test_twin_move_on_a_limp_servo_raises_instead_of_finishing(monkeypatch):
+    arm = FakeArm()
+    arm.blocked["shoulder_lift"] = arm.pos["shoulder_lift"]
+    monkeypatch.setattr(rt, "create_backend", lambda cfg: arm)
+    tw = Twin(Workspace())
+    try:
+        tw.connect("feetech", port="COM_TEST")
+        with pytest.raises(RuntimeError, match="stop awaryjny"):
+            tw.move({"shoulder_lift": 40.0}, duration=1.0, settle=0.5)
+        assert "shoulder_lift" in tw.status.error
+    finally:
+        tw.close()
+
+
+def test_normal_motion_does_not_trip_the_tracking_guard(twin, monkeypatch):
+    """Serwo 250 st./s (szybsze niz max_vel nadzoru), odczyt co 40 ms: rampa do domu, pelne
+    skoki suwakow, powrot stawu spoza limitow i chwytak sciskajacy kostke - bez STOP-u."""
+    arm = FakeArm({"shoulder_pan": 90.0, "elbow_flex": -80.0, "shoulder_lift": -101.0}, vmax=250.0)
+    arm.clamp_to_cfg = True
+    connect_fake(twin, monkeypatch, arm, go_home=True)
+    run(twin, 4.0)
+    assert twin.safety_state.value == "IDLE"
+    arm.blocked["gripper"] = 30.0
+    twin.claim("panel")
+    twin.set_engaged(True)
+    for target in ({"shoulder_pan": 100.0, "wrist_roll": 150.0, "gripper": 0.0},
+                   {"shoulder_pan": -100.0, "wrist_roll": -150.0, "elbow_flex": 90.0},
+                   {"shoulder_lift": 90.0, "wrist_flex": -90.0}):
+        twin.set_target(target, owner="panel")
+        run(twin, 2.0)
+        assert twin.safety_state.value == "ACTIVE", twin.status.error
+    twin.home()
+    run(twin, 3.0)
+    assert twin.safety_state.value == "IDLE" and not twin.status.error
+
+
+# ------------------------------------------------------------ chwytak: trzymanie i bledy
+def squeeze(twin, monkeypatch, arm, owner="polityka"):
+    """Chwytak zablokowany na kostce (30), rozkaz 5 - sciska."""
+    connect_fake(twin, monkeypatch, arm)
+    arm.blocked["gripper"] = 30.0
+    twin.claim(owner)
+    twin.set_engaged(True)
+    twin.set_target({"gripper": 5.0}, owner=owner)
+    run(twin, 1.0)
+    assert arm.sent[-1]["gripper"] == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("action", ["estop", "home", "preempt"])
+def test_stop_home_and_preempt_keep_the_gripper_squeeze(twin, monkeypatch, action):
+    """STOP/Dom/odebranie trzymaly zmierzony kat zablokowanej szczeki (30) = zerowa sila:
+    kostka niesiona nad blatem wypadala. Stawy ramienia dalej trzymaja pomiar."""
+    arm = FakeArm()
+    squeeze(twin, monkeypatch, arm)
+    n = len(arm.sent)
+    getattr(twin, action)(*(("test",) if action == "preempt" else ()))
+    run(twin, 3.5)
+    assert max(s["gripper"] for s in arm.sent[n:]) == pytest.approx(5.0)
+    assert twin.status.command["gripper"] == pytest.approx(5.0)
+
+
+def test_gripper_overload_eases_the_squeeze_instead_of_estop(twin, monkeypatch):
+    """Przeciazenie TYLKO chwytaka przy mocnym chwycie: bez STOP-u, szczeki luzniej, ostrzezenie."""
+    arm = FakeArm()
+    squeeze(twin, monkeypatch, arm)
+    arm.fault_list = ["gripper (serwo 6): przeciazenie"]
+    run(twin, 1.0)
+    assert twin.safety_state.value == "ACTIVE" and twin.owner == "polityka"
+    assert not twin.status.error
+    ease = 30.0 - Twin.grip_ease
+    assert arm.sent[-1]["gripper"] == pytest.approx(ease)  # wlasciciel dalej chce 5
+    assert 30.0 - arm.sent[-1]["gripper"] > Twin.grip_squeeze_margin   # chwyt zostaje
+    assert any("chwytak" in w and "przeciazenie" in w for w in twin.status.warnings)
+    twin.set_target({"shoulder_pan": 10.0}, owner="polityka")   # reszta ramienia jedzie dalej
+    run(twin, 0.5)
+    assert arm.sent[-1]["shoulder_pan"] == pytest.approx(10.0)
+    # Blad trwa mimo odciazenia - STOP, a chwytak dalej trzyma (luzniej), nie puszcza.
+    run(twin, 1.0)
+    assert twin.safety_state.value == "ESTOP" and "gripper" in twin.status.error
+    run(twin, 0.5)
+    assert arm.sent[-1]["gripper"] == pytest.approx(ease)
+
+
+def test_gripper_fault_that_clears_does_not_stop(twin, monkeypatch):
+    arm = FakeArm()
+    squeeze(twin, monkeypatch, arm)
+    arm.fault_list = ["gripper (serwo 6): przeciazenie"]
+    run(twin, 0.5)
+    arm.fault_list = []
+    run(twin, 3.0)
+    assert twin.safety_state.value == "ACTIVE"
+    assert arm.sent[-1]["gripper"] == pytest.approx(30.0 - Twin.grip_ease)   # odciazenie zostaje
+
+
+def test_arm_fault_with_a_gripper_fault_stops_at_once(twin, monkeypatch):
+    arm = FakeArm()
+    squeeze(twin, monkeypatch, arm)
+    arm.fault_list = ["gripper (serwo 6): przeciazenie", "elbow_flex (serwo 3): przegrzanie"]
+    twin.step(DT)
+    assert twin.safety_state.value == "ESTOP" and "elbow_flex" in twin.status.error
+    run(twin, 0.3)
+    assert arm.sent[-1]["gripper"] == pytest.approx(30.0 - Twin.grip_ease)
+
+
+# ------------------------------------------------------------ STOP w szybkim ruchu
+@pytest.mark.parametrize("extra", [0, 1])
+def test_stop_during_fast_motion_barely_moves_backwards(twin, monkeypatch, extra):
+    """STOP w trakcie szybkiego ruchu: trzymana poza nie lezy za ramieniem.
+
+    Przed poprawka trzymany byl odczyt sprzed do 40 ms - ramie cofalo sie o 3,7-6,4 st.
+    (serwo 250 st./s). Teraz odczyt przesuniety wzdluz predkosci, najwyzej do rozkazu.
+    `extra`: STOP w takcie z odczytem albo takt po nim.
+    """
+    arm = FakeArm(vmax=250.0)
+    connect_fake(twin, monkeypatch, arm)
+    twin.set_engaged(True)
+    twin.set_target({"shoulder_pan": 100.0})
+    run(twin, 0.3 + extra * DT)
+    at_stop = arm.pos["shoulder_pan"]
+    twin.estop()
+    run(twin, 0.5)
+    assert at_stop - arm.pos["shoulder_pan"] < 1.5
+    assert arm.pos["shoulder_pan"] <= twin.status.command["shoulder_pan"] + 1e-6
+
+
+# ------------------------------------------------------------ polaczenie
+def test_connect_ignores_a_single_corrupt_read(twin, monkeypatch):
+    """Jedna przeklamana ramka (0 tikow = -180 st.) tuz po polaczeniu nie zostaje poza startowa."""
+    arm = FakeArm()
+    arm.glitch = [{"shoulder_pan": -180.0}]
+    connect_fake(twin, monkeypatch, arm)
+    assert twin.status.command["shoulder_pan"] == pytest.approx(SO101.home["shoulder_pan"])
+    twin.set_engaged(True)
+    run(twin, 0.2)
+    assert all(abs(s["shoulder_pan"] - SO101.home["shoulder_pan"]) < 1.0 for s in arm.sent)
+
+
+def test_connect_refuses_reads_that_never_agree(twin, monkeypatch):
+    arm = FakeArm()
+    arm.glitch = [{"shoulder_pan": v} for v in (-180.0, 0.0) * 5]
+    with pytest.raises(RuntimeError, match="nie zgadzaja"):
+        connect_fake(twin, monkeypatch, arm)
+    assert not arm.is_connected and not twin.connected
+
+
+@pytest.mark.parametrize("ticks,warn", [(None, False), ((1986.0, 2670.0, 2048.0), False),
+                                        ((1990.0, 2660.0, 2048.0), False), ((1850.0, 2670.0, 2048.0), True)])
+def test_gripper_tick_mismatch_is_a_warning(twin, monkeypatch, ticks, warn):
+    """Backend mapuje chwytak 0..100 na inne tiki niz blizniak - kat szczek sie nie zgadza (C1/C3)."""
+    arm = FakeArm()
+    arm.grip_ticks = ticks
+    connect_fake(twin, monkeypatch, arm)
+    run(twin, 0.1)
+    assert any("chwytak" in w for w in twin.status.warnings) == warn
+    assert twin.safety_state.value != "ESTOP"
+
+
+# ------------------------------------------------------------ wlasnosc: sprzeglo i odmowy
+def test_set_engaged_with_an_owner_only_touches_its_own_clutch(twin, monkeypatch):
+    connect_fake(twin, monkeypatch, FakeArm())
+    twin.claim("panel")
+    assert twin.set_engaged(True, owner="panel")
+    assert not twin.set_engaged(False, owner="polityka")   # spozniony runner
+    twin.step(DT)
+    assert twin.status.engaged
+
+
+def test_refusals_name_the_current_owner_not_an_old_preempt(twin, monkeypatch):
+    """Po odebraniu ramienia panelowi (ponowne laczenie) i oddaniu go polityce spozniony suwak
+    slyszal "ponowne laczenie" sprzed minut zamiast tego, ze ramie ma polityka."""
+    connect_fake(twin, monkeypatch, FakeArm())
+    twin.claim("panel")
+    twin.preempt("ponowne laczenie")
+    twin.claim("panel")
+    twin.release("panel")
+    twin.claim("polityka")
+    assert twin.preempt_reason == ""
+    with pytest.raises(RuntimeError, match="ramie ma: polityka"):
+        twin.set_target({"shoulder_pan": 5.0}, owner="panel")
+    twin.home()
+    with pytest.raises(RuntimeError, match="pozycja domowa"):
+        twin.set_target({"shoulder_pan": 5.0}, owner="polityka")
+
+
+# ------------------------------------------------------------ scena po fizyce
+def test_scene_step_leaves_body_poses_matching_the_joint_angles(twin):
+    """K7 w zywej scenie: po `Scene.step` xpos/site_xpos pasuja do qpos (kostka, HUD, uchwyt TCP)."""
+    import mujoco
+
+    s = twin.scene
+    s.command({"shoulder_pan": 60.0, "elbow_flex": -40.0})
+    for _ in range(5):
+        s.step(0.02)
+    xpos, site = s.data.xpos.copy(), s.data.site_xpos.copy()
+    mujoco.mj_kinematics(s.model, s.data)
+    assert np.allclose(xpos, s.data.xpos, atol=1e-9)
+    assert np.allclose(site, s.data.site_xpos, atol=1e-9)

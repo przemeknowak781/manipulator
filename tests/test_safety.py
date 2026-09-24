@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from lerobot_mp.config import JOINT_NAMES, load_config
@@ -193,3 +194,35 @@ def test_hold_stops_a_ramp_at_the_measured_pose(supervisor):
     supervisor.trigger_estop()
     supervisor.hold({"shoulder_pan": 11.0})
     assert supervisor.state is SafetyState.ESTOP and supervisor.command["shoulder_pan"] == pytest.approx(11.0)
+
+
+@pytest.mark.parametrize("start", [160.0, 157.0])
+def test_homing_a_joint_outside_the_limits_has_no_speed_jump(cfg, start):
+    """Dom z wrist_roll 160 (limit 150): staw pelzal 15 st./s, a po powrocie w zakres ogranicznik
+    od razu puszczal pelne 220 st./s - rampa stawu zaczyna sie od nowa tam, gdzie wrocil."""
+    sup = SafetySupervisor(cfg)
+    sup.start({"wrist_roll": start}, go_home=False, keep_outside=True)
+    sup.begin_homing()
+    dt = 0.02
+    cmds = []
+    for _ in range(int(4.0 / dt)):
+        command, _ = sup.step(None, dt, hand_present=True, engaged=False)
+        cmds.append(command["wrist_roll"])
+    vel = np.abs(np.diff(cmds)) / dt
+    hi = cfg.joint("wrist_roll").max
+    # Smoothstep od limitu do domu: szczyt 1,5 * droga / czas rampy.
+    assert vel.max() <= 1.5 * (hi - sup.home["wrist_roll"]) / cfg.safety.startup_ramp_s + 1.0
+    assert cmds[-1] == pytest.approx(sup.home["wrist_roll"], abs=0.5)
+    assert sup.state is SafetyState.IDLE
+
+
+def test_begin_homing_can_keep_a_joint_where_it_is(supervisor, cfg):
+    """Blizniak: chwytak sciskajacy kostke nie otwiera sie w rampie do domu."""
+    settle(supervisor, {"gripper": 5.0, "shoulder_pan": 30.0}, seconds=2.0)
+    supervisor.begin_homing(keep={"gripper": 5.0})
+    command = settle(supervisor, None, seconds=4.0, hand=False, engaged=False)
+    assert command["gripper"] == pytest.approx(5.0)
+    assert command["shoulder_pan"] == pytest.approx(supervisor.home["shoulder_pan"], abs=0.5)
+    supervisor.begin_homing()                             # bez `keep` - jak dotad, wszystko do domu
+    command = settle(supervisor, None, seconds=4.0, hand=False, engaged=False)
+    assert command["gripper"] == pytest.approx(supervisor.home["gripper"], abs=0.5)

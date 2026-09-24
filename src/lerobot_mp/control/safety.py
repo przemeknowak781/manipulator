@@ -58,6 +58,9 @@ class SafetySupervisor:
         self._ramp_to: dict[str, float] = {}
         self._ramp_t = 0.0
         self._ramp_duration = max(cfg.safety.startup_ramp_s, 1e-3)
+        #: Chwila rampy [s], od ktorej liczy sie rampa danego stawu (brak = od zera).
+        #: Tylko blizniak: staw spoza limitow zaczyna swoja rampe dopiero po powrocie w zakres.
+        self._ramp_start: dict[str, float] = {}
         self._no_hand_for = 0.0
         self._estop = False
         self._was_active = False
@@ -117,6 +120,7 @@ class SafetySupervisor:
         self._ramp_from = dict(self._command)
         self._ramp_to = dict(self.home)
         self._ramp_t = 0.0
+        self._ramp_start = {}
         self._no_hand_for = 0.0
         self._was_active = False
         if not go_home:
@@ -175,6 +179,13 @@ class SafetySupervisor:
                 lo, hi = min(jc.min, max(lo, value)), max(jc.max, min(hi, value))
                 if lo >= jc.min and hi <= jc.max:
                     del self._soft[name]
+                    if self.state in (SafetyState.STARTING, SafetyState.HOMING):
+                        # Staw wrocil w zakres w trakcie rampy: jego rampa od nowa, stad.
+                        # Cel rampy uciekl juz daleko (staw pelzal 15 st./s), a ogranicznik
+                        # wracal w zakresie do pelnego max_vel - zmierzone: wrist_roll
+                        # 160 -> dom, rozkaz -15 st./s przez 8 taktow, potem od razu -220 st./s.
+                        self._ramp_from[name] = value
+                        self._ramp_start[name] = self._ramp_t
                 else:
                     self._soft[name] = (lo, hi)
 
@@ -196,12 +207,11 @@ class SafetySupervisor:
 
         if self.state in (SafetyState.STARTING, SafetyState.HOMING):
             self._ramp_t += dt
-            alpha = _smoothstep(self._ramp_t / self._ramp_duration)
-            target = {
-                name: self._ramp_from[name] + alpha * (self._ramp_to[name] - self._ramp_from[name])
-                for name in JOINT_NAMES
-            }
-            if self._ramp_t >= self._ramp_duration:
+            target = {}
+            for name in JOINT_NAMES:
+                alpha = _smoothstep((self._ramp_t - self._ramp_start.get(name, 0.0)) / self._ramp_duration)
+                target[name] = self._ramp_from[name] + alpha * (self._ramp_to[name] - self._ramp_from[name])
+            if self._ramp_t >= self._ramp_duration + max(self._ramp_start.values(), default=0.0):
                 self.state = SafetyState.IDLE
                 self._was_active = False
             return target
@@ -224,12 +234,21 @@ class SafetySupervisor:
         return dict(self._command)
 
     # ------------------------------------------------------------- sterowanie
-    def begin_homing(self, duration: float | None = None) -> None:
-        """Rozpoczyna plynny powrot do pozycji domowej."""
+    def begin_homing(self, duration: float | None = None, *, keep: dict[str, float] | None = None) -> None:
+        """Rozpoczyna plynny powrot do pozycji domowej.
+
+        `keep` (blizniak): stawy, ktore w rampie maja jechac do podanej wartosci
+        zamiast do domu - np. chwytak sciskajacy kostke nie otwiera sie po drodze.
+        """
         self._ramp_from = dict(self._command)
         self._ramp_to = dict(self.home)
+        for name, value in (keep or {}).items():
+            if name in self._ramp_to:
+                jc = self.cfg.joint(name)
+                self._ramp_to[name] = min(max(float(value), jc.min), jc.max)
         self._ramp_duration = max(duration or self.cfg.safety.startup_ramp_s, 1e-3)
         self._ramp_t = 0.0
+        self._ramp_start = {}
         self._no_hand_for = 0.0
         self._was_active = False
         self.state = SafetyState.HOMING
