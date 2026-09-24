@@ -41,6 +41,8 @@ def test_roll_and_motion_along_the_optical_axis_are_caught(roll, zoom):
     w = CameraWatch()
     w.remember("k", img)
     assert w.check("k", moved(img, roll, zoom)) > 8.0
+    assert not w.moved("k") and w.detail["k"]["waiting"]      # jedno sprawdzenie to jeszcze nie ruch
+    assert w.check("k", moved(img, roll, zoom)) > 8.0
     assert w.moved("k")
 
 
@@ -63,6 +65,7 @@ def test_small_zoom_and_roll_are_measured_not_just_flagged(roll, zoom):
     w.remember("k", img)
     got = w.check("k", moved(img, roll, zoom))
     assert got == pytest.approx(corner_shift(roll, zoom), rel=0.1)
+    w.check("k", moved(img, roll, zoom))
     assert w.moved("k")
     assert w.detail["k"]["scale"] == pytest.approx(zoom, abs=0.001)
 
@@ -127,8 +130,10 @@ def test_camera_motion_is_measured_while_the_arm_moves_in_the_twin(twin_frames):
     for name, true in (("roll 1 st.", half_diag * np.radians(1.0)), ("zoom 1.01", half_diag * 0.01),
                        ("zoom 1.02", half_diag * 0.02), ("zoom 1.03", half_diag * 0.03)):
         got = w.check("c", *frames[name])
-        assert w.moved("c"), f"{name}: {got:.2f} px"
         assert got == pytest.approx(true, abs=1.0), name
+        w.check("c", *frames[name])
+        assert w.moved("c"), f"{name}: {got:.2f} px"
+        w.check("c", *frames["still"])                     # z powrotem - kolejny ruch od nowa
 
 
 @pytest.mark.render
@@ -154,6 +159,109 @@ def test_a_check_costs_a_few_milliseconds_not_hundreds(twin_frames):
     assert min(medians) < 0.040, f"mediany rund {[round(1000 * m) for m in medians]} ms"
 
 
+def hand(img: np.ndarray, frac: float, side: str = "right", seed: int = 0) -> np.ndarray:
+    """Reka/tulow operatora: elipsa w kolorze skory z tekstura, wchodzaca z brzegu kadru (jak s14)."""
+    h, w = img.shape[:2]
+    ax = int(np.sqrt(frac * w * h / np.pi * 2)), int(np.sqrt(frac * w * h / np.pi / 2))
+    ov = img.copy()
+    cx = w - ax[0] // 3 if side == "right" else ax[0] // 3
+    cv2.ellipse(ov, (cx, h // 2), ax, 20, 0, 360, (200, 150, 120), -1)
+    sel = np.any(ov != img, axis=2)
+    out = img.copy()
+    noise = np.random.default_rng(seed).normal(0, 12, img.shape)
+    out[sel] = np.clip(ov[sel] + noise[sel], 0, 255).astype(np.uint8)
+    return out
+
+
+def _panel_view(eye, target, K):
+    from lerobot_mp.twin.kinematics import pose
+    eye, target = np.asarray(eye, float), np.asarray(target, float)
+    z = (target - eye) / np.linalg.norm(target - eye)
+    x = np.cross(z, [0, 0, 1.0])
+    x /= np.linalg.norm(x)
+    return pose(np.column_stack([x, np.cross(z, x), z]), eye)
+
+
+@pytest.fixture(scope="module")
+def panel_frames():
+    """Dwie kamery jak w panelu (`_add_sim_camera`, e2e): odniesienie, ramie w innej pozie, obrot o 1 st."""
+    mujoco = pytest.importorskip("mujoco")
+    from lerobot_mp.twin import scene as sc
+    from lerobot_mp.twin.kinematics import pose
+    from lerobot_mp.twin.robots import SO101
+    from lerobot_mp.twin.ui.watch import arm_mask
+
+    f = 240.0 / np.tan(np.radians(31.0))
+    K = np.array([[f, 0, 322.5], [0, f * 0.995, 237.5], [0, 0, 1]])
+    other = dict(SO101.home, shoulder_pan=40.0, elbow_flex=10.0)
+    a = np.radians(1.0)
+    Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+
+    def render(T, joints):
+        cfg = sc.SceneConfig(SO101, cameras=[sc.CameraView("c", K, 640, 480, T)],
+                             objects=[sc.Box("k", (0.015,) * 3, (0.22, 0.05), rgba=(0.85, 0.25, 0.2, 1.0))])
+        with sc.build(cfg) as s:
+            s.set_joints(joints)
+            mujoco.mj_forward(s.model, s.data)
+            return s.render("c"), arm_mask(s, "c")
+
+    out = {}
+    for name, eye in (("a", [0.55, -0.45, 0.45]), ("b", [0.5, 0.5, 0.5])):
+        T = _panel_view(eye, [0.2, 0.0, 0.0], K)
+        out[name] = dict(ref=render(T, SO101.home), still=render(T, other),
+                         roll=render(pose(T[:3, :3] @ Rz, T[:3, 3]), other)[0])
+    return out
+
+
+@pytest.mark.render
+@pytest.mark.parametrize("cam", ["a", "b"])
+def test_a_hand_in_the_frame_is_not_camera_motion(panel_frames, cam):
+    """Nie zamaskowana reka 10-20% kadru, kamera stoi. Przed wagami odpornosciowymi (IRLS):
+    pojedyncze sprawdzenie dawalo 1-68 px przy korelacji 0,89-0,98 (panel: "Kamera przestawiona"
+    przy kazdym siegnieciu do stanowiska); teraz <= 1,4 px."""
+    fr = panel_frames[cam]
+    w = CameraWatch()
+    w.remember(cam, *fr["ref"])
+    img, mask = fr["still"]
+    for frac in (0.10, 0.20):
+        for side in ("right", "left"):
+            got = w.check(cam, hand(img, frac, side), mask)
+            assert got < 2.0, f"reka {frac:.0%} z {side}: {got:.2f} px"
+    # Reka w kadrze nie chowa prawdziwego ruchu: obrot o 1 st. (7,0 px naroznika) dalej mierzony.
+    half_diag = float(np.linalg.norm(np.array([[0, 0], [639, 0], [0, 479], [639, 479]], float)
+                                     - [322.5, 237.5], axis=1).max())
+    got = w.check(cam, hand(fr["roll"], 0.10), mask)
+    assert got == pytest.approx(half_diag * np.radians(1.0), abs=1.0)
+
+
+def test_moved_only_when_two_checks_in_a_row_see_the_same_motion():
+    """Reka w kadrze daje "przesuniecie" inne w kazdym sprawdzeniu - przestawiona kamera to samo."""
+    img = textured(6)
+    w = CameraWatch()
+    w.remember("k", img)
+    # Dwa sprawdzenia ponad progiem, ale rozne (jak reka w dwoch miejscach): bez alarmu.
+    assert w.check("k", moved(img, roll_deg=2.0)) > 8.0
+    assert w.check("k", moved(img, roll_deg=-2.0)) > 8.0
+    assert not w.moved("k") and w.detail["k"]["waiting"]
+    # Trzecie jak drugie - to jest ruch kamery.
+    w.check("k", moved(img, roll_deg=-2.0))
+    assert w.moved("k") and not w.detail["k"]["waiting"]
+    # Potwierdzona przestawiona kamera nie "wraca", gdy cos na chwile zmieni wynik...
+    w.check("k", moved(img, roll_deg=-2.0, tx=12.0))
+    assert w.moved("k")
+    # ...a wraca od razu, gdy kadr znowu pasuje do odniesienia (ktos odstawil kamere).
+    assert w.check("k", img) < 0.5 and not w.moved("k")
+    # Kadr zupelnie inny dwa razy z rzedu (zaslonieta kamera) - przestawiona.
+    w.check("k", textured(7))
+    assert not w.moved("k")
+    w.check("k", textured(8))
+    assert w.moved("k")
+    # Nowe odniesienie (relokalizacja) zeruje historie.
+    w.remember("k", img)
+    w.check("k", moved(img, roll_deg=2.0))
+    assert not w.moved("k")
+
+
 def test_translation_is_measured_and_a_still_camera_stays_quiet_after_many_checks():
     img = textured(1)
     w = CameraWatch()
@@ -170,6 +278,7 @@ def test_translation_is_measured_and_a_still_camera_stays_quiet_after_many_check
 def test_a_different_picture_is_not_reported_as_a_still_camera():
     w = CameraWatch()
     w.remember("k", textured(2))
+    assert w.check("k", textured(3)) > 100.0
     assert w.check("k", textured(3)) > 100.0
     assert w.moved("k")
 
