@@ -56,6 +56,12 @@ GIZMO_IDLE_S = 0.5
 FRAME_MAX_AGE = 1.0
 #: Detekcja kostki starsza niz tyle [s] nie trafia do polityki jako nowa.
 CUBE_MAX_AGE = 0.5
+#: Niepewnosc chwili kadru [s] wzgledem jego znacznika czasu (opoznienie kamery i USB).
+MASK_WINDOW = (-0.15, 0.25)
+#: Najdalsze przesuniecie [px] sylwetki ramienia w masce - dalej to raczej zla historia katow.
+MASK_MAX_SHIFT_PX = 60.0
+#: Co tyle [px] kopia maski na drodze ramienia - ogniwo ma w kadrze kilkadziesiat px, bez przerw.
+MASK_STEP_PX = 6.0
 
 
 def _skip_unchanged_markdown() -> None:
@@ -106,6 +112,57 @@ def _px(shift: float) -> str:
     return f"{shift:.1f} px" if np.isfinite(shift) else "kadr nie pasuje do odniesienia"
 
 
+#: Parametry dynamiki w panelu: (pole `Dynamics`, etykieta).
+DYN_PARAMS = (("kp", "kp"), ("damping", "tlumienie"), ("armature", "armatura"), ("frictionloss", "tarcie"),
+              ("delay", "opoznienie"))
+
+
+def fitted_names(dyn, sysid_default: bool = False) -> tuple[str, ...]:
+    """Parametry, ktore identyfikacja naprawde dopasowala (`Dynamics.fitted`).
+
+    Starsza `Dynamics` bez tego pola: dla swiezego wyniku identyfikacji - lista,
+    z ktora ja liczono (`sysid.IDENTIFIED`); dla zapisanej dynamiki - nic (nie wiadomo).
+    """
+    names = getattr(dyn, "fitted", None)
+    if names is None and sysid_default:
+        from ..rl import sysid
+        names = getattr(sysid, "IDENTIFIED", ())
+    return tuple(names or ())
+
+
+def dynamics_parts(dyn, fitted) -> tuple[list[str], list[str]]:
+    """(dopasowane, z modelu) jako teksty "tlumienie x0.95", "opoznienie 25 ms".
+
+    Panel pisal "Dopasowano: kp x1.00 ... tarcie x1.00" takze dla parametrow, ktorych
+    identyfikacja NIE ruszala (kp i tarcie zostaja z modelu) - wygladalo to jak
+    pomiar "kp idealnie jak w modelu", a to tylko wartosc startowa.
+    """
+    fitted = set(fitted)
+    a, b = [], []
+    for name, label in DYN_PARAMS:
+        v = float(getattr(dyn, name))
+        txt = f"{label} {v / 20 * 1000:.0f} ms" if name == "delay" else f"{label} x{v:.2f}"
+        (a if name in fitted else b).append(txt)
+    return a, b
+
+
+def smear_mask(mask: np.ndarray, shifts: list[tuple[float, float]]) -> np.ndarray:
+    """Suma maski i jej kopii przesunietych o `shifts` [px] - sylwetka na drodze ramienia."""
+    out = mask.copy()
+    if not shifts or not mask.any():
+        return out
+    h, w = mask.shape
+    x, y, bw, bh = cv2.boundingRect(mask.astype(np.uint8))
+    crop = mask[y:y + bh, x:x + bw]                         # tylko prostokat ramienia - kilka razy szybciej
+    for dx, dy in {(int(round(dx)), int(round(dy))) for dx, dy in shifts}:
+        x0, y0 = x + dx, y + dy
+        sx, sy = max(0, -x0), max(0, -y0)
+        ex, ey = min(bw, w - x0), min(bh, h - y0)
+        if (dx or dy) and sx < ex and sy < ey:
+            out[y0 + sy:y0 + ey, x0 + sx:x0 + ex] |= crop[sy:ey, sx:ex]
+    return out
+
+
 def no_frame_image(text: str = "brak kadru", size: tuple[int, int] = (320, 240)) -> np.ndarray:
     img = np.zeros((size[1], size[0], 3), np.uint8)
     cv2.putText(img, text, (20, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (230, 60, 60), 2, cv2.LINE_AA)
@@ -138,6 +195,10 @@ class TwinApp:
         self._cube_used_t = 0.0
         from ..kinematics import RobotKinematics
         self._kin_vision = RobotKinematics(self.ws.spec())
+        # Punkty ramienia do przesuniecia maski w kadrze - wlasna kinematyka (maski licza
+        # petla panelu i przyciski visera, a `_kin_vision` jest w watku polityki).
+        self._kin_mask = RobotKinematics(self.ws.spec())
+        self._mask_lock = threading.Lock()
         # Uchwyt TCP: wlasna kinematyka (callbacki visera ida z wielu watkow naraz,
         # a `ik` pisze do swojego MjData) i ostatnie przyjete rozwiazanie jako start IK.
         self._kin_gizmo = RobotKinematics(self.ws.spec())
@@ -272,7 +333,7 @@ class TwinApp:
             if self.runner is not None:
                 self.runner.stop("STOP z panelu")
             self.calib_job.stop()
-            self.sysid_job.stop()
+            self.sysid_job.stop()                       # tylko nagranie - dopasowanie jest chronione
             self.arm_engage.value = False
             self._gizmo_seed = None
         self._notify(event, "STOP", "Ramie zatrzymane. Skasuj STOP w zakladce Ramie, zeby ruszyc dalej.", error=True)
@@ -326,6 +387,8 @@ class TwinApp:
         if self.runner is not None:
             self.runner.stop(reason)
         self.calib_job.stop()
+        # Identyfikacja: przerywa tylko nagranie. Po nim zadanie jest chronione
+        # (`Job.protect`) - dopasowanie ramienia nie rusza i konczy sie z wynikiem.
         self.sysid_job.stop()
         self.twin.preempt(reason)
         for job in (self.calib_job, self.sysid_job):
@@ -357,7 +420,11 @@ class TwinApp:
         if self.train.running:
             p = self.train.progress() or {}
             tr = f"{p.get('iteration', 0)}/{p.get('iterations', '?')} it., sukces {p.get('success', 0):.0%}"
-        return f"**Ramie:** {arm} | **Kamery:** {cam_txt} | **Polityka:** {pol} | **Trening:** {tr}"
+        # Trwale ostrzezenia ramienia (kalibracja chwytaka niezgodna z blizniakiem, chwytak
+        # poluzowany po przeciazeniu) - `RobotStatus.warnings`; starszy status ich nie ma.
+        warns = [str(w) for w in (getattr(st, "warnings", None) or [])]
+        warn_txt = f" | **Uwaga:** {'; '.join(warns)}" if warns else ""
+        return f"**Ramie:** {arm} | **Kamery:** {cam_txt} | **Polityka:** {pol} | **Trening:** {tr}{warn_txt}"
 
     # ================================================================== ramie
     def _build_arm(self) -> None:
@@ -800,46 +867,106 @@ class TwinApp:
         before = [j for (ti, j) in hist if ti <= t]
         return before[-1] if before else hist[0][1]
 
-    def _arm_speed_deg(self, t: float, window: tuple[float, float] = (-0.15, 0.25)) -> float:
-        """Najwiekszy ruch stawu ramienia [st.] w oknie wokol `t` - niepewnosc chwili kadru."""
-        near = [j for (ti, j) in list(self._joint_hist) if t + window[0] <= ti <= t + window[1]]
-        if len(near) < 2:
-            return 0.0
-        arm = [n for n in self.ws.spec().joints if n != self.ws.spec().gripper]
-        a = np.array([[j.get(n, 0.0) for n in arm] for j in near])
-        return float((a.max(axis=0) - a.min(axis=0)).max())
+    def _arm_points(self, joints: dict[str, float]) -> np.ndarray:
+        """Punkty ramienia (srodki bryl, poczatki ogniw, TCP) w ukladzie podstawy, (N, 3)."""
+        kin = self._kin_mask
+        with self._mask_lock:
+            kin._apply(kin.to_q(joints))
+            d, m = kin.data, kin.model
+            body = np.asarray(m.geom_bodyid) > 0                # bez bryl swiata (podloga)
+            P = np.vstack([d.geom_xpos[body], d.xpos[1:], d.site_xpos])
+            Ti = kin._base_inv()
+        return P @ Ti[:3, :3].T + Ti[:3, 3]
 
-    def _arm_masks(self, names: list[str], t: float | None = None, dilate: int = 9) -> dict[str, np.ndarray] | None:
+    def _arm_shifts(self, rec: CameraRecord, t: float, ref: dict[str, float] | None) -> list[tuple[float, float]]:
+        """Przesuniecia [px] sylwetki ramienia w kadrze `rec` w niepewnosci chwili kadru `t`.
+
+        Z historii katow w `MASK_WINDOW` wokol `t`: dla kazdej pozy najdalej przesuniety
+        punkt ramienia (rzut przez K i poze kamery) wzgledem pozy renderu `ref`. Maska
+        rozciaga sie wiec TYLKO wzdluz drogi ramienia i tylko o tyle, ile ono naprawde
+        przejechalo w kadrze. Wczesniej: kwadratowe poszerzenie z najwiekszego ruchu
+        STAWU (lacznie z wrist_roll, ktory prawie nie rusza sylwetki) - przy ~16 st./s
+        juz na limicie 40 px, maska rosla o ~22 px na kazda strone i chowala kostke
+        przy szczekach we wszystkich kamerach naraz, dokladnie w chwili chwytu.
+        """
+        near = [(ti, j) for (ti, j) in list(self._joint_hist) if t + MASK_WINDOW[0] <= ti <= t + MASK_WINDOW[1]]
+        T = rec.true_pose()
+        if len(near) < 2 or T is None:
+            return []
+        K, _ = rec.intrinsics()
+        R, p = T[:3, :3], T[:3, 3]
+
+        def uv(P):
+            c = (P - p) @ R                                     # uklad kamery (OpenCV, z do przodu)
+            z = c[:, 2]
+            ok = z > 0.05
+            zs = np.where(ok, z, 1.0)
+            return np.stack([K[0, 0] * c[:, 0] / zs + K[0, 2], K[1, 1] * c[:, 1] / zs + K[1, 2]], 1), ok
+
+        uv0, ok0 = uv(self._arm_points(ref if ref is not None else near[-1][1]))
+        path: list[np.ndarray] = []
+        placed = False
+        for ti, j in near:
+            if not placed and ti > t:
+                path.append(np.zeros(2))                        # poza renderu - na swoim miejscu w czasie
+                placed = True
+            uvj, okj = uv(self._arm_points(j))
+            ok = ok0 & okj
+            if not ok.any():
+                continue
+            dv = uvj[ok] - uv0[ok]
+            v = dv[int(np.argmax(np.linalg.norm(dv, axis=1)))]
+            n = float(np.linalg.norm(v))
+            path.append(v * (MASK_MAX_SHIFT_PX / n) if n > MASK_MAX_SHIFT_PX else v)
+        if not placed:
+            path.append(np.zeros(2))
+        shifts = [tuple(path[0])]
+        for a, b in zip(path, path[1:]):
+            steps = max(1, int(np.ceil(np.linalg.norm(b - a) / MASK_STEP_PX)))
+            shifts += [tuple(a + (b - a) * k / steps) for k in range(1, steps + 1)]
+        return shifts
+
+    def _arm_masks(self, names: list[str], t: float | dict[str, float] | None = None,
+                   dilate: int = 9) -> dict[str, np.ndarray] | None:
         """Maski ramienia (piksele zasloniete) w geometrii SUROWYCH kadrow kamer `names`.
 
         Render blizniaka to kamera otworkowa w pozie z chwili renderu, a kadr jest
         z dystorsja i sprzed 0-200 ms (plus opoznienie kamery). Dlatego: poza ramienia
-        z chwili kadru `t` (historia katow), maska przepuszczona przez dystorsje kamery
-        i poszerzona o to, ile ramie moglo przejechac w niepewnosci chwili kadru -
-        ~10 cm/s przy kostce to 1-3 cm, dziesiatki px.
+        z chwili kadru (historia katow) - KAZDEJ kamery z chwili jej wlasnego kadru
+        (`t` jako {kamera: chwila}; jedna chwila najstarszego kadru renderowala maske
+        swiezszej kamery w pozie sprzed ~150 ms), maska rozciagnieta wzdluz drogi
+        ramienia w niepewnosci chwili kadru (`_arm_shifts`) i przepuszczona przez
+        dystorsje kamery.
         """
         names = [n for n in names if n in {c.name for c in self.ws.cameras}]
         if not names:
             return None
-        joints = self._joints_at(t)
-        extra = {}
-        if t is not None:
-            speed = np.radians(self._arm_speed_deg(t))
-            for n in names:
-                K, _ = self.ws.camera(n).intrinsics()
-                # ramie ~0,35 m od osi obrotu, kamera ~0,6 m od niego - przesuniecie w px
-                extra[n] = int(min(40.0, K[0, 0] * 0.35 * speed / 0.6))
+        times = t if isinstance(t, dict) else {n: t for n in names}
+        poses = {n: self._joints_at(times.get(n)) for n in names}
+        shifts = {}
+        for n in names:
+            tn = times.get(n)
+            if tn is not None:
+                shifts[n] = self._arm_shifts(self.ws.camera(n), tn, poses[n])
 
         def render(s):
-            if joints:
-                s.set_joints(joints)                        # kopia stanu do renderu - scena bez zmian
-            return {n: arm_mask(s, n, dilate=dilate + extra.get(n, 0)) for n in names}
+            q0 = s.data.qpos.copy()
+            out = {}
+            for n in names:
+                if poses[n]:
+                    s.set_joints(poses[n])                  # kopia stanu do renderu - scena bez zmian
+                elif not np.array_equal(s.data.qpos, q0):
+                    s.data.qpos[:] = q0                     # bez historii: poza z teraz, nie poprzedniej kamery
+                    mujoco.mj_kinematics(s.model, s.data)
+                out[n] = arm_mask(s, n, dilate=dilate)
+            return out
         try:
             masks = self.twin.render_with(render)
         except KeyError:                                    # kamery nie ma w modelu (wylaczona, bez pozy)
             return None
         out = {}
         for n, m in masks.items():
+            m = smear_mask(m, shifts.get(n, []))
             rec = self.ws.camera(n)
             if not rec.simulated:
                 K, dist = rec.intrinsics()
@@ -861,7 +988,10 @@ class TwinApp:
             elif c.trusted:
                 cal = f"zaufana ({c.calibration.get('rms_px', 0):.2f} px)"
             else:
-                cal = f"niezaufana: {c.calibration.get('reason', '')}"
+                # Zapisana zaufana, ale K kamery inne niz to, z ktorym ja liczono (`CameraRecord.trusted`).
+                why = (c.calibration.get("reason", "") if not c.calibration.get("trusted")
+                       else "intrynsyki zmienione od kalibracji polozenia - skalibruj ponownie")
+                cal = f"niezaufana: {why}"
             sh = self.watch.shift.get(c.name)
             moved = "-" if sh is None else (f"**TAK {_px(sh)}**" if self.watch.moved(c.name) else f"nie ({_px(sh)})")
             rows.append(f"| {c.name}{'' if c.enabled else ' (wyl.)'} | {c.source} | {c.intrinsics_from} | {cal} | {moved} |")
@@ -1036,7 +1166,10 @@ class TwinApp:
         @self._safe
         def _(event):
             names = self._apply_calibration()
-            self._notify(event, "Zapisano", f"Kalibracja kamer: {', '.join(names)}")
+            bad = [f"{n}: {self.ws.camera(n).calibration.get('reason', '')}" for n in names
+                   if not self.ws.camera(n).trusted]
+            self._notify(event, "Zapisano", f"Kalibracja kamer: {', '.join(names)}"
+                         + (f". NIEZAUFANE: {'; '.join(bad)}" if bad else ""), error=bool(bad))
 
     def _apply_calibration(self) -> list[str]:
         """Zapis wyniku fali - z bokiem taga i K, z ktorymi ja liczono."""
@@ -1105,8 +1238,9 @@ class TwinApp:
                     from ..calib.handeye import pose_error
                     dt, dr = pose_error(np.asarray(rec.sim_pose), c.T_cam2base)
                     extra = f" (wzgl. prawdy {dt * 1000:.2f} mm, {np.degrees(dr):.3f} st.)"
-                k_problem = rec.intrinsics_problem() if rec is not None else ""
-                # Ten sam werdykt, ktory zapisze `Workspace.apply_fit` - bez zaufanego K poza nie jest zaufana.
+                # Ten sam werdykt, ktory zapisze `Workspace.apply_fit`: K, z ktorym LICZONO poze
+                # (z fali), musi byc zaufane i wciaz takie samo jak w kamerze.
+                k_problem = rec.fit_problem((j.data.get("intrinsics") or {}).get(n)) if rec is not None else ""
                 verdict = f"NIE: {c.reason}" if not c.trusted else (f"NIE: {k_problem}" if k_problem else "zaufana")
                 rows.append(f"| {n} | {c.rms_px:.2f} px | {c.n_obs} | {c.spread_deg:.0f} st. | {verdict}{extra} |")
             self.calib_md.content = "\n".join(rows)
@@ -1262,9 +1396,10 @@ class TwinApp:
             with self.frame_lock:
                 times = dict(self.frame_times)
             # Chwila detekcji = chwila NAJSTARSZEGO uzytego kadru (konsument ocenia jej wiek).
-            t_frames = min((times.get(n, now) for n in names), default=now)
-            # Piksele zasloniete ramieniem (maska z blizniaka, w pozie z chwili kadru) nie glosuja.
-            occ = self._arm_masks(names, t_frames, dilate=5) if names else None
+            t_cams = {n: times.get(n, now) for n in names}
+            t_frames = min(t_cams.values(), default=now)
+            # Piksele zasloniete ramieniem (maska z blizniaka, w pozie z chwili kadru KAZDEJ kamery) nie glosuja.
+            occ = self._arm_masks(names, t_cams, dilate=5) if names else None
             if names:
                 det = self.cube_det.detect_frames({n: frames[n] for n in names}, mapper, occ, t=t_frames)
             if det is not None:
@@ -1272,8 +1407,10 @@ class TwinApp:
                 self.cube_node.position, self.cube_node.wxyz = Tw[:3, 3], mat_to_wxyz(Tw[:3, :3])
                 self.cube_node.visible = True
                 yaw = np.degrees(np.arctan2(det.rot[1, 0], det.rot[0, 0]))
+                # n_cameras -1 = detekcja z samej mapy (nie wiadomo, ile kamer ja widzialo)
+                cams = f"{det.n_cameras} kam." if det.n_cameras >= 0 else "z mapy"
                 txt += (f"  \nkostka: x {det.pos[0] * 100:.1f} cm, y {det.pos[1] * 100:.1f} cm, obrot {yaw:.0f} st., "
-                        f"pewnosc {det.confidence:.2f}, {det.n_cameras} kam., "
+                        f"pewnosc {det.confidence:.2f}, {cams}, "
                         f"kadr sprzed {1000 * (time.monotonic() - det.t):.0f} ms")
             else:
                 self.cube_node.visible = False
@@ -1344,6 +1481,8 @@ class TwinApp:
             if not self.twin.status.simulated and not self.dyn_confirm.value:
                 raise RuntimeError("potwierdz, ze wokol ramienia jest wolne miejsce")
             if self.sysid_job.running:
+                if "recording" in self.sysid_job.data:
+                    raise RuntimeError("trwa dopasowanie poprzedniego nagrania - poczekaj na wynik")
                 raise RuntimeError("identyfikacja juz trwa")
             # Ramie dla identyfikacji albo odmowa z powodem - fala czy polityka w toku mieszaly
             # swoje cele z pobudzeniem, a nagranie z obu szlo do dopasowania dynamiki.
@@ -1375,9 +1514,14 @@ class TwinApp:
     def _show_dynamics(self) -> None:
         from ..rl.randomize import Dynamics
         d = Dynamics.from_dict(self.ws.dynamics)
-        self.dyn_md.content = (f"Srodek randomizacji: **{d.source}** - kp x{d.kp:.2f}, tlumienie x{d.damping:.2f}, "
-                               f"armatura x{d.armature:.2f}, tarcie x{d.frictionloss:.2f}, opoznienie "
-                               f"{d.delay:.2f} taktu" + (f", blad dopasowania {d.fit_deg:.2f} st." if d.fit_deg else ""))
+        names = fitted_names(d)
+        if names:
+            fitted, fixed = dynamics_parts(d, names)
+            vals = f"dopasowane: {', '.join(fitted)}" + (f"; z modelu: {', '.join(fixed)}" if fixed else "")
+        else:                                           # model albo zapis bez listy dopasowanych
+            vals = ", ".join(sum(dynamics_parts(d, ()), []))
+        self.dyn_md.content = (f"Srodek randomizacji: **{d.source}** - {vals}"
+                               + (f", blad dopasowania {d.fit_deg:.2f} st." if d.fit_deg else ""))
 
     def _tick_training(self) -> None:
         p = self.train.progress()
@@ -1407,15 +1551,23 @@ class TwinApp:
             self.dyn_res.content = j.message
         elif j.state == jobs.DONE and j.result is not None and j.data.get("shown") is not j.result:
             d = j.result
-            self.dyn_res.content = (f"Dopasowano: kp x{d.kp:.2f}, tlumienie x{d.damping:.2f}, armatura "
-                                    f"x{d.armature:.2f}, tarcie x{d.frictionloss:.2f}, opoznienie {d.delay / 20 * 1000:.0f} ms. "
-                                    f"Blad symulacji wzgledem nagrania: **{j.data.get('base', float('nan')):.2f} st. -> "
-                                    f"{d.fit_deg:.2f} st.**")
+            fitted, fixed = dynamics_parts(d, fitted_names(d, sysid_default=True))
+            head = (f"Dopasowano: {', '.join(fitted)}" if fitted else
+                    "Wynik (nie wiadomo, ktore parametry dopasowano)") + \
+                   (f"; z modelu (nie dopasowane): {', '.join(fixed)}" if fixed else "")
+            self.dyn_res.content = (f"{head}. Blad symulacji wzgledem nagrania: "
+                                    f"**{j.data.get('base', float('nan')):.2f} st. -> {d.fit_deg:.2f} st.**")
             self.dyn_keep.visible = True
             j.data["shown"] = d
         elif j.state == jobs.FAILED and j.data.get("shown") != "err":
             self.dyn_res.content = f"**Blad**: {j.error}"
+            self.dyn_keep.visible = False               # "Zapisz" zapisywalby wynik, ktorego nie ma
             j.data["shown"] = "err"
+        elif j.state == jobs.CANCELLED and j.data.get("shown") != "cancel":
+            # Wczesniej przerwane zadanie znikalo bez slowa - pasek gasl, a wyniku nie bylo.
+            self.dyn_res.content = f"**Przerwane**: {j.message or 'identyfikacja przerwana'}"
+            self.dyn_keep.visible = False
+            j.data["shown"] = "cancel"
 
     # =============================================================== polityki
     def _build_policies(self) -> None:
@@ -1593,7 +1745,21 @@ class TwinApp:
             det = None
         if det is not None:
             self._cube_used_t = det.t
-        return self.cube_tracker.update(det, kin.tcp(joints), q[5], cmd, kin.lo[5], now)
+        return self.cube_tracker.update(det, kin.tcp(joints), q[5], cmd, self._grip_closed_q(), now)
+
+    def _grip_closed_q(self) -> float:
+        """Kat szczeki [rad] pustego, zamknietego chwytaka (chwytak 0) - `grip_closed` trackera.
+
+        Ten sam, co w polityce (`Limits.lo` jej biegacza), a nie dolny kraniec MJCF:
+        po przeliczeniu chwytaka przez tiki serwa zamknieta szczeka stoi na -5,4 st.,
+        a MJCF ma -10 st. - warunek "szczeka stoi szerzej niz zamknieta" byl wtedy
+        zawsze prawdziwy i pusta dlon mogla wyjsc na "w dloni".
+        """
+        runner = self.runner
+        if runner is not None and getattr(runner, "limits", None) is not None:
+            return float(runner.limits.lo[5])
+        kin = self._kin_vision
+        return float(kin.to_q({kin.spec.gripper: 0.0})[kin.spec.joints.index(kin.spec.gripper)])
 
     def _start_policy(self, event) -> None:
         from ..rl.policy import Policy
@@ -1769,6 +1935,9 @@ class TwinApp:
             # a nie ostatni kadr POPRZEDNIEJ kamery pod nazwa nowej.
             img = frames.get(rec.name)
             self._img(self.cam_preview, "podglad", thumb(img, 480) if img is not None else no_frame_image())
+        else:
+            # Usunieta ostatnia kamera: podglad zostawal z jej ostatnim kadrem, jakby wciaz byla.
+            self._img(self.cam_preview, "podglad", no_frame_image("brak kamer"))
         with self.scene_lock:
             for name, img in frames.items():
                 h = self.frustums.get(name)
@@ -1877,15 +2046,27 @@ class TwinApp:
             self.close()
 
     def close(self) -> None:
+        """Najpierw ramie (polityka, zadania, rozlaczenie), dopiero potem trening i serwer.
+
+        Wczesniej `train.shutdown` (do 8 s na zapis polityki + 5 s na zabicie) szlo
+        PRZED rozlaczeniem ramienia, a drugie Ctrl+C w tym czasie pomijalo
+        `twin.close()` - proces konczyl sie bez czystego rozlaczenia serw.
+        """
         self._stop.set()
-        if self.runner is not None:
-            self.runner.stop("zamkniecie panelu")
-        for job in (self.calib_job, self.sysid_job, self.intr_job, self.eval_job):
-            job.stop()
-        # Trening w osobnym procesie bez konsoli - bez tego zostawal po zamknieciu panelu.
-        self._guard("trening", self.train.shutdown)
-        self.twin.close()
-        self.server.stop()
+        try:
+            if self.runner is not None:
+                self.runner.stop("zamkniecie panelu")
+            for job in (self.calib_job, self.sysid_job, self.intr_job, self.eval_job):
+                job.stop()
+        finally:
+            try:
+                self.twin.close()
+            finally:
+                try:
+                    # Trening w osobnym procesie bez konsoli - bez tego zostawal po zamknieciu panelu.
+                    self._guard("trening", self.train.shutdown)
+                finally:
+                    self.server.stop()
 
 
 def main(argv: list[str] | None = None) -> int:

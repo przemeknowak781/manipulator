@@ -39,6 +39,9 @@ class Job:
         self.cancel = threading.Event()
         self.data: dict[str, Any] = {}
         self._thread: threading.Thread | None = None
+        #: `protect` - reszta zadania nie rusza ramienia, `stop` jej juz nie przerywa.
+        self._protected = False
+        self._cancel_lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -48,6 +51,7 @@ class Job:
         if self.running:
             raise RuntimeError(f"{self.name} juz trwa")
         self.cancel.clear()
+        self._protected = False
         self.state, self.progress, self.message, self.result, self.error = RUNNING, 0.0, "start", None, ""
         self.data = {}
 
@@ -63,7 +67,24 @@ class Job:
         self._thread.start()
 
     def stop(self) -> None:
-        self.cancel.set()
+        with self._cancel_lock:
+            if not self._protected:
+                self.cancel.set()
+
+    def protect(self) -> bool:
+        """Od teraz `stop` nie przerywa zadania; False = `stop` przyszedl wczesniej (przerwij sam).
+
+        Dla czesci zadania, ktora nie potrzebuje ramienia: STOP, "Polacz" i "Rozlacz"
+        koncza wszystko, co rusza ramieniem, i przerywaly tez minutowe dopasowanie
+        dynamiki po nagraniu - wynik ginal bez slowa, a 20 s ruchu prawdziwego
+        ramienia szlo do powtorki. Sprawdzenie i ustawienie pod jedna blokada ze
+        `stop`: stop tuz przed koncem nagrania albo przerywa, albo nie - nigdy w polowie.
+        """
+        with self._cancel_lock:
+            if self.cancel.is_set():
+                return False
+            self._protected = True
+            return True
 
     def wait(self, timeout: float) -> bool:
         """Czeka na koniec watku zadania. True = skonczone (albo nigdy nie ruszylo)."""
@@ -306,7 +327,12 @@ def run_intrinsics(job: Job, hub, camera: str, board, size: tuple[int, int], per
 
 def run_sysid(job: Job, twin) -> Any:
     """Identyfikacja dynamiki. Ramie wziete przez panel dla `SYSID_OWNER` wraca po nagraniu
-    (dopasowanie trwa minuty, ramienia nie potrzebuje), takze gdy nagranie padlo."""
+    (dopasowanie trwa minuty, ramienia nie potrzebuje), takze gdy nagranie padlo.
+
+    Po nagraniu zadanie jest chronione (`Job.protect`): STOP, "Polacz" i "Rozlacz"
+    przerywaja tylko nagranie - gotowe nagranie dopasowuje sie do konca i wynik
+    trafia do panelu. Przerwane przed koncem nagrania - wynik None ("przerwane").
+    """
     from ..rl.sysid import excitation, fit, record
 
     job.message = "ruch pobudzajacy (ramie sie rusza)"
@@ -318,8 +344,11 @@ def run_sysid(job: Job, twin) -> Any:
         if twin.owner == SYSID_OWNER:
             twin.set_engaged(False)
             twin.release(SYSID_OWNER)
+    if not job.protect():
+        job.message = "przerwane w trakcie nagrania - nagranie odrzucone"
+        return None
     job.data["recording"] = rec
-    job.message = "dopasowanie symulacji do nagrania"
+    job.message = "dopasowanie symulacji do nagrania (ramie juz wolne)"
 
     def prog(n, c):
         job.progress = min(0.99, 0.4 + 0.6 * n / 700)

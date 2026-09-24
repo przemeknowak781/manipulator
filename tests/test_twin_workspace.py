@@ -92,6 +92,46 @@ def test_real_camera_pose_is_not_trusted_without_a_trusted_charuco_K():
     assert ws.camera("sym").trusted                                 # symulowana zna swoje K
 
 
+def test_pose_from_a_K_that_changed_before_save_is_not_trusted():
+    """Fala z nominalnym K, potem krok 1 zapisal zaufane K z ChArUco, potem "Zapisz".
+
+    Werdykt oceniamy dla K, z ktorym LICZONO poze - wczesniej obecne, zaufane K
+    robilo zaufana poze policzona z nominalnego (fx 502 zamiast 552).
+    """
+    ws = Workspace()
+    ws.add_camera(CameraRecord("usb1", "0"))
+    rec = ws.camera("usb1")
+    used = rec.intrinsics()                                        # K z chwili startu fali: nominalne
+    rec.K = (nominal_K(640, 480) * np.diag([1.1, 1.1, 1.0])).tolist()
+    rec.dist = [-0.2, 0.05, 0.0, 0.0, 0.0]
+    rec.intrinsics_from = "szachownica"
+    rec.intrinsics_info = {"rms_px": 0.3, "trusted": True, "reason": ""}
+    ws.apply_fit(trusted_fit("usb1"), tag_size=0.05, intrinsics={"usb1": used})
+    assert rec.calibrated and not rec.trusted
+    assert "zmienione od fali" in rec.calibration["reason"]
+    assert "zmienione od fali" in rec.fit_problem(used) and rec.fit_problem(rec.intrinsics()) == ""
+    # Kamera, dla ktorej fala nie podala K - niezaufana, a nie oceniana obecnym K.
+    ws.add_camera(charuco_camera("bez_K"))
+    ws.apply_fit(trusted_fit("bez_K"), intrinsics={"usb1": used})
+    assert not ws.camera("bez_K").trusted
+
+
+def test_trusted_pose_is_revoked_when_the_camera_K_changes_later():
+    ws = Workspace()
+    ws.add_camera(charuco_camera())
+    cam = ws.camera("front")
+    ws.apply_fit(trusted_fit(), intrinsics={"front": cam.intrinsics()})
+    assert cam.trusted
+    # Po zapisie i odczycie (JSON) to wciaz to samo K - zaufanie zostaje.
+    back = Workspace(cameras=[CameraRecord(**json.loads(json.dumps(ws.to_dict()))["cameras"][0])])
+    assert back.camera("front").trusted
+    cam.K[0][0] *= 1.05                                             # K zmienione obok panelu
+    assert not cam.trusted
+    # Poza bez zapisanego K (sprzed zapisu K przy pozie) - werdykt, jak byl zapisany.
+    old = CameraRecord("stara", "sim", T_cam2base=np.eye(4).tolist(), calibration={"trusted": True})
+    assert old.trusted
+
+
 def test_scene_takes_only_enabled_placed_cameras():
     ws = Workspace()
     ws.add_camera(calibrated_camera("front"))
