@@ -71,6 +71,25 @@ class RobotBackend(ABC):
         """
         return {}
 
+    def gripper_ticks(self) -> tuple[float, float, float] | None:
+        """(zamkniety, otwarty, zero) chwytaka w surowych tikach serwa - to, na co TEN backend
+        naprawde przelicza skale aplikacji: 0 = zamkniety, 100 = otwarty, zero = zero stawu.
+
+        Blizniak liczy kat szczeki z tikow konfiguracji `feetech`. Backend, ktory
+        mapuje 0..100 inaczej (LeRobot - po swoim zakresie z kalibracji), dawal
+        polityce i sledzeniu kostki inny kat szczeki niz prawdziwy, a nikt tego
+        nie widzial. None = backend nie ma tikow (symulator) albo ich nie zna.
+        """
+        return None
+
+    def calibration_warnings(self) -> list[str]:
+        """Niefatalne zastrzezenia do kalibracji ramienia (zdania dla panelu). Nigdy nie rzuca.
+
+        Np. `lerobot` liczy stopnie od srodka zakresu z kalibracji, a blizniak od
+        tiku `center_ticks` - ramie jedzie, ale katy sa przesuniete wzgledem modelu.
+        """
+        return []
+
     def step(self, dt: float) -> None:  # noqa: B027 - domyslnie nic nie robi
         """Krok symulacji. Prawdziwy robot ignoruje (rzeczywistosc liczy sie sama)."""
 

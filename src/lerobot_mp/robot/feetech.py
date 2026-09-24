@@ -90,6 +90,19 @@ def checksum(payload: bytes) -> int:
     return (~sum(payload)) & 0xFF
 
 
+def describe_servo_error(name: str, dev_id: int, bits: int) -> str:
+    """Bity bledu serwa jako zdanie dla operatora: "staw (serwo N): przeciazenie, ...".
+
+    Wspolne dla obu backendow (bajt bledu odpowiedzi tu, rejestr Status w `lerobot`
+    - te same bity), zeby panel i nadzor dostawaly to samo zdanie niezaleznie od backendu.
+    """
+    what = [text for bit, text in SERVO_ERROR_BITS if bits & bit]
+    known = sum(bit for bit, _ in SERVO_ERROR_BITS)
+    if bits & ~known:
+        what.append(f"nieznany blad 0x{bits & ~known:02X}")
+    return f"{name} (serwo {dev_id}): {', '.join(what)}"
+
+
 class FeetechBus:
     """Warstwa protokolu na porcie szeregowym. Oddzielona, zeby dala sie testowac."""
 
@@ -516,13 +529,8 @@ class FeetechArm(RobotBackend):
             out: list[str] = []
             for name, dev_id in self.ids.items():
                 bits = self.bus.errors.get(dev_id, 0)
-                if not bits:
-                    continue
-                what = [text for bit, text in SERVO_ERROR_BITS if bits & bit]
-                known = sum(bit for bit, _ in SERVO_ERROR_BITS)
-                if bits & ~known:
-                    what.append(f"nieznany blad 0x{bits & ~known:02X}")
-                out.append(f"{name} (serwo {dev_id}): {', '.join(what)}")
+                if bits:
+                    out.append(describe_servo_error(name, dev_id, bits))
             if self._connected and self._failed_cycles >= LINK_LOSS_CYCLES:
                 ms = (time.monotonic() - self._last_full_read) * 1000.0
                 which = "" if len(self._stale) == len(self.ids) else f" ({', '.join(self._stale)})"
@@ -531,6 +539,11 @@ class FeetechArm(RobotBackend):
         except Exception as exc:  # pragma: no cover - wolane co cykl petli, nie moze jej wysypac
             logger.exception("Nie udalo sie sprawdzic stanu serw")
             return [f"nie udalo sie sprawdzic stanu serw: {exc}"]
+
+    def gripper_ticks(self) -> tuple[float, float, float]:
+        """(zamkniety, otwarty, zero) chwytaka w tikach - dokladnie te, ktorymi licza `_to_ticks`/`_to_units`."""
+        rc = self.cfg.robot
+        return float(rc.gripper_closed_ticks), float(rc.gripper_open_ticks), float(rc.center_ticks)
 
     def joint_limits(self) -> dict[str, tuple[float, float]]:
         """Limity kata z EEPROM serw w jednostkach aplikacji (tylko stawy, ktore je maja)."""

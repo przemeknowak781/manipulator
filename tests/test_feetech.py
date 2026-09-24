@@ -234,6 +234,16 @@ def test_gripper_spans_the_configured_tick_range(arm_cfg):
     assert arm._to_ticks("gripper", 100.0) == arm_cfg.robot.gripper_open_ticks
 
 
+def test_gripper_ticks_are_the_ones_the_backend_converts_with(arm_cfg):
+    """Blizniak porownuje je z tikami swojej kinematyki - musza byc tymi, ktorymi liczy backend."""
+    arm, _ = connected(arm_cfg)
+    closed, opened, zero = arm.gripper_ticks()
+    assert (closed, opened, zero) == (1986.0, 2670.0, 2048.0)
+    assert arm._to_ticks("gripper", 0.0) == closed
+    assert arm._to_ticks("gripper", 100.0) == opened
+    assert arm._to_units("shoulder_pan", int(zero)) == 0.0
+
+
 def test_send_joints_clamps_to_the_configured_limits(arm_cfg):
     arm, link = connected(arm_cfg)
     limit = arm_cfg.joint("shoulder_pan").max
