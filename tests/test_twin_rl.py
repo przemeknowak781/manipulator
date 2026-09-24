@@ -336,6 +336,31 @@ def test_gpu_batch_env_matches_the_cpu_env():
 
 
 @cuda
+def test_fine_tuning_waits_for_the_critic_before_moving_the_actor(tmp_path):
+    """Douczanie z krytykiem od zera psulo reach-v1 (98% -> 9%): aktor ma stac, dopoki
+    krytyk sie nie rozgrzeje, a polityka zapisana z krytykiem rozgrzewki nie potrzebuje."""
+    from dataclasses import replace
+
+    from lerobot_mp.twin.rl.ppo import PPOConfig, train
+
+    cfg = PPOConfig(num_envs=64, horizon=8, iterations=2, hidden=(32, 32))
+    train("reach", cfg, randomization=Randomization.none(), out_dir=tmp_path / "a")
+    base = Policy.load(tmp_path / "a" / "policy.pt")
+    assert base.critic_state is not None                  # krytyk jedzie w pliku do douczania
+
+    obs = np.random.default_rng(0).normal(size=(16, base.meta.obs_dim)).astype(np.float32)
+
+    def actor_moved(init):
+        before = init.act(obs)
+        tuned = train("reach", replace(cfg, critic_warmup=2), randomization=Randomization.none(), init=init)
+        return not np.array_equal(before, tuned.to("cpu").act(obs))
+
+    assert actor_moved(base)                              # krytyk z pliku - aktor uczy sie od razu
+    base.critic_state = None                              # jak polityka sprzed zapisu krytyka
+    assert not actor_moved(base)
+
+
+@cuda
 def test_gpu_applies_the_same_multi_tick_action_delay_as_the_cpu():
     """Opoznienie z identyfikacji (np. 2 takty) - GPU scinalo je do 1 taktu."""
     from dataclasses import replace

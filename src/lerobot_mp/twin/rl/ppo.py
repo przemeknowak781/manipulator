@@ -52,6 +52,8 @@ class PPOConfig:
     value_coef: float = 1.0
     max_grad_norm: float = 1.0
     init_std: float = 0.6
+    #: Pierwsze iteracje douczania ucza tylko krytyka (aktor stoi) - patrz `train`.
+    critic_warmup: int = 0
     hidden: tuple[int, ...] = (256, 256, 128)
     seed: int = 0
     #: Co ile iteracji zapisywac punkt kontrolny (0 = tylko na koncu).
@@ -92,7 +94,7 @@ def train(task: str | tk.TaskConfig, cfg: PPOConfig | None = None, *, workspace:
           randomization: Randomization | None = None, out_dir: str | Path | None = None,
           on_progress: Callable[[Progress], None] | None = None,
           stop: threading.Event | None = None, device: str = "cuda:0", init: Policy | None = None) -> Policy:
-    """`init` - start z istniejacej polityki (aktor i normalizacja; krytyk od nowa).
+    """`init` - start z istniejacej polityki (aktor, normalizacja i krytyk, jesli zapisany).
 
     Do douczania: po identyfikacji dynamiki na ramieniu, po zmianie randomizacji
     albo percepcji - zamiast odkrywac chwyt od zera.
@@ -110,8 +112,13 @@ def train(task: str | tk.TaskConfig, cfg: PPOConfig | None = None, *, workspace:
         meta.hidden = list(init.meta.hidden)
         meta.notes = f"douczana z polityki z {init.meta.created} ({init.meta.steps / 1e6:.0f} mln krokow)"
     ac = ActorCritic(meta, cfg.init_std).to(device)
+    warmup = 0
     if init is not None:
         ac.policy.load_state_dict(init.state_dict())
+        if init.critic_state is not None:
+            ac.critic.load_state_dict(init.critic_state)
+        else:
+            warmup = cfg.critic_warmup
     opt = torch.optim.Adam(ac.parameters(), lr=cfg.lr)
     lr = cfg.lr
     out = Path(out_dir) if out_dir else None
@@ -139,10 +146,18 @@ def train(task: str | tk.TaskConfig, cfg: PPOConfig | None = None, *, workspace:
 
     for it in range(1, cfg.iterations + 1):
         t0 = time.perf_counter()
+        # Douczanie startuje z krytykiem od zera: jego przewagi sa wtedy szumem, a przy
+        # malej eksploracji (init_std 0,25) krytyk dlugo nie odroznia "przy celu" od
+        # "kilka mm obok". Zmierzone na reach-v1: 98% sukcesu do 60. iteracji, potem
+        # spadek do 9%, a polityka deterministyczna odplywala od celu (3 -> 29 mm pod
+        # koniec epizodu). Aktor - razem z normalizacja wejscia - stoi, dopoki krytyk
+        # sie nie nauczy. Polityka z zapisanym krytykiem rozgrzewki nie potrzebuje.
+        warming = it <= warmup
         # ---------------------------------------------------------- zbieranie
         with torch.no_grad():
             for t in range(T):
-                ac.policy.norm.update(obs)
+                if not warming:
+                    ac.policy.norm.update(obs)
                 obs_n = ac.policy.norm(obs)
                 dist = ac.dist(obs_n)
                 act = dist.sample()
@@ -190,6 +205,13 @@ def train(task: str | tk.TaskConfig, cfg: PPOConfig | None = None, *, workspace:
                 v_clip = b_val[idx] + torch.clamp(v - b_val[idx], -cfg.clip, cfg.clip)
                 vl = torch.max((v - b_ret[idx]) ** 2, (v_clip - b_ret[idx]) ** 2).mean()
                 ent = dist.entropy().sum(-1).mean()
+                if warming:
+                    loss = cfg.value_coef * vl
+                    opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(ac.parameters(), cfg.max_grad_norm)
+                    opt.step()
+                    continue
                 loss = pg + cfg.value_coef * vl - cfg.entropy * ent
                 with torch.no_grad():
                     # KL miedzy starym a nowym rozkladem (przyblizenie Schulmana).
@@ -228,21 +250,23 @@ def train(task: str | tk.TaskConfig, cfg: PPOConfig | None = None, *, workspace:
         if out:
             (out / "progress.json").write_text(json.dumps(asdict(prog)), encoding="utf-8")
             if cfg.save_every and it % cfg.save_every == 0:
-                _finish(ac.policy, prog, out / "policy.pt")
+                _finish(ac, prog, out / "policy.pt")
         if stopping:
             break
 
-    pol = ac.policy
-    _finish(pol, prog, out / "policy.pt" if out else None)
+    pol = _finish(ac, prog, out / "policy.pt" if out else None)
     return pol.eval()
 
 
-def _finish(pol: Policy, prog: Progress, path: Path | None) -> None:
+def _finish(ac: ActorCritic, prog: Progress, path: Path | None) -> Policy:
+    pol = ac.policy
+    pol.critic_state = {k: v.detach().cpu().clone() for k, v in ac.critic.state_dict().items()}
     pol.meta.steps, pol.meta.iterations = prog.steps, prog.iteration
     pol.meta.success = prog.success
     pol.meta.evals["gpu"] = {"success": prog.success, "reward": prog.reward, "steps": prog.steps}
     if path is not None:
         pol.save(path)
+    return pol
 
 
 def _rand_dict(r: Randomization) -> dict[str, Any]:

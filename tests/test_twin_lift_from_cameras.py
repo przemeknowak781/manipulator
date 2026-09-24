@@ -4,7 +4,8 @@ Kadry symulowanych kamer -> dopasowanie sylwetki (z maska ramienia) -> sledzenie
 kostki w dloni -> runner -> nadzor bezpieczenstwa -> fizyka. Sprawdzamy na
 prawdzie z fizyki, czy kostka zostala podniesiona. Na tym tescie `lift-v1`
 (uczona na prawdziwej pozycji kostki) podnosila 1 z 8, `lift-v2` (douczona
-z modelem percepcji) - 8 z 8.
+z modelem percepcji) - 8 z 8; test jedzie na bazowej `lift-v3` (douczona po
+przegladzie: nowy chwytak, obserwacja po fizyce, koniec po sukcesie).
 
 Caly lancuch idzie w czasie SYMULOWANYM, bez watkow: petla blizniaka 50 Hz
 (`Twin.step`), wizja co 0,1 s, polityka 20 Hz (`PolicyRunner.step_once`) na
@@ -30,7 +31,7 @@ from lerobot_mp.twin.runtime import Twin  # noqa: E402
 from lerobot_mp.twin.ui.watch import arm_mask  # noqa: E402
 from lerobot_mp.twin.workspace import CameraRecord, Workspace  # noqa: E402
 
-POLICY = bundled_dir() / "lift-v2" / "policy.pt"
+POLICY = bundled_dir() / "lift-v3" / "policy.pt"
 
 
 def look(eye, target):
@@ -42,7 +43,7 @@ def look(eye, target):
     return pose(np.column_stack([x, np.cross(z, x), z]), eye)
 
 
-@pytest.mark.skipif(not POLICY.is_file(), reason="brak bazowej polityki lift-v2 w assets/policies")
+@pytest.mark.skipif(not POLICY.is_file(), reason="brak bazowej polityki lift-v3 w assets/policies")
 def test_lift_policy_lifts_a_cube_seen_only_by_cameras():
     ws = Workspace()
     K = [[560.0, 0, 322.0], [0, 560.0, 236.0], [0, 0, 1]]

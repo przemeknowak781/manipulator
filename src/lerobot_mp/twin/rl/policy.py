@@ -89,6 +89,9 @@ class Policy(nn.Module):
         self.meta = meta
         self.norm = Normalizer(meta.obs_dim)
         self.actor = mlp([meta.obs_dim, *meta.hidden], meta.act_dim)
+        #: Wagi krytyka z treningu (tylko do douczania; do jazdy niepotrzebne). Polityki
+        #: zapisane przed jego dodaniem go nie maja - douczanie grzeje wtedy krytyka od zera.
+        self.critic_state: dict | None = None
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.actor(self.norm(obs))
@@ -109,7 +112,10 @@ class Policy(nn.Module):
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"meta": asdict(self.meta), "state": self.state_dict()}, path)
+        blob = {"meta": asdict(self.meta), "state": self.state_dict()}
+        if self.critic_state is not None:
+            blob["critic"] = self.critic_state
+        torch.save(blob, path)
         path.with_name("meta.json").write_text(json.dumps(asdict(self.meta), indent=2, ensure_ascii=False,
                                                           default=float), encoding="utf-8")
         return path
@@ -119,11 +125,12 @@ class Policy(nn.Module):
         blob = torch.load(Path(path), map_location=device, weights_only=False)
         pol = Policy(PolicyMeta(**blob["meta"]))
         pol.load_state_dict(blob["state"])
+        pol.critic_state = blob.get("critic")
         return pol.to(device).eval()
 
 
 def bundled_dir() -> Path:
-    """Polityki bazowe z repozytorium (`reach-v1`, `lift-v2`) - start do douczania na swoim ramieniu."""
+    """Polityki bazowe z repozytorium (`reach-v2`, `lift-v3`) - start do douczania na swoim ramieniu."""
     from ..robots import REPO_ROOT
 
     return REPO_ROOT / "assets" / "policies"

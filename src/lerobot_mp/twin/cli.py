@@ -188,6 +188,7 @@ def _train(a: argparse.Namespace) -> int:
         init = Policy.load(a.init)
         a.task = init.task.name
         cfg.init_std = 0.25                            # douczanie: mniejsza eksploracja na starcie
+        cfg.critic_warmup = 30                         # dla polityk bez zapisanego krytyka (patrz ppo)
         print(f"Start z polityki {a.init} ({init.task.name})")
     print(f"Trening {a.task}: {a.envs} swiatow x {a.iters} iteracji -> {out}")
     print(f"  {_describe(rand)}{'' if a.no_rand else f', rozrzut x{a.spread}'}")

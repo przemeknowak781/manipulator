@@ -27,7 +27,11 @@
     ],
     "lift_height": 0.06,
     "start_noise_deg": 8.0,
-    "action_rate": 0.02
+    "action_rate": 0.02,
+    "end_on_success": 0,
+    "limit_penalty": 0.0,
+    "limit_margin": 0.15,
+    "hold_still": 0.0
   },
   "hidden": [
     256,
@@ -36,10 +40,10 @@
   ],
   "obs_dim": 27,
   "act_dim": 6,
-  "created": "2026-09-24T00:46:45",
-  "steps": 15728640,
-  "iterations": 160,
-  "success": 0.968994140625,
+  "created": "2026-09-24T10:52:32",
+  "steps": 12779520,
+  "iterations": 130,
+  "success": 0.988037109375,
   "randomization": {
     "kp": [
       0.85,
@@ -67,6 +71,10 @@
     ],
     "obs_noise_deg": 0.3,
     "max_delay": 1,
+    "cube_delay": 3,
+    "cube_period": 3,
+    "cube_noise": 0.002,
+    "fold_yaw": true,
     "centre": {
       "kp": 1.0,
       "damping": 1.0,
@@ -75,28 +83,31 @@
       "delay": 0.0,
       "source": "menagerie",
       "fit_deg": null
-    }
+    },
+    "min_delay": 0
   },
   "evals": {
     "gpu": {
-      "success": 0.968994140625,
-      "reward": 108.28929254505783,
-      "steps": 15728640
+      "success": 0.988037109375,
+      "reward": 115.92390924785286,
+      "steps": 12779520
     },
     "cpu_nominal": {
       "episodes": 50,
       "success": 1.0,
       "ever_success": 1.0,
       "randomized": false,
-      "final_distance_mm": 2.787884556875028
+      "centre": "menagerie",
+      "final_distance_mm": 1.514267823197511
     },
     "cpu_rand": {
       "episodes": 50,
-      "success": 1.0,
+      "success": 0.98,
       "ever_success": 1.0,
       "randomized": true,
-      "final_distance_mm": 2.663189931840604
+      "centre": "menagerie",
+      "final_distance_mm": 1.4770717325848821
     }
   },
-  "notes": ""
+  "notes": "douczana z polityki z 2026-09-24T00:46:45 (16 mln krokow)"
 }
