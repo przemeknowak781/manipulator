@@ -27,11 +27,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 
 import mujoco
 import numpy as np
 
 from .robots import RobotSpec
+
+#: Tiki serwa STS3215 na obrot - te same, co w backendzie `feetech`.
+TICKS_PER_REV = 4096
+
+
+@lru_cache(maxsize=1)
+def backend_gripper_ticks() -> tuple[float, float, float]:
+    """(zamkniety, otwarty, zero) chwytaka w tikach serwa - z tej samej konfiguracji, co backend."""
+    from ..config import load_config
+
+    rc = load_config().robot
+    return float(rc.gripper_closed_ticks), float(rc.gripper_open_ticks), float(rc.center_ticks)
 
 
 def pose(R: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -71,8 +84,11 @@ class RobotKinematics:
     `MjData`, wiec nie ruszaja stanu symulacji.
     """
 
-    def __init__(self, spec: RobotSpec, model: mujoco.MjModel | None = None, prefix: str = ""):
+    def __init__(self, spec: RobotSpec, model: mujoco.MjModel | None = None, prefix: str = "",
+                 gripper_ticks: tuple[float, float, float] | None = None):
         self.spec = spec
+        #: (zamkniety, otwarty, zero) chwytaka w tikach serwa - patrz `to_q`.
+        self.gripper_ticks = gripper_ticks if gripper_ticks is not None else backend_gripper_ticks()
         self.prefix = prefix
         self.model = model if model is not None else mujoco.MjModel.from_xml_path(str(spec.mjcf_path))
         self.data = mujoco.MjData(self.model)
@@ -95,27 +111,46 @@ class RobotKinematics:
         """Jednostki aplikacji -> wektor kata stawow MJCF [rad], w kolejnosci opisu.
 
         Stawy ramienia to stopnie tej samej kalibracji, wiec tylko zmiana jednostki.
-        Chwytak LeRobot normalizuje do 0..100, a MJCF ma kat szczeki: przeliczamy
-        liniowo na zakres stawu, tak samo jak podglad 3D (`ArmModel.from_lerobot`).
-        Brakujace stawy biora wartosc z pozy spoczynkowej.
+        Chwytak ma 0..100, a MJCF kat szczeki. Przeliczenie idzie przez TE SAME
+        tiki, co w backendzie `feetech` (`gripper_closed_ticks..gripper_open_ticks`,
+        zero w `center_ticks`), przyciete do zakresu stawu z MJCF. Wczesniej 0..100
+        szlo liniowo na caly zakres MJCF (-10..100 st.), a serwo przejezdza na
+        0..100 tylko 60 st. (-5..55): ta sama szczeka byla w blizniaku 1,8 raza
+        szerzej otwarta niz na ramieniu, polityka i sledzenie kostki widzialy
+        inna liczbe niz w treningu. Brakujace stawy biora wartosc z pozy spoczynkowej.
         """
         q = np.empty(len(self.spec.joints))
         for k, name in enumerate(self.spec.joints):
             value = float(joints.get(name, self.spec.home.get(name, 0.0)))
             if name == self.spec.gripper:
-                fraction = min(max(value / 100.0, 0.0), 1.0)
-                q[k] = self.lo[k] + fraction * (self.hi[k] - self.lo[k])
+                q[k] = self._grip_to_q(k, value)
             else:
                 q[k] = np.radians(value)
         return q
+
+    def _grip_to_q(self, k: int, value: float) -> float:
+        closed, opened, center = self.gripper_ticks
+        if abs(opened - closed) < 1e-9:                    # konfiguracja bez zakresu - liniowo na MJCF
+            fraction = min(max(value / 100.0, 0.0), 1.0)
+            return float(self.lo[k] + fraction * (self.hi[k] - self.lo[k]))
+        ticks = closed + value / 100.0 * (opened - closed)
+        q = np.radians((ticks - center) * 360.0 / TICKS_PER_REV)
+        return float(min(max(q, self.lo[k]), self.hi[k]))
+
+    def _grip_from_q(self, k: int, q: float) -> float:
+        closed, opened, center = self.gripper_ticks
+        if abs(opened - closed) < 1e-9:
+            span = self.hi[k] - self.lo[k]
+            return float((q - self.lo[k]) / span * 100.0) if span > 0 else 0.0
+        ticks = center + np.degrees(q) * TICKS_PER_REV / 360.0
+        return float((ticks - closed) * 100.0 / (opened - closed))
 
     def from_q(self, q: np.ndarray) -> dict[str, float]:
         """Wektor MJCF [rad] -> jednostki aplikacji."""
         out: dict[str, float] = {}
         for k, name in enumerate(self.spec.joints):
             if name == self.spec.gripper:
-                span = self.hi[k] - self.lo[k]
-                out[name] = float((q[k] - self.lo[k]) / span * 100.0) if span > 0 else 0.0
+                out[name] = self._grip_from_q(k, float(q[k]))
             else:
                 out[name] = float(np.degrees(q[k]))
         return out

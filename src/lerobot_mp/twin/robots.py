@@ -7,7 +7,9 @@ zakresy, masy, siatki - siedzi w MJCF i jest czytana z niego, a nie powielana.
 
 Jednostki aplikacji sa jednostkami LeRobota: stawy w stopniach, chwytak w skali
 0..100. MJCF liczy w radianach, a chwytak to w nim kat szczeki. Przeliczenie
-jest w `kinematics.RobotKinematics` i tylko tam.
+jest w `kinematics.RobotKinematics` i tylko tam - dla chwytaka przez te same tiki
+serwa (`RobotConfig.gripper_closed_ticks..gripper_open_ticks`), co backend
+`feetech`, zeby 0..100 znaczylo ten sam kat szczeki w blizniaku i na ramieniu.
 """
 
 from __future__ import annotations
