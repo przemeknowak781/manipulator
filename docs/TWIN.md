@@ -61,12 +61,28 @@ lerobot-twin check
 ## Panel
 
 ```bash
-lerobot-twin ui          # http://localhost:8080 ; zdalnie: http://<adres>:8080
+lerobot-twin ui                  # http://localhost:8080
+lerobot-twin ui --host 0.0.0.0   # także z sieci — panel nie ma hasła, tylko w zaufanej sieci
 ```
 
 Stały **STOP** i pasek stanu nad zakładkami. Każdy ruch — z suwaków, z uchwytu
 w 3D, z polityki, z fali kalibracyjnej, z identyfikacji — idzie przez
 `runtime.Twin` i jego `SafetySupervisor`.
+
+**Ramię ma zawsze jednego właściciela**: panel (sprzęgło i uchwyt), polityka,
+fala kalibracyjna albo identyfikacja. Drugi nie ruszy, dopóki pierwszy nie
+skończy — panel mówi, kto ma ramię. **STOP**, **Dom**, **Połącz** i **Rozłącz**
+odbierają ramię każdemu, a ramię zostaje w **zmierzonej** pozie: nie dociska
+do przeszkody i nie wraca skokiem do starego celu. Każde uruchomienie na
+prawdziwym ramieniu wymaga świeżego potwierdzenia.
+
+Pętla sama zatrzymuje ramię (STOP awaryjny, powód w pasku stanu), gdy serwo
+zgłosi błąd (przeciążenie, przegrzanie, napięcie, czujnik kąta), gdy serwa nie
+odpowiadają przez 5 odczytów z rzędu (wtedy też nic do nich nie wysyła — po
+powrocie łącza nie ma zaległej serii skoków) i gdy pętla stanie na ponad 0,5 s.
+Ramię stojące po włączeniu poza limitami zostaje, gdzie jest; po włączeniu
+sprzęgła wraca w zakres 15°/s. Limity z konfiguracji są zawężane do limitów
+zapisanych w EEPROM serw.
 
 | zakładka | co robi |
 |---|---|
@@ -105,36 +121,54 @@ zawsze brak przepuszczenia (patrz README).
 **2. Intrynsyki każdej kamery.** *Pobierz arkusz tablicy*, wydrukuj w skali
 100%, **zmierz bok kwadratu linijką**, wpisz. *Zbieraj kadry* i pokazuj tablicę
 w rogach kadru, bliżej i dalej, pochyloną — 12+ kadrów, pokrycie 55%+.
-*Oblicz i zapisz K*. Residuum ≤ 0,6 px.
+*Oblicz i zapisz K*. Residuum ≤ 0,6 px. Tablica trzymana równolegle do
+obiektywu nie wyznacza ogniskowej — sesja bez pochyleń (rozrzut < 35°) albo z
+ogniskową nie do wiary wychodzi jako **niezaufana**, a kamera z takim K nie
+dostanie zaufanej pozy w kroku 3. *Przerwij* niczego nie liczy ani nie zapisuje.
 
 **3. Położenie kamer.** *Pobierz arkusz karty*, wydrukuj, zmierz bok taga,
 zegnij kartę, włóż wolny koniec w szczęki (ok. 70 mm ma wystawać). Zaznacz
 potwierdzenie, *Start fali*. Ramię zbiera ~20 póz; kamera, której fala się nie
-udała, wraca jako niezaufana z powodem. *Zapisz wynik kalibracji*. Wyjmij kartę.
+udała, wraca jako niezaufana z powodem — także kamera bez zaufanego K z kroku 2.
+*Zapisz wynik kalibracji* (zapisuje też użyty bok taga — zmieniony po fali nie
+przejdzie). Wyjmij kartę.
 
 **4. Sprawdzenie Sim-Real.** Zakładka Sim-Real, każda kamera: krawędzie renderu
 mają leżeć na krawędziach ramienia i stołu. Mediana > 3 px = coś jest źle
 (zmierzony tag? stół w bliźniaku nie na wysokości podstawy?).
 
 **5. Dynamika serw.** Zakładka Trening → *Identyfikuj na połączonym ramieniu*
-(~20 s ruchu po 12°) → *Zapisz jako dynamikę stanowiska*. Od teraz trening
-randomizuje wokół zmierzonego ramienia, nie katalogu.
+(~20 s ruchu po 12°; do pozy startowej ramię jedzie 30°/s) → *Zapisz jako
+dynamikę stanowiska*. Od teraz trening randomizuje wokół zmierzonego ramienia,
+nie katalogu. Z tego ruchu wyznaczalne są **tłumienie, armatura i opóźnienie**
+(na syntetycznych danych: ~2% i 0–1,3 ms); wzmocnienia serw i tarcia suchego
+ten ruch nie rozróżnia (kp 0,63 dopasowuje się tak samo dobrze jak 1,0), więc
+zostają z modelu, a randomizacja je pokrywa. Nagranie z martwą pętlą albo
+nieświeżymi odczytami jest odrzucane.
 
 **6. Trening.** Najszybciej: **douczanie** gotowych polityk na zmierzonej
-dynamice — zakładka Trening, *Start z polityki* `reach-v1` / `lift-v2`,
+dynamice — zakładka Trening, *Start z polityki* `reach-v2` / `lift-v3`,
 100–300 iteracji (`lerobot-twin train --init …`). Od zera: `reach` 160
 iteracji (~2,5 min), `lift` 600 (~30 min). Po treningu polityka sama przechodzi
 ewaluację na CPU.
 
 **7. `reach` na ramieniu.** Zakładka Polityki, polityka `reach`, potwierdzenie,
 *Uruchom*. Przeciągaj żółtą kulkę celu w 3D — ramię za nią jedzie. Polityka
-staje sama, gdy ramię nie nadąża za celem o więcej niż 25° (kolizja, blokada).
+staje sama, gdy ramię nie nadąża za celem o więcej niż 25° (kolizja, blokada),
+i zostaje w zmierzonej pozie. Cel spoza obszaru treningu jest rzutowany na jego
+brzeg (kulka wraca na rzut).
 
 **8. `lift` z kamerami.** Kostka 3 cm w kolorze z listy na blacie przed ramieniem,
-zakładka Mapa ma ją pokazywać. Polityka `lift-v2` (albo jej douczona wersja),
+zakładka Mapa ma ją pokazywać. Polityka `lift-v3` (albo jej douczona wersja),
 źródło kostki **kamery**, *Uruchom*. Gdy szczęki zasłonią kostkę, śledzenie
-przejmuje ją „w dłoni”. Nie używaj `lift-v1` z kamerami — uczona na prawdziwej
-pozycji kostki, nie znosi opóźnienia percepcji.
+przejmuje ją „w dłoni”. Polityka kończy sama („zadanie wykonane”), gdy kostka
+jest 6 cm nad blatem przez 10 taktów.
+
+**Chwytak.** 0..100 w panelu to te same tiki serwa co w backendzie `feetech`
+(`gripper_closed_ticks` … `gripper_open_ticks`, zero w `center_ticks`); w
+bliźniaku 0 = −5,4°, 100 = 54,7° kąta szczęki. Sprawdź na ramieniu, że przy 0
+szczęki się stykają — jeśli nie, zero szczęki w MJCF nie leży w `center_ticks`
+i trzeba to poprawić w konfiguracji, zanim zaufa się `lift`.
 
 ---
 
@@ -174,6 +208,7 @@ pytest -q -k "not renders and not full_session"    # maszyna bez GPU
 | trening `reach` (15 mln kroków) | **2 min** → CPU 100%, 1,5 mm od celu | – |
 | trening `lift` (59 mln kroków) | **28 min** → CPU 100% (96% z randomizacją) | – |
 | douczanie `lift` z modelem percepcji (29 mln kroków) | 16 min → CPU 98% z randomizacją, z kamer 8/8 | – |
+| douczanie `reach` / `lift` po przeglądzie (13 / 29 mln kroków) | 1,5 / 16 min → CPU 100% / 100% | – |
 
 MuJoCo Warp zgadza się z MuJoCo na CPU: stawy po 2 s fizyki różnią się o
 0,001°, obserwacje środowisk GPU i CPU po 30 krokach o 6·10⁻⁵.
@@ -211,8 +246,12 @@ względem prawdy. Intrynsyki z symulowanej tablicy: ogniskowe z dokładnością
 Po zapisaniu kalibracji panel zapamiętuje kadr odniesienia każdej kamery
 i co 2 s porównuje z nim bieżący — korelacją fazową, z **ramieniem wyciętym
 maską z bliźniaka** (ruch ramienia daje 0,4 px „przesunięcia”, obrót kamery
-o 1° — 9,8 px). Powyżej 3 px piramida robi się czerwona i panel proponuje
-szybką relokalizację (krótka fala tylko dla tej kamery).
+o 1° — 9,8 px). Oprócz przesunięcia łapie **obrót wokół osi kamery i zmianę
+skali** (dopasowanie ECC, skala z martwą strefą 1,5%); miarą jest największe
+przesunięcie narożnika kadru. Powyżej 3 px piramida robi się czerwona i panel
+proponuje szybką relokalizację (krótka fala tylko dla tej kamery). Klatka
+starsza niż 1 s nie jest kadrem — zamrożony albo martwy strumień panel pokazuje
+jako błąd kamery i otwiera go na nowo.
 
 ---
 
@@ -249,7 +288,11 @@ Kostka (`perception.CubeDetector.detect_frames`):
 3. **ramię to „nie wiem”** — piksele zasłonięte ramieniem (segmentacja z
    bliźniaka, w pozie z serw) nie głosują;
 4. **bramka IoU ≥ 0,75** — model zakłada kostkę leżącą; kostkę w powietrzu da
-   się „wcisnąć” w jakąś pozę na blacie z IoU 0,36–0,64 i błędem do 1 m.
+   się „wcisnąć” w jakąś pozę na blacie z IoU 0,36–0,64 i błędem do 1 m;
+5. **jedna kamera przy dłoni to za mało** — wykrycie potwierdzone przez jedną
+   kamerę (`n_cameras`) blisko chwytaka albo przy kostce w dłoni jest pomijane:
+   jedna kamera potrafi „położyć” na blacie kostkę uniesioną w szczękach.
+   Wykrycie ma czas kadru (`t`); stare i powtórzone nie przedłużają życia kostki.
 
 Na blacie w symulacji: **1–3 mm, ~1°**. `CubeTracker` przejmuje kostkę, gdy
 kamery jej nie widzą: szczęka **zablokowana** (nie dojeżdża do rozkazu i stoi)
@@ -268,10 +311,12 @@ szum 2 mm, obrót złożony do ±45° — a nagroda liczy się z prawdy.
 |---|---|
 | `lift-v1` — uczona na prawdziwej pozycji kostki | 1/8 |
 | `lift-v2` — `lift-v1` douczona z modelem percepcji (300 iteracji, 16 min) | **8/8** |
+| `lift-v3` — `lift-v2` douczona po przeglądzie (300 iteracji); kończy sama, kostka 9,6–11,8 cm | **8/8** |
 
 Od zera z modelem percepcji uczenie szło bardzo wolno (0% po 220 iteracjach) —
 douczanie z polityki, która już umie chwytać, doszło do 98% w 300.
-Pilnuje tego `tests/test_twin_lift_from_cameras.py`.
+Pilnuje tego `tests/test_twin_lift_from_cameras.py` — w czasie symulowanym,
+więc wynik nie zależy od obciążenia maszyny.
 
 ## Polityki bazowe
 
@@ -280,11 +325,21 @@ i w `lerobot-twin policies` obok własnych ze stanowiska:
 
 | | zadanie | CPU bez / z randomizacją |
 |---|---|---|
-| `reach-v1` | dojazd TCP do punktu | 100% / 100%, 2,7 mm od celu |
-| `lift-v2` | chwyt i podniesienie kostki z kamer | 96% / 98% |
+| `reach-v2` | dojazd TCP do punktu | 100% / 98%, 1,5 mm od celu |
+| `lift-v3` | chwyt i podniesienie kostki z kamer | 100% / 100% |
 
 Obie uczone wokół modelu Menagerie — po identyfikacji dynamiki na swoim ramieniu
-douczyć je (`--init`, 100–300 iteracji), zamiast uczyć od zera.
+douczyć je (`--init`, 100–300 iteracji), zamiast uczyć od zera. Pliki niosą też
+wagi **krytyka** z treningu: douczanie z krytykiem od zera psuło politykę
+(`reach-v1`: 98% → 9% sukcesu po 100 iteracjach, dojeżdżała i odpływała od celu,
+bo niedouczony krytyk przy małej eksploracji nie odróżnia „przy celu” od „kilka
+mm obok”). Polityka bez zapisanego krytyka dostaje 30 iteracji rozgrzewki, w
+których uczy się tylko krytyk. „Nagroda” w logu treningu zawiera wartość stanu
+doliczaną na końcu epizodu — rośnie razem z krytykiem, o jakości mówi *sukces*.
+
+`lift-v3` pod limitem stawu bywa tylko tam, gdzie zadanie tego wymaga (kostka
+blisko podstawy — łokieć zgięty do +92°): 10 taktów na 20 epizodów, `lift-v2`
+26 i wymachy po chwycie.
 
 ---
 
@@ -292,10 +347,10 @@ douczyć je (`--init`, 100–300 iteracji), zamiast uczyć od zera.
 
 | | |
 |---|---|
-| zadania | `reach` — TCP do punktu (sukces < 2 cm); `lift` — chwyt i podniesienie kostki 3 cm o 6 cm |
+| zadania | `reach` — TCP do punktu (sukces < 2 cm); `lift` — chwyt i podniesienie kostki 3 cm o 6 cm; epizod `lift` kończy się po 10 taktach sukcesu (liczone jak limit czasu — wartość stanu dalej jest bootstrapowana), kara za jazdę pod limity stawów i za ruch po sukcesie |
 | akcja | 6 liczb w [−1, 1]: przyrost celu stawów ramienia (≤ 0,05 rad na takt, 20 Hz), cel chwytaka bezwzględnie, ograniczony jak w nadzorze |
-| obserwacja | stawy i cele stawów (znormalizowane), TCP, cel albo kostka (położenie, obrót 6D), poprzednia akcja — **jedna definicja** (`rl/task.py`) dla CPU, GPU i ramienia |
-| randomizacja | wzmocnienie, tłumienie, armatura i tarcie serw, masa i tarcie kostki, opóźnienie akcji, szum kątów — wokół `Workspace.dynamics` (identyfikacja); **percepcja kostki** jak z kamer (opóźnienie, odświeżanie, szum, symetria) |
+| obserwacja | stawy i cele stawów (znormalizowane), TCP, cel albo kostka (położenie, obrót 6D), poprzednia akcja — **jedna definicja** (`rl/task.py`) dla CPU, GPU i ramienia; TCP i kostka liczone po krokach fizyki, zgodne z kątami stawów |
+| randomizacja | wzmocnienie, tłumienie, armatura i tarcie serw, masa i tarcie kostki, opóźnienie akcji, szum kątów — wokół `Workspace.dynamics` (identyfikacja); **percepcja kostki** jak z kamer (opóźnienie, odświeżanie, szum, symetria). `--no-rand` = dokładnie zmierzona dynamika i jej opóźnienie, model percepcji zostaje; ewaluacja „CPU bez randomizacji” też idzie na zmierzonym ramieniu, nie na Menagerie |
 | środowiska | `LeRobotMP/TwinReach-v0`, `LeRobotMP/TwinLift-v0` (Gymnasium, CPU); `rl.batch.BatchEnv` (MuJoCo Warp, GPU) |
 
 ---
