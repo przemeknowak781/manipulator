@@ -1,29 +1,94 @@
-# LeRobot 101 × MediaPipe
+# Cyfrowy bliźniak SO-101
 
-Sterowanie ramieniem **SO-101 (LeRobot 101)** ruchem dłoni przed kamerą.
-MediaPipe śledzi 21 punktów dłoni, a aplikacja zamienia je na zadane pozycje
-sześciu stawów — z filtracją, limitami i zatrzymaniem awaryjnym.
+Symulacja MuJoCo, która wie o biurku to samo, co prawdziwe stanowisko: gdzie
+stoi ramię, gdzie stoją kamery, jaką mają optykę i jak naprawdę odpowiadają
+serwa. Polityki uczone w niej na GPU jadą potem na prawdziwym **SO-101**
+tą samą ścieżką kodu — przez nadzór bezpieczeństwa i z tą samą percepcją
+z kamer.
 
-Działa **bez robota**: wbudowany symulator i podgląd 3D pozwalają nauczyć się
-gestów, zanim cokolwiek podłączysz.
+W repozytorium jest też aplikacja do [sterowania ramieniem ruchem dłoni](#sterowanie-dłonią--lerobot-101--mediapipe)
+(MediaPipe), od której projekt się zaczął.
 
 ```
-   dłoń przed kamerą              podgląd na żywo                  ramię
-  ┌────────────────┐        ┌──────────────────────┐        ┌──────────────┐
-  │  21 punktów    │──────► │  HUD: stan, stawy,   │──────► │  SO-101      │
-  │  MediaPipe     │        │  limity, chwytak     │        │  lub symulator│
-  └────────────────┘        │  + model 3D ramienia │        └──────────────┘
-                            └──────────────────────┘
+  prawdziwe stanowisko                        bliźniak (MuJoCo)
+ ┌──────────────────────┐   kalibracja      ┌──────────────────────────┐
+ │ SO-101 (COM/socket)  │ ────────────────► │ ramię z MuJoCo Menagerie │
+ │ kamery USB dookoła   │  karta w dłoni,   │ kamery w tych samych     │
+ │ biurko, kostka       │  ChArUco, sysid   │ pozach, z tym samym K,   │
+ └──────────▲───────────┘                   │ serwa jak zmierzone      │
+            │                               └────────────┬─────────────┘
+            │  polityka przez nadzór                     │  tysiące światów MuJoCo Warp
+            │  (te same wzory obserwacji)                ▼  PPO na GPU
+            └────────────────────────────────── polityka reach / lift
 ```
 
-> **Nowe: cyfrowy bliźniak stanowiska z panelem w przeglądarce** (`lerobot-twin ui`).
-> Symulacja MuJoCo z kamerami skalibrowanymi na prawdziwym biurku (intrynsyki
-> z ChArUco, położenie wielu kamer z karty w chwytaku, wykrywanie przestawionej
-> kamery), mapa stołu i kostka z kamer na żywo, trening polityk na GPU
-> (MuJoCo Warp + PPO: `reach` w 2 min, `lift` w pół godziny), identyfikacja
-> dynamiki serw i uruchamianie polityk na ramieniu przez nadzór bezpieczeństwa.
-> Instrukcja i test na sprzęcie krok po kroku: **[docs/TWIN.md](docs/TWIN.md)**,
-> stan prac i decyzje: **[HANDOFF.md](HANDOFF.md)**.
+## Jaki problem rozwiązuje
+
+Robot nauczony w zwykłej symulacji zwykle zawodzi na prawdziwym biurku.
+Symulacja nie wie, gdzie naprawdę stoją kamery i jaką mają optykę, jak
+reagują konkretne serwa ani jak spóźniona i zaszumiona jest percepcja —
+polityka działa w sim, a na ramieniu nie. Każda nowa umiejętność to wtedy
+godziny prób i błędów na sprzęcie, z ryzykiem uszkodzeń.
+
+## Podejście
+
+Bliźniak jest **zmierzony ze stanowiska**, a nie modelowany na oko:
+
+- **Kamery** trafiają do symulacji w swojej zmierzonej pozie i z własną
+  macierzą K — intrynsyki z tablicy ChArUco, położenie z karty z tagami
+  w chwytaku, wszystkie kamery naraz.
+- **Serwa** — identyfikacja dynamiki z nagrania ruchu (tłumienie, armatura,
+  opóźnienie); trening losuje warunki *wokół zmierzonego* ramienia.
+- **Percepcja** — trening widzi kostkę tak, jak widzą ją kamery (spóźnioną,
+  rzadko odświeżaną, zaszumioną), a nie tak, jak zna ją fizyka.
+- **Jedna ścieżka kodu dla symulacji i ramienia** — te same wzory obserwacji,
+  ten sam nadzór bezpieczeństwa, ta sama percepcja; przejście sim → ramię to
+  zmiana backendu (`sim` → `feetech`).
+
+## Co umożliwia
+
+- **Trening polityk na GPU** (`reach`, `lift`) i uruchamianie ich na
+  prawdziwym SO-101 przez nadzór bezpieczeństwa.
+- **Chwytanie obiektów widzianych wyłącznie z kamer** — bez znaczników na
+  obiekcie; kostka lokalizowana z dokładnością 1–3 mm.
+- **Dowolne rozstawianie wielu kamer** — przestawienie kamery wykrywane samo
+  (przybliżenie o 1 %, obrót o 1°), szybka relokalizacja jednej kamery.
+- **Douczanie gotowych polityk** na zmierzonej dynamice swojego ramienia
+  zamiast uczenia od zera.
+- **Porównanie Sim-Real na żywo** — kadr prawdziwej kamery z nałożonymi
+  krawędziami renderu bliźniaka z tej samej pozy.
+- **Bezpieczną pracę z ramieniem** — jeden właściciel ruchu; STOP i Dom
+  odbierają ramię każdemu; reakcja na błędy serw, utratę łącza i kolizje;
+  ściskający chwytak nie puszcza przy STOP.
+- **Pracę zdalną** — ramię przez most sieciowy (`socket://`), panel
+  w przeglądarce z przewodnikiem krok po kroku i podpowiedzią przy każdej
+  kontrolce.
+
+## Co przyspiesza
+
+Zmierzone na RTX A4500:
+
+| | czas |
+|---|---|
+| Fizyka na GPU (MuJoCo Warp) | **1,1 mln kroków/s**, tysiące światów naraz |
+| Trening `reach` | **ok. 2 min** |
+| Trening `lift` od zera / douczanie | ok. 28 min / ok. 16 min |
+| Kalibracja wszystkich kamer | jedna fala, ok. 20 póz; w symulacji 0,16 mm / 0,013° błędu |
+| Identyfikacja dynamiki serw | ok. 20 s ruchu + kilka sekund dopasowania |
+| Od świeżego klona do panelu | ok. 6 min instalacji → `lerobot-twin demo` → `lerobot-twin ui` |
+
+Większość iteracji — projekt zadania, trening, strojenie percepcji,
+kalibracja, próba całego łańcucha — dzieje się w bliźniaku; na sprzęcie
+zostaje sprawdzenie.
+
+## Stan
+
+W symulacji: polityki `reach-v3` i `lift-v3` mają 100 % sukcesu na CPU
+(inny silnik niż w treningu), `lift` z kostką **wyłącznie z kamer** podnosi
+8/8. Kod przeszedł trzy rundy przeglądu z niezależną weryfikacją poprawek;
+567 testów. **Na prawdziwym ramieniu całość nie była jeszcze testowana** —
+to następny krok, procedura krok po kroku w [docs/TWIN.md](docs/TWIN.md).
+Decyzje, historia i pułapki: [HANDOFF.md](HANDOFF.md).
 
 ---
 
@@ -64,8 +129,8 @@ Sprawdzone wersje pakietów są w [`constraints.txt`](constraints.txt).
 **Windows + karta NVIDIA** (PowerShell):
 
 ```powershell
-git clone <adres-repozytorium> manipulator
-cd manipulator
+git clone https://github.com/machinekind/digital_twin_training.git
+cd digital_twin_training
 py -3.12 -m venv .venv
 Set-ExecutionPolicy -Scope Process Bypass   # tylko to okno; bez tego Activate.ps1 jest zablokowany
 .venv\Scripts\activate
@@ -94,7 +159,7 @@ $env:TMP='D:\tmp'; $env:PIP_CACHE_DIR='D:\tmp\pipcache'   # cmd.exe: set TMP=D:\
 
 ```bash
 sudo apt install python3.12 python3.12-venv libgl1 libglib2.0-0 libegl1   # Ubuntu 22.04: python3.12 z PPA deadsnakes
-git clone <adres-repozytorium> manipulator && cd manipulator
+git clone https://github.com/machinekind/digital_twin_training.git && cd digital_twin_training
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
@@ -109,8 +174,8 @@ też tu indeks `cu126`. Na serwerze bez ekranu: `export MUJOCO_GL=egl`.
 
 ```powershell
 # Windows (PowerShell)
-git clone <adres-repozytorium> manipulator
-cd manipulator
+git clone https://github.com/machinekind/digital_twin_training.git
+cd digital_twin_training
 py -3.12 -m venv .venv
 Set-ExecutionPolicy -Scope Process Bypass
 .venv\Scripts\activate
@@ -121,7 +186,7 @@ pip install -e ".[twin,feetech,dev]" -c constraints.txt
 
 ```bash
 # Linux (pakiety systemowe jak wyżej) i macOS z Apple Silicon
-git clone <adres-repozytorium> manipulator && cd manipulator
+git clone https://github.com/machinekind/digital_twin_training.git && cd digital_twin_training
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu   # macOS: pip install torch==2.11.0
@@ -221,6 +286,26 @@ python -c "import cv2; print([l.strip() for l in cv2.getBuildInformation().split
 Ostatnie polecenie ma pokazać `WIN32UI` (Windows) albo `GTK`/`QT` (Linux), a nie `NONE`.
 
 ---
+
+---
+
+# Sterowanie dłonią — LeRobot 101 × MediaPipe
+
+Sterowanie ramieniem **SO-101 (LeRobot 101)** ruchem dłoni przed kamerą.
+MediaPipe śledzi 21 punktów dłoni, a aplikacja zamienia je na zadane pozycje
+sześciu stawów — z filtracją, limitami i zatrzymaniem awaryjnym.
+
+Działa **bez robota**: wbudowany symulator i podgląd 3D pozwalają nauczyć się
+gestów, zanim cokolwiek podłączysz.
+
+```
+   dłoń przed kamerą              podgląd na żywo                  ramię
+  ┌────────────────┐        ┌──────────────────────┐        ┌──────────────┐
+  │  21 punktów    │──────► │  HUD: stan, stawy,   │──────► │  SO-101      │
+  │  MediaPipe     │        │  limity, chwytak     │        │  lub symulator│
+  └────────────────┘        │  + model 3D ramienia │        └──────────────┘
+                            └──────────────────────┘
+```
 
 ## Szybki start
 
@@ -646,7 +731,7 @@ ten sam format, więc działa na obu wersjach.
 pip install -e ".[dev]" -c constraints.txt && pytest -q
 ```
 
-484 testy pokrywają matematykę sterowania (filtry, kinematyka, mapowanie,
+567 testów pokrywa matematykę sterowania (filtry, kinematyka, mapowanie,
 nadzór), kąty ramienia w układzie tułowia, wątek podglądu 3D i zgodność modelu
 ze źródłem, cały łańcuch od cech dłoni do symulowanego ramienia oraz bliźniaka
 (kalibracja, percepcja, RL, panel). Bez extra `[twin]` testy bliźniaka się
