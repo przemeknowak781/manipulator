@@ -79,6 +79,10 @@ SERVO_ERROR_BITS: tuple[tuple[int, str], ...] = (
 #: Tyle kolejnych nieudanych odczytow ramienia = lacze zerwane (a nie jedna zgubiona ramka).
 LINK_LOSS_CYCLES = 5
 
+#: Najkrotsze okno ciszy [s], po ktorym lacze po zgubionej odpowiedzi uznajemy za puste.
+#: Wlasciwe okno to ~2x najdluzszy ostatni przebieg tam i z powrotem (patrz `FeetechBus._quiet`).
+QUIET_MIN_S = 0.02
+
 #: O tyle tikow (~1 stopien) moga sie roznic dwa odczyty pozycji przy starcie.
 #: Z tej pozycji robi sie cel serwa tuz przed zalaczeniem momentu - jeden
 #: przeklamany odczyt oznaczalby skok ramienia z pelna predkoscia.
@@ -118,6 +122,13 @@ class FeetechBus:
         #: Jak skonczyl sie ostatni `_receive`: "ok", "lost" (brak/ucieta ramka,
         #: strumien moze byc przesuniety) albo "corrupt" (cala ramka, zla tresc).
         self._last_rx = "ok"
+        #: Najdluzszy ostatni przebieg udanej transakcji [s] (maleje powoli) - z niego okno ciszy.
+        self._rtt = 0.0
+        #: Po zgubionej odpowiedzi strumien jest podejrzany: spozniona odpowiedz moze jeszcze
+        #: przyjsc i trafic do nastepnej transakcji. Kasowane dopiero przez czysty odczyt.
+        self._suspect = False
+        #: Odczyty, w ktorych po odpowiedzi przyszla nowsza - wzieta ta nowsza (diagnostyka).
+        self.late_replies = 0
 
     # ------------------------------------------------------------------ port
     def open(self, link: Any = None) -> None:
@@ -220,20 +231,98 @@ class FeetechBus:
             return None
         return frame[1]
 
+    # ------------------------------------------------- spoznione odpowiedzi
+    def _pending(self) -> bool:
+        """Czy w laczu czekaja bajty (`socket://` pyserial mowi tylko 0/1, a nie ile)."""
+        try:
+            return bool(getattr(self._link, "in_waiting", 0))
+        except Exception:  # pragma: no cover - zamkniete lacze
+            return False
+
+    def _quiet(self) -> float:
+        """Okno ciszy: ~2x najdluzszy ostatni przebieg, nie krocej niz QUIET_MIN_S, nie dluzej niz timeout."""
+        return min(max(2.0 * self._rtt + 0.005, QUIET_MIN_S), max(self.timeout, QUIET_MIN_S))
+
+    def _note_rtt(self, t0: float) -> None:
+        self._rtt = max(time.monotonic() - t0, self._rtt * 0.9)
+
+    def _settle(self, ids: list[int], length: int) -> dict[int, int]:
+        """Czyta, co jeszcze przyjdzie, az lacze ucichnie na `_quiet()`, potem czysci bufor.
+
+        Zwraca {id: wartosc} z NAJNOWSZYCH pelnych ramek serw `ids` (pusto = nic nowego).
+        Protokol nie numeruje transakcji, a `_send` czysci tylko to, co JUZ przyszlo.
+        Zmierzone przez most: odpowiedz sprzed przestoju sieci (albo spozniona o 0,3 s
+        retransmisja TCP) przychodzila w trakcie NASTEPNEGO odczytu i byla brana za jego
+        odpowiedz - blizniak robil z pozy sprzed 0,3 s rozkaz i serwo cofalo sie o 6-7 st.
+        (takze po STOP-ie). Wlasciwa odpowiedz przychodzi zaraz za spozniona, w kolejnosci
+        TCP, wiec wygrywa ostatnia ramka kazdego serwa, ktora zdazy przed cisza.
+        """
+        quiet = self._quiet()
+        last = time.monotonic()
+        hard = last + self.timeout + quiet          # ciagly szum nie trzyma petli bez konca
+        newer: dict[int, int] = {}
+        while True:
+            now = time.monotonic()
+            if now - last >= quiet or now >= hard:
+                break
+            if not self._pending():
+                time.sleep(0.001)
+                continue
+            frame = self._receive_frame()
+            if frame is None:
+                if self._last_rx == "lost":
+                    break                           # ucieta ramka - strumien przesuniety, bufor do kosza
+                continue
+            dev_id, data = frame
+            if dev_id in ids and len(data) >= length:
+                newer[dev_id] = int.from_bytes(data[:length], "little")
+            last = time.monotonic()
+        self._link.reset_input_buffer()
+        return newer
+
+    def _finish(self, out: dict[int, int], ids: list[int], length: int, t0: float) -> dict[int, int]:
+        """Konczy odczyt: po zgubionej odpowiedzi oproznia lacze, a pierwszy odczyt po niej sprawdza.
+
+        Odczyt, ktory dostal odpowiedz, gdy strumien byl podejrzany, czeka jeszcze na cisze:
+        jesli za odpowiedzia przyszla nowsza, tamta byla spozniona i liczy sie tylko nowsza.
+        Po zgubionej odpowiedzi lacze jest oprozniane (czytane i wyrzucane do ciszy), zeby
+        spozniona ramka nie trafila do nastepnego rozkazu.
+        """
+        lost = self._last_rx == "lost"
+        if out and self._suspect:
+            newer = self._settle(ids, length)
+            if newer:
+                self.late_replies += 1
+                logger.debug("Spozniona odpowiedz serw %s - biore nowsza", sorted(out))
+                out = newer                         # czego nie ma w nowszej, jest nieswieze
+            self._suspect = bool(newer) or lost
+        elif lost:
+            self._settle([], length)
+            self._suspect = True
+        if out and not lost:
+            self._note_rtt(t0)
+        return out
+
     def ping(self, dev_id: int) -> bool:
         self._send(dev_id, INST_PING)
-        return self._receive(dev_id) is not None
+        ok = self._receive(dev_id) is not None
+        if not ok and self._last_rx == "lost":
+            self._settle([], 0)
+            self._suspect = True
+        return ok
 
     def read(self, dev_id: int, addr: int, length: int) -> int | None:
+        t0 = time.monotonic()
         self._send(dev_id, INST_READ, bytes([addr, length]))
         data = self._receive(dev_id)
-        if data is None or len(data) < length:
-            return None
-        return int.from_bytes(data[:length], "little")
+        out = {} if data is None or len(data) < length else {dev_id: int.from_bytes(data[:length], "little")}
+        return self._finish(out, [dev_id], length, t0).get(dev_id)
 
     def write(self, dev_id: int, addr: int, value: int, length: int) -> None:
         self._send(dev_id, INST_WRITE, bytes([addr]) + value.to_bytes(length, "little"))
-        self._receive(dev_id)
+        if self._receive(dev_id) is None and self._last_rx == "lost":
+            self._settle([], 0)
+            self._suspect = True
 
     def sync_read(self, addr: int, length: int, ids: list[int]) -> dict[int, int]:
         """Jeden pakiet, odpowiedz kazdego serwa po kolei - {id: wartosc} dla tych, ktore odpowiedzialy.
@@ -242,6 +331,7 @@ class FeetechBus:
         przy 20 ms RTT odczyt ramienia kosztuje 20 ms, a nie 120.
         """
         params = bytes([addr, length, *ids])
+        t0 = time.monotonic()
         self._send(BROADCAST_ID, INST_SYNC_READ, params)
         out: dict[int, int] = {}
         # Serwa odpowiadaja po kolei, ale to, ktore milczy, nie moze zabrac ze
@@ -258,7 +348,7 @@ class FeetechBus:
                 out[dev_id] = int.from_bytes(data[:length], "little")
             if dev_id == ids[-1]:
                 break                       # ostatnie serwo odpowiedzialo - nie czekamy na brakujace
-        return out
+        return self._finish(out, list(ids), length, t0)
 
     def sync_write(self, addr: int, length: int, values: dict[int, int]) -> None:
         """Jeden pakiet dla wszystkich serw naraz - bez odpowiedzi, wiec bez czekania.

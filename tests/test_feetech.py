@@ -8,9 +8,13 @@ moment zalacza sie DOPIERO po nadpisaniu rejestru celu.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from lerobot_mp.config import JOINT_NAMES, load_config
+from lerobot_mp.robot import serial_bridge
 from lerobot_mp.robot.feetech import (
     ADDR_GOAL_POSITION,
     ADDR_MAX_ANGLE_LIMIT,
@@ -525,6 +529,142 @@ def test_socket_link_disables_nagle():
     finally:
         bus.close()
         server.close()
+
+
+def test_link_silent_is_public(arm_cfg):
+    """Blizniak pyta o `link_silent` (kontrakt D1), a nie o prywatne `_link_silent`."""
+    arm, link = connected(arm_cfg)
+    arm.read_joints()
+    assert arm.link_silent is False
+    link.silent = True
+    arm.read_joints()
+    assert arm.link_silent is True
+    link.silent = False
+    arm.read_joints()
+    assert arm.link_silent is False
+
+
+class DelayedServoPort:
+    """Szesc serw za mostem `serial_bridge`, z odpowiedziami, ktore moga przyjsc za pozno.
+
+    Odpowiedzi ida w kolejnosci (jak TCP): spozniona wstrzymuje wszystkie za nia.
+    `delay_next` - dodatkowe opoznienie odpowiedzi na NASTEPNY SYNC READ (retransmisja TCP).
+    `stall(s)` - przestoj sieci: odpowiedz na nastepny SYNC READ jest juz w drodze (pozycja
+    sprzed przestoju), a zapytania wyslane w trakcie serwa obsluza dopiero po nim.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pos = {dev_id: REST_TICKS for dev_id in range(1, 7)}
+        #: (kiedy gotowe, id, wartosc albo None = pozycja w chwili, gdy zapytanie dotrze).
+        self.queue: list[tuple[float, int, int | None]] = []
+        self.delay_next = 0.0
+        self.hold_until = 0.0
+        self._capture_next = False
+        self.closed = False
+
+    def stall(self, seconds: float) -> None:
+        with self.lock:
+            self.hold_until = time.monotonic() + seconds
+            self._capture_next = True
+
+    def write(self, data: bytes) -> int:
+        now = time.monotonic()
+        with self.lock:
+            i = 0
+            while i + 5 < len(data):
+                length, instruction, params = data[i + 3], data[i + 4], data[i + 5: i + 3 + data[i + 3]]
+                i += 4 + length
+                if instruction != INST_SYNC_READ:
+                    continue
+                extra, self.delay_next = self.delay_next, 0.0
+                ready = max(now + extra, self.hold_until, self.queue[-1][0] if self.queue else 0.0)
+                in_flight = now >= self.hold_until or self._capture_next
+                self._capture_next = False
+                for dev_id in params[2:]:
+                    self.queue.append((ready, dev_id, self.pos[dev_id] if in_flight else None))
+        return len(data)
+
+    def _ready(self, size: int) -> bytes:
+        out = bytearray()
+        now = time.monotonic()
+        while self.queue and self.queue[0][0] <= now and len(out) < size:
+            _, dev_id, value = self.queue.pop(0)
+            value = self.pos[dev_id] if value is None else value
+            body = bytes([dev_id, 4, 0]) + value.to_bytes(2, "little")
+            out += b"\xff\xff" + body + bytes([checksum(body)])
+        return bytes(out)
+
+    def read(self, size: int = 1) -> bytes:
+        deadline = time.monotonic() + serial_bridge.POLL_S
+        while not self.closed:
+            with self.lock:
+                data = self._ready(size)
+            if data or time.monotonic() >= deadline:
+                return data
+            time.sleep(0.001)
+        return b""
+
+    @property
+    def in_waiting(self) -> int:
+        return 0                                     # `_ready` oddaje cale ramki od razu
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def bridged():
+    """FeetechBus po `socket://` przez prawdziwy most do `DelayedServoPort`."""
+    pytest.importorskip("serial")
+    port, ready, stop = DelayedServoPort(), threading.Event(), threading.Event()
+    bound: list[int] = []
+    server = threading.Thread(target=serial_bridge.serve, args=(lambda: port, "127.0.0.1", 0),
+                              kwargs=dict(stop=stop, on_ready=lambda p: (bound.append(p), ready.set())), daemon=True)
+    server.start()
+    assert ready.wait(5)
+    bus = FeetechBus(f"socket://127.0.0.1:{bound[0]}")
+    bus.open()
+    try:
+        yield bus, port
+    finally:
+        bus.close()
+        stop.set()
+        port.close()
+        server.join(3)
+
+
+IDS = [1, 2, 3, 4, 5, 6]
+
+
+def first_answer(bus: FeetechBus, tries: int = 8) -> dict[int, int]:
+    for _ in range(tries):
+        got = bus.sync_read(ADDR_PRESENT_POSITION, 2, IDS)
+        if got:
+            return got
+    raise AssertionError("serwa nie odpowiedzialy ani razu")
+
+
+def test_a_late_reply_is_never_taken_for_the_next_read(bridged):
+    """Odpowiedz spozniona o 0,4 s (limit 0,25 s) przychodzila w trakcie NASTEPNEGO odczytu
+    i byla brana za jego odpowiedz: blizniak dostawal poze sprzed 0,4 s jako swieza."""
+    bus, port = bridged
+    assert first_answer(bus)[1] == REST_TICKS
+    port.delay_next = 0.4
+    assert bus.sync_read(ADDR_PRESENT_POSITION, 2, IDS) == {}          # limit minal - nic
+    port.pos[1] = REST_TICKS + 500                                      # serwo pojechalo dalej
+    assert first_answer(bus)[1] == REST_TICKS + 500
+
+
+def test_the_first_read_after_a_link_stall_is_the_current_pose(bridged):
+    """Przestoj sieci: odpowiedz sprzed niego przychodzila pierwsza po powrocie i wygrywala
+    z odpowiedzia na biezace zapytanie - rozkaz z pozy sprzed przestoju cofal serwo o 6-7 st."""
+    bus, port = bridged
+    first_answer(bus)
+    port.stall(0.7)
+    assert bus.sync_read(ADDR_PRESENT_POSITION, 2, IDS) == {}
+    port.pos[1] = REST_TICKS + 500
+    assert first_answer(bus)[1] == REST_TICKS + 500
 
 
 def test_disconnect_leaves_the_arm_holding_by_default(arm_cfg):
