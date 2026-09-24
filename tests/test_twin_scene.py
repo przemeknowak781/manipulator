@@ -78,6 +78,7 @@ def sphere_centres(scene: sc.Scene, camera: str, points) -> list[np.ndarray]:
     ],
     ids=["srodek", "przesuniety", "odwrotnie"],
 )
+@pytest.mark.render
 def test_sim_camera_renders_where_its_intrinsics_project(K):
     T = look_at([0.55, -0.40, 0.30], [0.18, 0.02, 0.02])
     with sc.build(sc.SceneConfig(SO101, cameras=[sc.CameraView("probe", K, W, H, T)])) as scene:

@@ -50,6 +50,7 @@ def _look_at_pose(eye, target):
     return pose(np.column_stack([x, np.cross(z, x), z]), eye)
 
 
+@pytest.mark.render
 def test_panel_starts_adds_a_simulated_camera_and_maps_the_table(tmp_path):
     from lerobot_mp.twin.ui.app import TwinApp
 
@@ -314,6 +315,7 @@ def test_reach_goal_from_the_gizmo_is_kept_in_the_trained_region(app):
     assert np.allclose(app.goal_gizmo.position, (app.T_b2w @ np.r_[g, 1.0])[:3], atol=1e-6)
 
 
+@pytest.mark.render
 def test_saving_a_card_fit_refuses_a_tag_size_changed_since_the_wave(app):
     from lerobot_mp.twin.calib.handeye import CameraFit, Fit
     from lerobot_mp.twin.workspace import CameraRecord
@@ -395,6 +397,7 @@ def _static_mask(app, name, joints, dilate=5):
     return app.twin.render_with(render)
 
 
+@pytest.mark.render
 def test_arm_mask_grows_along_the_arm_path_and_each_camera_at_its_own_frame_time(app):
     """Kwadratowe poszerzenie z predkosci stawu (tez wrist_roll) chowalo kostke przy szczekach.
 
@@ -441,6 +444,7 @@ def test_arm_mask_grows_along_the_arm_path_and_each_camera_at_its_own_frame_time
         app._refresh_cameras()
 
 
+@pytest.mark.render
 def test_preview_says_no_cameras_after_the_last_one_is_removed(app):
     from lerobot_mp.twin.ui.app import no_frame_image
 

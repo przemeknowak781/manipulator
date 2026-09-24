@@ -138,6 +138,7 @@ def test_a_wave_that_only_rolls_the_wrist_is_refused(kin):
 
 
 # ----------------------------------------------------------------- sesja
+@pytest.mark.render
 def test_full_session_in_simulation_calibrates_the_camera():
     """Cala sesja: fala, render, detekcja, dopasowanie i werdykt - wzgledem prawdy."""
     res = run(seed=0, n_cameras=1)

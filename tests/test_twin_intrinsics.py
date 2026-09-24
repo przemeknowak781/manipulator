@@ -13,6 +13,7 @@ from lerobot_mp.twin.calib.intrinsics import Board, Collector, simulate  # noqa:
 K = np.array([[600.0, 0, 330.0], [0, 590.0, 235.0], [0, 0, 1]])
 
 
+@pytest.mark.render
 def test_calibration_recovers_the_camera_matrix_of_the_simulated_camera():
     res, _ = simulate(K, n=14, seed=1)
     assert res.trusted, res.reason
@@ -21,6 +22,7 @@ def test_calibration_recovers_the_camera_matrix_of_the_simulated_camera():
     assert res.rms_px < 0.3
 
 
+@pytest.mark.render
 def test_the_same_view_twice_is_refused():
     """Dwadziescia kadrow z jednego miejsca daje pewne siebie i zle K."""
     _, col = simulate(K, n=5, seed=2)

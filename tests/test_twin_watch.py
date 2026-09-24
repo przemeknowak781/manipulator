@@ -106,6 +106,7 @@ def twin_frames():
     return frames
 
 
+@pytest.mark.render
 def test_camera_motion_is_measured_while_the_arm_moves_in_the_twin(twin_frames):
     """Ramie w innej pozie + kamera obrocona o 1 st. albo zblizona o 1/2/3%.
 

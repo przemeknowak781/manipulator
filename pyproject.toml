@@ -43,6 +43,7 @@ lerobot_mp = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = ["render: test renderuje kadry przez MuJoCo/OpenGL (maszyna bez GPU: -m \"not render\")"]
 
 [tool.ruff]
 line-length = 110

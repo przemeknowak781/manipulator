@@ -43,6 +43,7 @@ def look(eye, target):
     return pose(np.column_stack([x, np.cross(z, x), z]), eye)
 
 
+@pytest.mark.render
 @pytest.mark.skipif(not POLICY.is_file(), reason="brak bazowej polityki lift-v3 w assets/policies")
 def test_lift_policy_lifts_a_cube_seen_only_by_cameras():
     ws = Workspace()

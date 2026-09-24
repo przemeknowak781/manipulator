@@ -42,6 +42,7 @@ def render_cube(xy, yaw, lift=0.0):
         return {v.name: s.render(v.name) for v in VIEWS}
 
 
+@pytest.mark.render
 def test_cube_is_found_from_two_cameras_to_a_few_millimetres():
     """Czesc wspolna masek z kamer: sama gorna sciana, bez rozmazanych bokow."""
     rng = np.random.default_rng(0)
@@ -62,6 +63,7 @@ def _det(p, n_cameras=2):
     return CubeDetection(np.asarray(p, float), np.eye(3), 100.0, 1.0, n_cameras)
 
 
+@pytest.mark.render
 def test_detection_says_how_many_cameras_saw_the_cube():
     """Podniesiona kostka jest "lezaca dalej" dla jednej kamery - bramka IoU tego nie widzi."""
     xy = (0.22, 0.03)
@@ -158,6 +160,7 @@ def test_detection_without_two_witnesses_never_replaces_the_cube_in_hand(n_camer
         assert tr.source == "w dloni" and got[0] == pytest.approx(cube + [0.0, 0.0, 0.02 * k], abs=1e-9)
 
 
+@pytest.mark.render
 def test_map_detection_counts_as_one_witness():
     """`detect` z mapy nie wie, ile kamer widzialo kostke - tracker ma to traktowac jak jedna."""
     xy = (0.22, 0.03)
@@ -264,6 +267,7 @@ def test_tracker_forgets_a_cube_nobody_holds():
     assert tr.update(None, T_far, 1.0, 1.0, -0.17, now=1.5) is None         # nie ma jej juz za dlugo
 
 
+@pytest.mark.render
 def test_moved_camera_is_detected_and_moving_arm_is_not():
     from lerobot_mp.twin.ui.watch import CameraWatch, arm_mask
 
@@ -292,6 +296,7 @@ def test_moved_camera_is_detected_and_moving_arm_is_not():
     assert w.moved("c")
 
 
+@pytest.mark.render
 def test_lift_from_one_camera_never_feeds_a_lifted_ghost_and_recovers_a_dropped_cube():
     """Caly lancuch lift-v3 z TYLKO kamera `a` (jak `test_twin_lift_from_cameras`, ale jeden swiadek).
 
