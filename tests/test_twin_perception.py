@@ -123,6 +123,116 @@ def test_single_camera_confirmation_keeps_a_resting_cube_alive():
         assert got is not None and np.allclose(got[0], cube)
 
 
+CLOSED = -0.17
+T_FAR = pose(np.eye(3), np.array([0.1, -0.15, 0.2]))
+
+
+def _holding(tr, cube):
+    """Tracker z kostka w dloni: widziana z daleka, potem szczeka zablokowana na niej."""
+    tr.update(_det(cube, 2), T_FAR, 0.8, 0.8, CLOSED, now=0.0)
+    T_grasp = pose(np.eye(3), cube + [0.0, 0.0, 0.005])
+    for t, q in ((0.3, 0.5), (0.4, 0.19), (0.5, 0.19)):
+        tr.update(None, T_grasp, grip_q=q, grip_cmd=CLOSED, grip_closed=CLOSED, now=t)
+    assert tr.source == "w dloni"
+
+
+@pytest.mark.parametrize("n_cameras", [0, -1])
+def test_detection_without_two_witnesses_never_replaces_the_cube_in_hand(n_cameras):
+    """Dopasowanie sylwetki daje n_cameras=0, gdy ramie zaslania kostke w szczekach KAZDEJ kamerze.
+
+    Wczesniej 0 znaczylo "nie wiadomo" i przechodzilo jak dwie kamery: duch kostki
+    7 cm obok i 6 cm nizej zostawal "kamery", a kostka wypadala z dloni trackera.
+    """
+    tr = CubeTracker()
+    cube = np.array([0.22, 0.03, 0.015])
+    _holding(tr, cube)
+    ghost = cube + [-0.05, 0.07, 0.0]
+    # Szczeka drgnela (nie stoi), ale dalej sciska - duch nie moze wejsc w `last`
+    # ani zdjac kostki z dloni.
+    T = pose(np.eye(3), cube + [0.0, 0.0, 0.005])
+    got = tr.update(_det(ghost, n_cameras), T, grip_q=0.25, grip_cmd=CLOSED, grip_closed=CLOSED, now=0.6)
+    assert tr.source != "kamery" and np.allclose(got[0], cube)
+    for k, t in enumerate((0.7, 0.8, 0.9)):
+        T = pose(np.eye(3), cube + [0.0, 0.0, 0.005 + 0.02 * k])
+        got = tr.update(_det(ghost, n_cameras), T, grip_q=0.25, grip_cmd=CLOSED, grip_closed=CLOSED, now=t)
+        assert tr.source == "w dloni" and got[0] == pytest.approx(cube + [0.0, 0.0, 0.02 * k], abs=1e-9)
+
+
+def test_map_detection_counts_as_one_witness():
+    """`detect` z mapy nie wie, ile kamer widzialo kostke - tracker ma to traktowac jak jedna."""
+    xy = (0.22, 0.03)
+    mapper = TableMapper({v.name: (v.K, None, v.T_cam2base) for v in VIEWS}, n=280).at_height(0.03)
+    det = CubeDetector().detect(mapper.fuse(render_cube(xy, 0.3))[0], mapper)
+    assert det is not None and det.n_cameras == -1
+    tr = CubeTracker()
+    tr.update(_det([0.22, 0.03, 0.015], 2), T_FAR, 0.8, 0.8, CLOSED, now=0.0)
+    T_near = pose(np.eye(3), np.array([0.22, 0.03, 0.06]))
+    det.pos = np.array([0.25, 0.03, 0.015])
+    tr.update(det, T_near, 0.8, 0.8, CLOSED, now=0.1)
+    assert tr.source.startswith("ostatnie widziane")
+
+
+def test_pushed_cube_is_reacquired_when_it_stays_put_while_the_hand_moves():
+    """Kostka potracona 3 cm, jedna kamera, dlon przy niej: wczesniej stala w starym miejscu 6 s,
+    potem None."""
+    tr = CubeTracker()
+    cube = np.array([0.22, 0.03, 0.015])
+    tr.update(_det(cube, 2), T_FAR, 0.8, 0.8, CLOSED, now=0.0)
+    pushed = cube + [0.03, 0.0, 0.0]
+    # Dlon stoi 5 cm nad starym miejscem: nic nie dowodzi, ze to nie duch - zostaje stare
+    # polozenie, ale zrodlo mowi wprost, ze kamera widzi kostke gdzie indziej.
+    T_hover = pose(np.eye(3), cube + [0.0, 0.0, 0.05])
+    for t in (0.1, 0.2, 0.3, 0.4):
+        jitter = [0.002 * (-1) ** int(10 * t), 0.0, 0.0]
+        got = tr.update(_det(pushed + jitter, 1), T_hover, 0.8, 0.8, CLOSED, now=t)
+        assert np.allclose(got[0], cube)
+    assert "gdzie indziej" in tr.source
+    # Dlon odjezdza w poziomie, kostka stoi (szum 2-4 mm) - przyjeta z kamer.
+    for k, t in enumerate((0.5, 0.6, 0.7)):
+        T = pose(np.eye(3), cube + [-0.008 * k, -0.006 * k, 0.05])
+        got = tr.update(_det(pushed + [0.0, 0.003 * (-1) ** k, 0.0], 1), T, 0.8, 0.8, CLOSED, now=t)
+    assert tr.source == "kamery" and np.linalg.norm(got[0] - pushed) < 0.004
+
+
+def test_ghost_moving_with_the_hand_is_never_accepted():
+    """Duch kostki w szczekach jedzie z dlonia - nawet gdy tracker nie wie, ze szczeka cos trzyma."""
+    tr = CubeTracker()
+    cube = np.array([0.22, 0.03, 0.015])
+    tr.update(_det(cube, 2), T_FAR, 0.8, 0.8, CLOSED, now=0.0)
+    for k in range(10):
+        move = np.array([0.004 * k, -0.003 * k, 0.0])
+        tcp = cube + [0.0, 0.0, 0.04] + move
+        # Rzut kostki z wysokosci dloni wzdluz promienia kamery: w poziomie jedzie SZYBCIEJ niz dlon.
+        ghost = cube + [-0.04, 0.05, 0.0] + 1.2 * move
+        got = tr.update(_det(ghost, 1), pose(np.eye(3), tcp), 0.8, 0.8, CLOSED, now=0.1 * (k + 1))
+        assert tr.source != "kamery" and np.allclose(got[0], cube)
+
+
+def test_cube_that_falls_from_the_hand_does_not_hang_in_the_air():
+    """Szczeka zamknela sie na pustym 8 cm nad blatem: wczesniej "ostatnie widziane" w powietrzu,
+    a runner liczyl kostke za podniesiona i konczyl "zadanie wykonane" z kostka na blacie."""
+    tr = CubeTracker()
+    cube = np.array([0.22, 0.03, 0.015])
+    _holding(tr, cube)
+    T_up = pose(np.eye(3), cube + [0.0, 0.0, 0.085])
+    got = tr.update(None, T_up, grip_q=0.19, grip_cmd=CLOSED, grip_closed=CLOSED, now=0.6)
+    assert tr.source == "w dloni" and got[0][2] == pytest.approx(0.095)
+    # Drgniecie przy sciskaniu (jeszcze trzyma) - bez upadku, kostka dalej w dloni.
+    got = tr.update(None, T_up, grip_q=0.13, grip_cmd=CLOSED, grip_closed=CLOSED, now=0.7)
+    assert got[0][2] == pytest.approx(0.095)
+    # ...ale w nastepnym takcie szczeka jest juz zamknieta na pustym: kostka lezy pod dlonia.
+    got = tr.update(None, T_up, grip_q=-0.15, grip_cmd=CLOSED, grip_closed=CLOSED, now=0.8)
+    assert tr.source == "ostatnie widziane (upuszczona)"
+    assert got[0] == pytest.approx([0.22, 0.03, 0.015], abs=1e-9)
+    # Drgniecie, po ktorym szczeka znow stoi na kostce - dalej w dloni, nie upadek.
+    tr2 = CubeTracker()
+    _holding(tr2, cube)
+    tr2.update(None, T_up, 0.19, CLOSED, CLOSED, now=0.6)
+    tr2.update(None, T_up, 0.13, CLOSED, CLOSED, now=0.7)
+    got = tr2.update(None, T_up, 0.13, CLOSED, CLOSED, now=0.8)
+    assert tr2.source == "w dloni" and got[0][2] == pytest.approx(0.095)
+
+
 def test_tracker_carries_the_cube_with_the_hand_when_cameras_lose_it():
     """Kamery widza kostke tylko z daleka - przy chwycie szczeki zaslaniaja gorna sciane."""
     tr = CubeTracker()
@@ -180,3 +290,84 @@ def test_moved_camera_is_detected_and_moving_arm_is_not():
     # dalej niz srodek (10,7 px przy 560*a = 9,8 px), stad 15%, a nie 10%.
     assert shift == pytest.approx(560 * a, rel=0.15)
     assert w.moved("c")
+
+
+def test_lift_from_one_camera_never_feeds_a_lifted_ghost_and_recovers_a_dropped_cube():
+    """Caly lancuch lift-v3 z TYLKO kamera `a` (jak `test_twin_lift_from_cameras`, ale jeden swiadek).
+
+    Seed 5: pierwszy chwyt wypuszcza kostke 3-5 cm dalej. Przed poprawka: duch z
+    n_cameras=0 szedl do polityki jako "kamery" przy kostce 1,6 cm nad blatem, a potem
+    lezaca obok kostka (widziana dobrze, ale przez jedna kamere przy dloni) byla
+    pomijana - 130 taktow chwytania pustego miejsca i stop "kamery jej nie widza".
+    """
+    pytest.importorskip("torch")
+    from lerobot_mp.twin.kinematics import RobotKinematics, inverse
+    from lerobot_mp.twin.rl import task as tk
+    from lerobot_mp.twin.rl.policy import Policy, bundled_dir
+    from lerobot_mp.twin.rl.runner import PolicyRunner
+    from lerobot_mp.twin.runtime import Twin
+    from lerobot_mp.twin.ui.watch import arm_mask
+    from lerobot_mp.twin.workspace import CameraRecord, Workspace
+
+    path = bundled_dir() / "lift-v3" / "policy.pt"
+    if not path.is_file():
+        pytest.skip("brak bazowej polityki lift-v3 w assets/policies")
+    ws = Workspace()
+    T = look_at([0.55, -0.45, 0.45], [0.2, 0, 0]).tolist()
+    ws.add_camera(CameraRecord("a", "sim", 640, 480, K=K.tolist(), sim_pose=T, T_cam2base=T,
+                               calibration={"trusted": True}))
+    pol = Policy.load(path)
+    h = pol.task.cube_half
+    twin = Twin(ws)
+    try:
+        twin.configure(objects=[sc.Box("cube", (h, h, h), (0.2, 0.0), rgba=(0.85, 0.25, 0.2, 1.0),
+                                       mass=pol.task.cube_mass)], grasp_sensors=["cube"])
+        twin.connect("sim", threaded=False)
+        mapper = TableMapper.from_workspace(ws)
+        kin = RobotKinematics(ws.spec())
+        pos, quat = tk.sample_cubes(pol.task, np.random.default_rng(5), 1)
+        with twin.lock:
+            s = twin.scene
+            b = s.model.body("cube").id
+            a = s.model.jnt_qposadr[s.model.body_jntadr[b]]
+            qb, qw = np.zeros(4), np.zeros(4)
+            mujoco.mju_mat2Quat(qb, s.T_base2world[:3, :3].ravel())
+            mujoco.mju_mulQuat(qw, qb, quat[0])
+            s.data.qpos[a:a + 3] = s.T_base2world[:3, :3] @ pos[0] + s.T_base2world[:3, 3]
+            s.data.qpos[a + 3:a + 7] = qw
+            mujoco.mj_forward(s.model, s.data)
+
+        def truth():
+            with twin.lock:
+                s = twin.scene
+                Ti = inverse(s.T_base2world)
+                return Ti[:3, :3] @ s.data.xpos[s.model.body("cube").id] + Ti[:3, 3]
+
+        tracker, det = CubeTracker(), CubeDetector()
+        last, clock, log = {"det": None}, {"t": 0.0}, []
+
+        def provider():
+            joints = dict(twin.status.measured) or twin.joints()
+            q = kin.to_q(joints)
+            d, last["det"] = last["det"], None                # tylko swieze detekcje, jak w panelu
+            out = tracker.update(d, kin.tcp(joints), q[5], runner.q_cmd[5], runner.limits.lo[5], clock["t"])
+            log.append((truth()[2] - h, tracker.source))
+            return out
+
+        runner = PolicyRunner(twin, pol, cube_provider=provider)
+        runner.start(threaded=False)
+        for k in range(1, int(20.0 / 0.01) + 1):
+            clock["t"] = k * 0.01
+            if k % 2 == 0:
+                twin.step(0.02)
+            if k % 10 == 0:
+                occ = twin.render_with(lambda sc_: {"a": arm_mask(sc_, "a", dilate=5)})
+                last["det"] = det.detect_frames({"a": twin.render("a")}, mapper, occ, t=clock["t"])
+            if k % 5 == 0 and not runner.step_once(clock["t"]):
+                break
+        lifted_from_cameras = [lift for lift, src in log if lift > 0.01 and src == "kamery"]
+        assert not lifted_from_cameras, f"podniesiona kostka jako 'kamery' {len(lifted_from_cameras)} razy"
+        assert runner.status.stopped_because == "zadanie wykonane", runner.status.stopped_because
+        assert truth()[2] - h > pol.task.lift_height
+    finally:
+        twin.close()
