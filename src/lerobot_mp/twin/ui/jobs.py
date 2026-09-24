@@ -65,6 +65,14 @@ class Job:
     def stop(self) -> None:
         self.cancel.set()
 
+    def wait(self, timeout: float) -> bool:
+        """Czeka na koniec watku zadania. True = skonczone (albo nigdy nie ruszylo)."""
+        t = self._thread
+        if t is None or t is threading.current_thread():
+            return True
+        t.join(timeout)
+        return not t.is_alive()
+
 
 class TrainingJob:
     """`lerobot-twin train` w osobnym procesie; postep z `progress.json` przebiegu."""
@@ -112,6 +120,36 @@ class TrainingJob:
         if self.run_dir is not None:
             (self.run_dir / "STOP").touch()
 
+    def shutdown(self, timeout: float = 8.0) -> None:
+        """Konczy trening razem z panelem: STOP (zapis polityki), chwila na zapis, potem zabicie.
+
+        Proces bez konsoli (CREATE_NO_WINDOW) nie dostaje Ctrl+C z panelu - zostawal
+        po zamknieciu panelu, zajmowal GPU i pisal do katalogu polityki, a nowy
+        panel nie mial do niego uchwytu i pozwalal wlaczyc drugi trening obok.
+        """
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                self.stop()
+                proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("Trening nie skonczyl sie po STOP w %.0f s - zabijam proces", timeout)
+                proc.kill()
+                try:
+                    proc.wait(5.0)
+                except subprocess.TimeoutExpired:          # pragma: no cover - proces nie daje sie zabic
+                    logger.error("Proces treningu %s nie daje sie zabic", proc.pid)
+            except OSError:                                # pragma: no cover - katalog przebiegu zniknal
+                proc.kill()
+        self._close_log()
+
+    def _close_log(self) -> None:
+        if self._log is not None:
+            try:
+                self._log.close()
+            finally:
+                self._log = None
+
     def progress(self) -> dict[str, Any] | None:
         if self.run_dir is None:
             return None
@@ -129,7 +167,10 @@ class TrainingJob:
 
     @property
     def exit_code(self) -> int | None:
-        return None if self.proc is None else self.proc.poll()
+        code = None if self.proc is None else self.proc.poll()
+        if code is not None:
+            self._close_log()                              # proces skonczyl - uchwyt logu juz niepotrzebny
+        return code
 
 
 # ------------------------------------------------------------ kalibracja
@@ -141,11 +182,44 @@ class _CameraSubset:
         return {n: img for n in self.names for img in [self.hub.frame(n)] if img is not None}
 
 
+#: Wlasciciele ramienia (`Twin.claim`) zadan w tle.
+CALIB_OWNER, SYSID_OWNER = "kalibracja", "identyfikacja"
+
+
+class _OwnedArm:
+    """Ramie dla sesji kalibracji: kazdy przejazd tylko, gdy fala WCIAZ ma ramie.
+
+    `Twin.move` bierze wolne ramie sam. Fala przerwana miedzy przejazdami (np.
+    "Polacz" przelaczylo sim na prawdziwe ramie w czasie zdjec) wziela wiec
+    NOWE ramie nastepnym `move` i jechala dalej na prawdziwym SO-101 - bez
+    potwierdzenia "karta w szczekach" i z chwytakiem zamykanym do 0. Panel
+    bierze ramie dla fali przed jej startem; tu sprawdzamy, ze wciaz je ma.
+    """
+
+    def __init__(self, twin, job: Job, owner: str = CALIB_OWNER):
+        self.twin, self.job, self.owner = twin, job, owner
+
+    def joints(self) -> dict[str, float]:
+        return self.twin.joints()
+
+    def move(self, joints, duration: float) -> None:
+        if self.twin.owner != self.owner:
+            reason = getattr(self.twin, "preempt_reason", "") or f"ramie ma: {self.twin.owner or 'nikt'}"
+            raise RuntimeError(f"fala przerwana - ramie odebrane ({reason})")
+        if self.job.cancel.is_set():
+            raise RuntimeError("fala przerwana")
+        self.twin.move(joints, duration, owner=self.owner)
+
+
 def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False) -> Any:
     """Fala kalibracyjna z karta w chwytaku, na blizniaku (sim albo prawdziwe ramie).
 
     W symulacji karta trafia do sceny w pozie przekrzywionej wzgledem nominalnej
     (jak wlozona reka); sesja zna tylko nominalna - dokladnie jak na biurku.
+
+    Ramie ma byc wziete dla fali (`twin.claim(CALIB_OWNER)`) przed startem. Na koniec
+    fala jedzie do domu TYLKO, jesli wciaz ma ramie: po STOP-ie albo ponownym
+    polaczeniu `home()` w `finally` ruszalo ramie, ktore juz do fali nie nalezalo.
     """
     from ..calib.card import perturb, pinch_point
     from ..calib.session import Session, WaveConfig
@@ -155,20 +229,24 @@ def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False
 
     ws = twin.workspace
     card = ws.card_obj()
+    # Bok taga i K, z ktorymi liczone jest dopasowanie - zapis wyniku bierze je stad,
+    # nie z pol panelu w chwili klikniecia "Zapisz".
+    job.data["tag_size"] = float(card.tag_size)
     nominal = card.nominal(pinch_point(RobotKinematics(ws.spec())))
     simulated = twin.status.simulated
     before = dict(twin.extras)                           # np. kostka polozona wczesniej - wroci po fali
-    if simulated:
-        truth = perturb(nominal, np.random.default_rng(int(time.time())))
-        twin.configure(**before, with_card=True, card_pose=truth)
-        job.data["card_truth"] = truth
-    job.message = "przygotowanie sprawdzacza kolizji"
-    checker = CollisionChecker(sc.build(ws.scene_config(with_card=True, card_pose=nominal, card_collider=0.012)))
-    intr = {n: ws.camera(n).intrinsics() for n in cameras}
-    cfg = WaveConfig(min_obs=10, min_poses=6, max_poses=36) if quick else WaveConfig()
-    session = Session(twin, _CameraSubset(twin.cameras, cameras), intr, twin.scene.kin, card, nominal, checker, cfg,
-                      seed=int(time.time()) % 10_000)
     try:
+        if simulated:
+            truth = perturb(nominal, np.random.default_rng(int(time.time())))
+            twin.configure(**before, with_card=True, card_pose=truth)
+            job.data["card_truth"] = truth
+        job.message = "przygotowanie sprawdzacza kolizji"
+        checker = CollisionChecker(sc.build(ws.scene_config(with_card=True, card_pose=nominal, card_collider=0.012)))
+        intr = {n: ws.camera(n).intrinsics() for n in cameras}
+        job.data["intrinsics"] = intr
+        cfg = WaveConfig(min_obs=10, min_poses=6, max_poses=36) if quick else WaveConfig()
+        session = Session(_OwnedArm(twin, job), _CameraSubset(twin.cameras, cameras), intr, twin.scene.kin, card,
+                          nominal, checker, cfg, seed=int(time.time()) % 10_000)
         while not session.done:
             if job.cancel.is_set():
                 return None
@@ -181,18 +259,35 @@ def run_card_calibration(job: Job, twin, cameras: list[str], quick: bool = False
         job.message = "dopasowanie"
         return session.solve()
     finally:
-        twin.home()
+        if twin.owner == CALIB_OWNER:
+            try:
+                # Dom odbiera ramie wlascicielowi i wola jego `preempt` - u fali to
+                # `job.stop`, ktory oznaczylby udana fale jako przerwana. Wiec bez niego.
+                twin.claim(CALIB_OWNER, preempt=None)
+                twin.home()
+            finally:
+                twin.release(CALIB_OWNER)
         if simulated:
             twin.configure(**before)
 
 
-def run_intrinsics(job: Job, hub, camera: str, board, size: tuple[int, int], period: float = 0.25) -> Any:
-    """Zbiera kadry tablicy ChArUco z kamery, dopoki panel nie powie `stop`, potem liczy K."""
+def run_intrinsics(job: Job, hub, camera: str, board, size: tuple[int, int], period: float = 0.25,
+                   solve: threading.Event | None = None) -> Any:
+    """Zbiera kadry tablicy ChArUco z kamery, dopoki panel nie powie `solve`, potem liczy K.
+
+    `job.cancel` PRZERYWA bez liczenia (wynik None, zadanie "przerwane"). Wczesniej
+    "Przerwij" i "Oblicz i zapisz K" byly tym samym sygnalem: odrzucana sesja
+    (rozmazane kadry, zla tablica) nadpisywala dobre K i uniewazniala kalibracje polozenia.
+    Kamera, dla ktorej zbierano, jest w `job.data["camera"]` - wynik trafia do niej,
+    a nie do kamery wybranej w panelu w chwili konca.
+    """
     from ..calib.intrinsics import Collector
 
+    solve = solve if solve is not None else threading.Event()
+    job.data["camera"] = camera
     col = Collector(board, size)
     job.data["collector"] = col
-    while not job.cancel.is_set():
+    while not (job.cancel.is_set() or solve.is_set()):
         img = hub.frame(camera)
         if img is not None:
             ok, why = col.add(img)
@@ -201,17 +296,27 @@ def run_intrinsics(job: Job, hub, camera: str, board, size: tuple[int, int], per
             job.message = why
             job.progress = min(1.0, len(col.views) / 12)
         time.sleep(period)
-    job.cancel.clear()
+    if job.cancel.is_set():
+        job.message = "przerwane - K bez zmian"
+        return None
     job.message = "liczenie K"
     return col.solve()
 
 
 def run_sysid(job: Job, twin) -> Any:
+    """Identyfikacja dynamiki. Ramie wziete przez panel dla `SYSID_OWNER` wraca po nagraniu
+    (dopasowanie trwa minuty, ramienia nie potrzebuje), takze gdy nagranie padlo."""
     from ..rl.sysid import excitation, fit, record
 
     job.message = "ruch pobudzajacy (ramie sie rusza)"
     home = dict(twin.workspace.spec().home)
-    rec = record(twin, excitation(home), on_tick=lambda p: setattr(job, "progress", 0.4 * p))
+    try:
+        rec = record(twin, excitation(home), on_tick=lambda p: setattr(job, "progress", 0.4 * p),
+                     should_stop=job.cancel.is_set)
+    finally:
+        if twin.owner == SYSID_OWNER:
+            twin.set_engaged(False)
+            twin.release(SYSID_OWNER)
     job.data["recording"] = rec
     job.message = "dopasowanie symulacji do nagrania"
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from collections.abc import Callable
 
 import cv2
@@ -58,9 +59,25 @@ class _Live:
         self.stream = CameraStream(cfg)
         self.stream.open()
 
-    def rgb(self) -> np.ndarray | None:
+    def rgb_t(self) -> tuple[np.ndarray | None, float, str | None]:
+        """(kadr RGB, chwila jego wykonania, blad strumienia).
+
+        Watek `CameraStream` konczy sie po cichu, gdy `cap.read()` zawiedzie (na
+        Shadow: zerwane przekazanie USB), a `read()` dalej oddaje ostatnia klatke -
+        bez sprawdzenia bledu i wieku panel mial "kadr" zamrozony na zawsze.
+        """
+        err = self.stream.error
+        if err is None and not self.stream.is_running:
+            err = "watek kamery zatrzymany"
+        if err is not None:
+            return None, 0.0, err
         frame = self.stream.read()
-        return None if frame is None else cv2.cvtColor(frame.image, cv2.COLOR_BGR2RGB)
+        if frame is None:
+            return None, 0.0, None
+        return cv2.cvtColor(frame.image, cv2.COLOR_BGR2RGB), float(frame.timestamp), None
+
+    def rgb(self) -> np.ndarray | None:
+        return self.rgb_t()[0]
 
     def close(self) -> None:
         self.stream.close()
@@ -71,13 +88,21 @@ class CameraHub:
 
     `sim_render(nazwa)` podaje kadr kamery symulowanej ze sceny blizniaka;
     bez niego kamery o zrodle "sim" po prostu nie maja obrazu.
+
+    `frame_t` oddaje kadr razem z chwila jego wykonania (`time.monotonic`), a
+    `frame` nie oddaje kadru starszego niz `stale_after` [s]: zamrozona kamera
+    (strumien stanal, klatka ta sama) dawala fali kalibracyjnej i percepcji
+    kostki ten sam obraz jako nowy.
     """
 
-    def __init__(self, workspace: Workspace, sim_render: Callable[[str], np.ndarray] | None = None):
+    def __init__(self, workspace: Workspace, sim_render: Callable[[str], np.ndarray] | None = None,
+                 stale_after: float = 1.0):
         self.workspace = workspace
         self.sim_render = sim_render
+        self.stale_after = stale_after
         self._live: dict[str, _Live] = {}
         self._errors: dict[str, str] = {}
+        self._stream_errors: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def sync(self) -> None:
@@ -87,9 +112,15 @@ class CameraHub:
             for name in list(self._live):
                 if name not in wanted:
                     self._live.pop(name).close()
+                    self._stream_errors.pop(name, None)
             for name, rec in wanted.items():
-                if name in self._live:
-                    continue
+                live = self._live.get(name)
+                if live is not None:
+                    if live.stream.error is None and live.stream.is_running:
+                        continue
+                    live.close()                          # strumien padl - sync otwiera go od nowa
+                    self._live.pop(name)
+                    self._stream_errors.pop(name, None)
                 try:
                     self._live[name] = _Live(rec)
                     self._errors.pop(name, None)
@@ -98,16 +129,39 @@ class CameraHub:
                     logger.warning("Kamera %s (%s) nie otworzyla sie: %s", name, rec.source, exc)
 
     def error(self, name: str) -> str | None:
-        return self._errors.get(name)
+        """Blad otwarcia kamery albo jej strumienia (zerwany, zamrozony)."""
+        return self._errors.get(name) or self._stream_errors.get(name)
 
-    def frame(self, name: str) -> np.ndarray | None:
-        """Najnowszy kadr RGB albo None."""
+    def frame_t(self, name: str) -> tuple[np.ndarray | None, float]:
+        """(najnowszy kadr RGB albo None, chwila jego wykonania wg `time.monotonic`; 0.0 = nie wiadomo).
+
+        Kamera symulowana renderuje stan sceny z tej chwili - jej kadr jest zawsze swiezy.
+        """
         rec = self.workspace.camera(name)
         if rec.source == "sim":
-            return self.sim_render(name) if self.sim_render and rec.true_pose() is not None else None
+            if not (self.sim_render and rec.true_pose() is not None):
+                return None, 0.0
+            t = time.monotonic()
+            return self.sim_render(name), t
         with self._lock:
             live = self._live.get(name)
-        return live.rgb() if live else None
+        if live is None:
+            return None, 0.0
+        img, t, err = live.rgb_t()
+        if err is not None:
+            self._stream_errors[name] = f"strumien przerwany: {err}"
+        elif img is not None and self.stale_after and time.monotonic() - t > self.stale_after:
+            self._stream_errors[name] = f"brak nowych klatek od {time.monotonic() - t:.1f} s"
+        else:
+            self._stream_errors.pop(name, None)
+        return img, t
+
+    def frame(self, name: str) -> np.ndarray | None:
+        """Najnowszy kadr RGB albo None - takze wtedy, gdy jest starszy niz `stale_after`."""
+        img, t = self.frame_t(name)
+        if img is not None and self.stale_after and t and time.monotonic() - t > self.stale_after:
+            return None
+        return img
 
     def grab(self) -> dict[str, np.ndarray]:
         out = {}

@@ -80,6 +80,20 @@ class CameraRecord:
         dist = None if self.dist is None else np.asarray(self.dist, float)
         return K, dist
 
+    def intrinsics_problem(self) -> str:
+        """Dlaczego K tej kamery nie wystarcza do ZAUFANEJ pozy ("" = wystarcza).
+
+        Symulowana zna swoje prawdziwe K. Prawdziwa - tylko z zaufanej sesji ChArUco.
+        """
+        if self.simulated:
+            return ""
+        if self.intrinsics_from != "szachownica" or self.K is None:
+            return "intrynsyki nominalne - najpierw krok 1 (tablica ChArUco)"
+        if not self.intrinsics_info.get("trusted", False):
+            why = self.intrinsics_info.get("reason", "")
+            return "intrynsyki z niezaufanej sesji ChArUco" + (f" ({why})" if why else "") + " - powtorz krok 1"
+        return ""
+
     def view(self) -> CameraView | None:
         """Kamera jako czesc sceny - tylko, gdy wiadomo, gdzie stoi.
 
@@ -155,24 +169,45 @@ class Workspace:
             setattr(cfg, key, value)
         return cfg
 
-    def apply_fit(self, fit) -> list[str]:
+    def apply_fit(self, fit, tag_size: float | None = None,
+                  intrinsics: dict[str, tuple[Any, Any]] | None = None) -> list[str]:
         """Wpisuje wynik kalibracji do kamer. Zwraca nazwy kamer, ktore dostaly poze.
 
         Poza jest zapisywana takze dla kamery niezaufanej - z powodem obok -
         bo lepiej widziec w UI, jak bardzo sie rozjechala, niz nie widziec nic.
+
+        `tag_size` - bok taga, z ktorym LICZONO dopasowanie (fala czyta go na
+        starcie); bez niego wpisywany byl bok z pola w panelu w chwili zapisu,
+        a ten mogl juz byc inny niz ten, z ktorym policzono poze.
+        `intrinsics` - {kamera: (K, dist)}, z ktorymi liczono; trafiaja do
+        `calibration`, zeby pozniejsza zmiana K byla widoczna jako niezgodnosc.
+
+        Prawdziwa kamera jest zaufana TYLKO z K z szachownicy, ktora sama byla
+        zaufana. Z nominalnym K (65 st. pola widzenia) albo z niezaufanej
+        sesji ChArUco poza wychodzi pewna siebie i przesunieta: zmierzone
+        w `calib.simulate` z K o 10% za duzym - residuum 0,90 px (przechodzi
+        prog), a kamera 72,7 mm od prawdziwego miejsca.
         """
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        size = float(tag_size) if tag_size is not None else float(self.card_obj().tag_size)
         updated = []
         for name, cam_fit in fit.cameras.items():
             try:
                 rec = self.camera(name)
             except KeyError:
                 continue
+            trusted, reason = bool(cam_fit.trusted), cam_fit.reason
+            k_problem = rec.intrinsics_problem()
+            if trusted and k_problem:
+                trusted, reason = False, k_problem
             rec.T_cam2base = np.asarray(cam_fit.T_cam2base, float).tolist()
             rec.calibration = dict(rms_px=float(cam_fit.rms_px), max_px=float(cam_fit.max_px),
                                    n_obs=int(cam_fit.n_obs), spread_deg=float(cam_fit.spread_deg),
-                                   trusted=bool(cam_fit.trusted), reason=cam_fit.reason, time=now,
-                                   tag_size=float(self.card_obj().tag_size))
+                                   trusted=trusted, reason=reason, time=now, tag_size=size)
+            if intrinsics and name in intrinsics:
+                K, dist = intrinsics[name]
+                rec.calibration["K"] = np.asarray(K, float).tolist()
+                rec.calibration["dist"] = None if dist is None else np.asarray(dist, float).ravel().tolist()
             updated.append(name)
         return updated
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -37,9 +38,24 @@ from ..runtime import Twin
 from ..workspace import CameraRecord, Workspace, nominal_K
 from . import jobs
 from .bridge import SceneMirror, mat_to_wxyz
-from .watch import CameraWatch, arm_mask
+from .watch import CameraWatch, arm_mask, distort_mask
 
 logger = logging.getLogger(__name__)
+
+#: Wlasciciel ramienia (`Twin.claim`), gdy steruje panel: suwaki i uchwyt TCP ze sprzeglem.
+PANEL_OWNER = "panel"
+POLICY_OWNER = "polityka"
+#: Najwiekszy skok stawu [st.] miedzy kolejnymi rozwiazaniami IK uchwytu TCP. Zmierzone:
+#: przeciagniecie uchwytu o 1-2 cm z shoulder_pan ~108 st. dawalo "poprawne" IK na
+#: drugiej galezi - 178-180 st. zmiany, cale ramie przez stol w ~1,3 s.
+GIZMO_MAX_STEP_DEG = 15.0
+#: Po takiej przerwie w przeciaganiu uchwyt TCP wraca na koncowke (Dom, polityka,
+#: suwaki, przebudowa - uchwyt nie moze zostac w starym miejscu jako "cel").
+GIZMO_IDLE_S = 0.5
+#: Kadr starszy niz tyle [s] nie jest kadrem "na zywo" (zamrozony strumien).
+FRAME_MAX_AGE = 1.0
+#: Detekcja kostki starsza niz tyle [s] nie trafia do polityki jako nowa.
+CUBE_MAX_AGE = 0.5
 
 
 def _skip_unchanged_markdown() -> None:
@@ -85,6 +101,17 @@ def thumb(img: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(img, (width, max(1, int(h * width / w))), interpolation=cv2.INTER_AREA)
 
 
+def _px(shift: float) -> str:
+    """Przesuniecie kadru z `CameraWatch` do tabeli; nieskonczone = kadr nie pasuje do odniesienia."""
+    return f"{shift:.1f} px" if np.isfinite(shift) else "kadr nie pasuje do odniesienia"
+
+
+def no_frame_image(text: str = "brak kadru", size: tuple[int, int] = (320, 240)) -> np.ndarray:
+    img = np.zeros((size[1], size[0], 3), np.uint8)
+    cv2.putText(img, text, (20, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (230, 60, 60), 2, cv2.LINE_AA)
+    return img
+
+
 class TwinApp:
     def __init__(self, workspace: str | Path | None = None, host: str = "0.0.0.0", port: int = 8080):
         self.ws = Workspace.load(workspace)
@@ -92,6 +119,9 @@ class TwinApp:
         self.twin = Twin(self.ws)
         self.watch = CameraWatch()
         self.frames: dict[str, np.ndarray] = {}
+        #: Chwila wykonania kazdego kadru z `frames` (time.monotonic) - wiek detekcji kostki.
+        self.frame_times: dict[str, float] = {}
+        self._t_grab = 0.0
         self.frame_lock = threading.Lock()
         self.calib_job, self.intr_job = jobs.Job("kalibracja"), jobs.Job("intrynsyki")
         self.sysid_job, self.eval_job = jobs.Job("identyfikacja"), jobs.Job("ewaluacja")
@@ -103,8 +133,24 @@ class TwinApp:
         self.cube_det = CubeDetector()
         self.cube_tracker = CubeTracker()
         self.last_cube = None
+        #: Chwila kadrow ostatniej detekcji podanej polityce - ta sama detekcja nie idzie drugi raz.
+        self._cube_used_t = 0.0
         from ..kinematics import RobotKinematics
         self._kin_vision = RobotKinematics(self.ws.spec())
+        # Uchwyt TCP: wlasna kinematyka (callbacki visera ida z wielu watkow naraz,
+        # a `ik` pisze do swojego MjData) i ostatnie przyjete rozwiazanie jako start IK.
+        self._kin_gizmo = RobotKinematics(self.ws.spec())
+        self._gizmo_lock = threading.Lock()
+        self._gizmo_seed: dict[str, float] | None = None
+        self._gizmo_t = 0.0
+        self._engage_t = 0.0
+        #: (t, katy) z ostatnich ~3 s - maska ramienia w pozie z chwili kadru, nie renderu.
+        self._joint_hist: deque[tuple[float, dict[str, float]]] = deque(maxlen=120)
+        self._goal_base: np.ndarray | None = None
+        self._reach_task = None                         # obszar celow reach bez uruchomionej polityki
+        self._map_pose_key = None
+        self._intr_solve = threading.Event()
+        self._dirty_rebuild = 0.0                       # kamera spoza modelu przeciagana - przebudowa po chwili
         self.mapper: TableMapper | None = None
         self._mapper_key = None
         self._stop = threading.Event()
@@ -152,14 +198,18 @@ class TwinApp:
             self._build_simreal()
 
         # Oswietlenie widoku (nie symulacji): rozproszone z nieba (+z) i jedno kierunkowe z gory.
+        # three.js bierze kierunek swiatla polkuli z POLOZENIA swiatla (obrot nic nie zmienia):
+        # polozenie (0, 0, 1) = niebo w +z. Obrot przy polozeniu (0, 0, 0) dawal zerowy
+        # kierunek i plaskie pol na pol nieba i ziemi na kazdej powierzchni.
         s.scene.add_light_ambient("/swiatlo/otoczenie", intensity=0.5)
         s.scene.add_light_hemisphere("/swiatlo/niebo", sky_color=(235, 240, 255), ground_color=(70, 65, 60),
-                                     intensity=1.6, wxyz=(np.cos(np.pi / 4), np.sin(np.pi / 4), 0.0, 0.0))
+                                     intensity=1.6, position=(0.0, 0.0, 1.0))
         s.scene.add_light_directional("/swiatlo/gora", intensity=1.4, position=(0.6, -0.8, 2.5), cast_shadow=True)
         self.base_frame = s.scene.add_frame("/podstawa", axes_length=0.08, axes_radius=0.003,
                                             position=T[:3, 3], wxyz=mat_to_wxyz(T[:3, :3]))
-        self.mirror = SceneMirror(s, self.twin.scene.model)
-        self._mirror_version = self.twin.version
+        self.mirror = None
+        self._mirror_version = -1
+        self._sync_mirror()
         self.twin.cameras.sync()
         self._refresh_cameras()
         logger.info("Panel gotowy w %.1f s", time.monotonic() - t_start)
@@ -207,19 +257,91 @@ class TwinApp:
                             hint="Zatrzymanie awaryjne: ramie staje, polityka i fala sie koncza")
 
         @stop.on_click
-        def _(event):
+        async def _(event):
+            # Asynchronicznie, w petli zdarzen visera, a sama robota od razu w nowym watku:
+            # zwykly callback czekal w tej samej puli 32 watkow co reszta panelu - za
+            # przebudowami sceny z przeciagania kamery STOP potrafil ruszyc po kilkudziesieciu s.
+            threading.Thread(target=self._emergency_stop, args=(event,), name="STOP", daemon=True).start()
+
+    def _emergency_stop(self, event=None) -> None:
+        """STOP: najpierw nadzor (ramie staje w zmierzonej pozie), dopiero potem sprzatanie watkow."""
+        try:
+            self.twin.estop("STOP z panelu")
+        finally:
             if self.runner is not None:
                 self.runner.stop("STOP z panelu")
             self.calib_job.stop()
             self.sysid_job.stop()
-            self.twin.estop()
             self.arm_engage.value = False
-            self._notify(event, "STOP", "Ramie zatrzymane. Skasuj STOP w zakladce Ramie, zeby ruszyc dalej.",
-                         error=True)
+            self._gizmo_seed = None
+        self._notify(event, "STOP", "Ramie zatrzymane. Skasuj STOP w zakladce Ramie, zeby ruszyc dalej.", error=True)
+
+    # ------------------------------------------------ kto steruje ramieniem
+    def _busy(self, me: str) -> str:
+        """Kto INNY teraz rusza ramieniem ("" = nikt). Panel (sprzeglo) oddaje ramie sam - nie blokuje.
+
+        Zadania patrzymy obok `Twin.owner`: fala bierze ramie dopiero przy pierwszym
+        przejezdzie, a do tego czasu (przebudowa sceny, sprawdzacz kolizji) jest juz w toku.
+        """
+        if me != jobs.CALIB_OWNER and self.calib_job.running:
+            return "fala kalibracyjna"
+        if me != jobs.SYSID_OWNER and self.sysid_job.running and "recording" not in self.sysid_job.data:
+            return "identyfikacja dynamiki"
+        if me != POLICY_OWNER and self.runner is not None and self.runner.status.running:
+            return "polityka"
+        owner = self.twin.owner
+        if owner is not None and owner not in (PANEL_OWNER, me):
+            return owner
+        return ""
+
+    def _release_panel(self) -> None:
+        """Panel puszcza ramie (sprzeglo off) - tylko jesli wciaz je ma."""
+        self.arm_engage.value = False
+        self._gizmo_seed = None
+        if self.twin.owner == PANEL_OWNER:
+            self.twin.set_engaged(False)
+            self.twin.release(PANEL_OWNER)
+
+    def _take_arm(self, owner: str, preempt=None) -> None:
+        """Ramie dla zadania `owner` - albo RuntimeError z tym, kto je ma. Panel oddaje je bez pytania."""
+        busy = self._busy(owner)
+        if busy:
+            raise RuntimeError(f"ramie zajete: {busy} - najpierw je zatrzymaj (albo STOP)")
+        self._release_panel()
+        self.twin.claim(owner, preempt=preempt)
+
+    def _panel_preempted(self) -> None:
+        """Twin odebral ramie panelowi (Dom, STOP, polaczenie, petla padla) - sprzeglo w panelu off."""
+        self.arm_engage.value = False
+        self._gizmo_seed = None
+
+    def _stop_motion(self, reason: str, wait: float = 3.0) -> None:
+        """Konczy wszystko, co rusza ramieniem, i czeka na zadania - przed (roz)laczeniem.
+
+        Bez tego fala albo identyfikacja z sim jechala dalej na swiezo polaczonym
+        prawdziwym ramieniu (odtworzone: shoulder_pan 14,8 -> 40 -> -39 -> 33 st.
+        bez zadnej akcji operatora), z pominieciem potwierdzen z ich startu.
+        """
+        if self.runner is not None:
+            self.runner.stop(reason)
+        self.calib_job.stop()
+        self.sysid_job.stop()
+        self.twin.preempt(reason)
+        for job in (self.calib_job, self.sysid_job):
+            if job.running and "recording" not in job.data and not job.wait(wait):
+                logger.warning("Zadanie %s nie skonczylo sie w %.0f s (%s)", job.name, wait, reason)
+        self._release_panel()
+
+    def _reset_confirmations(self) -> None:
+        """Kazdy przejazd prawdziwego ramienia wymaga swiezego potwierdzenia (karta, wolne miejsce)."""
+        for box in (self.calib_confirm, self.dyn_confirm, self.pol_confirm):
+            box.value = False
 
     def _status_text(self) -> str:
         st = self.twin.status
-        arm = (f"{st.backend} - {st.state} - {st.loop_hz:.0f} Hz" if st.connected
+        arm = (f"{st.backend} - {st.state} - {st.loop_hz:.0f} Hz" + (f", steruje: **{self.twin.owner}**"
+                                                                      if self.twin.owner else "")
+               + (f" - **{st.error}**" if st.error else "") if st.connected
                else ("rozlaczone" + (f" ({st.error})" if st.error else "")))
         cams = [c for c in self.ws.cameras if c.enabled]
         trusted = sum(1 for c in cams if c.trusted)
@@ -270,18 +392,14 @@ class TwinApp:
         @connect.on_click
         @self._safe
         def _(event):
-            if self.runner is not None:
-                self.runner.stop("ponowne laczenie")
-            port = self.arm_port.value.strip() or None
-            self.twin.connect(self.arm_backend.value, port, go_home=self.arm_home_on_connect.value)
-            self._save()
+            self._connect(self.arm_backend.value, self.arm_port.value.strip() or None, self.arm_home_on_connect.value)
             self._notify(event, "Polaczono", f"{self.twin.status.backend}: {self.twin.status.state}")
 
         @disconnect.on_click
         @self._safe
         def _(event):
-            if self.runner is not None:
-                self.runner.stop("rozlaczenie")
+            self._stop_motion("rozlaczenie")
+            self._reset_confirmations()
             self.twin.disconnect()
 
         with g.add_folder("Sterowanie"):
@@ -291,6 +409,7 @@ class TwinApp:
             clear = g.add_button("Skasuj STOP", icon=viser.Icon.RESTORE)
             self.tcp_gizmo_on = g.add_checkbox("Uchwyt koncowki w 3D", False,
                                                hint="Przeciagnij koncowke; katy liczy odwrotna kinematyka")
+            self.tcp_md = g.add_markdown("")
             spec = self.ws.spec()
             kin = self.twin.scene.kin
             self.sliders = {}
@@ -309,26 +428,70 @@ class TwinApp:
                 def on_slide(event, name=name):
                     if event.client is None or not self.arm_engage.value:
                         return                          # zmiana z petli (sprzezenie zwrotne) albo bez sprzegla
-                    self.twin.set_target({name: float(self.sliders[name].value)})
+                    self._gizmo_seed = None             # cel zmienil sie obok uchwytu TCP
+                    try:
+                        self.twin.set_target({name: float(self.sliders[name].value)}, owner=PANEL_OWNER)
+                    except RuntimeError:                # ramie odebrane panelowi w miedzyczasie
+                        self.arm_engage.value = False
                 s.on_update(on_slide)
 
         @self.arm_engage.on_update
         def _(event):
-            if event.client is not None:
-                if self.arm_engage.value and not self.twin.connected:
-                    self.arm_engage.value = False
-                    self._notify(event, "Brak ramienia", "Najpierw polacz ramie (np. sim).", error=True)
-                    return
-                self.twin.set_engaged(self.arm_engage.value)
+            self._on_engage(event)
 
         @home.on_click
+        @self._safe
         def _(event):
-            self.twin.home()
+            self.twin.home()                            # odbiera ramie kazdemu (panel, polityka, fala)
+            self._gizmo_seed = None
 
         @clear.on_click
         def _(event):
             self.twin.clear_estop()
 
+        self._build_table()
+
+    def _connect(self, backend: str, port: str | None, go_home: bool = False, **kw) -> None:
+        """Polacz: najpierw koniec wszystkiego, co jezdzi, i nowe potwierdzenia (moze to byc inne ramie)."""
+        self._stop_motion("ponowne laczenie")
+        self._reset_confirmations()
+        self.twin.connect(backend, port, go_home=go_home, **kw)
+        self._save()
+
+    def _on_engage(self, event) -> None:
+        """Sprzeglo z panelu (tylko zmiany od uzytkownika - te z petli maja `client` None)."""
+        if event.client is None:
+            return                                      # zmiana z petli / z kodu panelu
+        self._engage_t = time.monotonic()
+        if not self.arm_engage.value:
+            self._release_panel()
+            return
+        if not self.twin.connected:
+            self.arm_engage.value = False
+            self._notify(event, "Brak ramienia", "Najpierw polacz ramie (np. sim).", error=True)
+            return
+        # Sprzeglo = panel bierze ramie na wlasnosc. Gdy jedzie fala, identyfikacja albo
+        # polityka - odmowa z powodem; wczesniej suwaki pisaly cel na zmiane z nimi.
+        try:
+            busy = self._busy(PANEL_OWNER)
+            if busy:
+                raise RuntimeError(f"ramie zajete: {busy}")
+            self.twin.claim(PANEL_OWNER, preempt=self._panel_preempted)
+        except RuntimeError as exc:
+            self.arm_engage.value = False
+            self._notify(event, "Sprzeglo", f"{exc} - zatrzymaj je najpierw.", error=True)
+            return
+        self._gizmo_seed = None
+        self._gizmo_t = 0.0                         # uchwyt TCP od razu na koncowce
+        self.twin.set_engaged(True)
+        if self.twin.owner != PANEL_OWNER:          # odebrane (STOP, Dom) miedzy claim a sprzeglem
+            if self.twin.owner is None:
+                self.twin.set_engaged(False)
+            self.arm_engage.value = False
+
+    def _build_table(self) -> None:
+        """Stol i uchwyt TCP w 3D."""
+        g = self.server.gui
         with g.add_folder("Stanowisko (stol)", expand_by_default=False):
             t = self.ws.table_obj()
             g.add_markdown("Blat i to, gdzie na nim stoi podstawa - zmierz na biurku. Kamery sa "
@@ -353,6 +516,8 @@ class TwinApp:
             T_new = self.twin.scene.T_base2world
             self.base_frame.position, self.base_frame.wxyz = T_new[:3, 3], mat_to_wxyz(T_new[:3, :3])
             self._refresh_cameras()
+            if self._goal_base is not None:           # cel reach jest w ukladzie podstawy - kula za nia
+                self._set_goal(self._goal_base)
             self._notify(event, "Stanowisko", "Stol zapisany, scena przebudowana.")
 
         self.tcp_gizmo = self.server.scene.add_transform_controls("/uchwyt_tcp", scale=0.12, disable_rotations=True,
@@ -361,33 +526,73 @@ class TwinApp:
         @self.tcp_gizmo_on.on_update
         def _(event):
             self.tcp_gizmo.visible = self.tcp_gizmo_on.value
+            self._gizmo_seed, self._gizmo_t = None, 0.0
 
         @self.tcp_gizmo.on_update
         def _(event):
-            if not (self.arm_engage.value and self.tcp_gizmo_on.value and self.twin.connected):
+            self._on_tcp_gizmo()
+
+    def _on_tcp_gizmo(self) -> None:
+        """Przeciagniety uchwyt TCP -> cel stawow, tylko na tej samej galezi IK co ramie teraz.
+
+        IK startuje WYLACZNIE z ostatniego przyjetego rozwiazania (albo z rozkazu, gdy
+        przeciaganie sie zaczyna) i bez losowych startow; rozwiazanie dalej niz
+        `GIZMO_MAX_STEP_DEG` od startu jest odrzucane - to druga galaz, nie ruch o 1 cm.
+        """
+        if not (self.arm_engage.value and self.tcp_gizmo_on.value and self.twin.connected
+                and self.twin.owner == PANEL_OWNER):
+            return
+        p_base = (inverse(self.T_b2w) @ np.r_[self.tcp_gizmo.position, 1.0])[:3]
+        gripper = self.ws.spec().gripper
+        with self._gizmo_lock:
+            self._gizmo_t = time.monotonic()
+            cmd = {k: float(v) for k, v in (self.twin.status.command or self.twin.joints()).items()}
+            seed = dict(self._gizmo_seed) if self._gizmo_seed is not None else cmd
+            # restarts=0: `ik` probuje wtedy start z `seed` i z pozycji domowej - ta druga
+            # wygrywa tylko, gdy start z `seed` nie trafil, i wtedy odrzuca ja limit skoku.
+            sol = self._kin_gizmo.ik(p_base, seed=seed, restarts=0)
+            if not sol.ok:
+                self.tcp_md.content = "uchwyt poza zasiegiem ramienia - cel bez zmian"
                 return
-            p_base = (inverse(self.T_b2w) @ np.r_[self.tcp_gizmo.position, 1.0])[:3]
-            with self.twin.lock:
-                seed = self.twin.scene.joints()
-            sol = self.twin.scene.kin.ik(p_base, seed=seed, restarts=2)
-            if sol.ok:
-                self.twin.set_target({k: v for k, v in sol.joints.items() if k != self.ws.spec().gripper})
+            arm = {k: float(v) for k, v in sol.joints.items() if k != gripper}
+            jump = max((abs(v - float(seed.get(k, v))) for k, v in arm.items()), default=0.0)
+            if jump > GIZMO_MAX_STEP_DEG:
+                self.tcp_md.content = (f"odrzucone: IK chcialo skoku {jump:.0f} st. (inna galaz) - "
+                                       f"przeciagaj mniejszymi krokami")
+                return
+            self._gizmo_seed = {**seed, **arm}
+        self.tcp_md.content = ""
+        try:
+            self.twin.set_target(arm, owner=PANEL_OWNER)
+        except RuntimeError:                            # ramie odebrane panelowi w miedzyczasie
+            self.arm_engage.value = False
 
     def _tick_arm(self) -> None:
         st = self.twin.status
         joints = st.measured if st.connected and st.measured else self.twin.joints()
+        owner = self.twin.owner
+        if self.arm_engage.value and owner != PANEL_OWNER and time.monotonic() - self._engage_t > 0.5:
+            # Ramie odebrane panelowi (STOP, Dom, polaczenie, petla padla) albo wziete przez zadanie.
+            self.arm_engage.value = False
+            self._gizmo_seed = None
+        other = owner is not None and owner != PANEL_OWNER
+        if self.arm_engage.disabled != other:
+            self.arm_engage.disabled = other
         if not self.arm_engage.value:
             for name, s in self.sliders.items():
                 if name in joints:
                     s.value = round(float(np.clip(joints[name], *self.slider_range[name])), 1)
-        if self.tcp_gizmo_on.value and not self.arm_engage.value:
+        driving = (self.arm_engage.value and owner == PANEL_OWNER
+                   and time.monotonic() - self._gizmo_t < GIZMO_IDLE_S)
+        if self.tcp_gizmo_on.value and not driving:
+            # Uchwyt wraca na koncowke, gdy nikt go nie ciagnie: po Domu, przebudowie, polityce
+            # czy suwakach nastepne male przesuniecie celowalo w STARE miejsce koncowki.
             with self.twin.lock:
                 d, site = self.twin.scene.data, self.twin.scene.kin.site_id
                 p = d.site_xpos[site].copy()
             if np.abs(np.asarray(self.tcp_gizmo.position) - p).max() > 1e-4:
                 self.tcp_gizmo.position = p
-        if self.arm_engage.value and not st.engaged and st.connected and st.state == "ESTOP":
-            self.arm_engage.value = False
+            self._gizmo_seed = None
 
     # ================================================================= kamery
     def _build_cameras(self) -> None:
@@ -440,7 +645,7 @@ class TwinApp:
         @self.cam_gizmo.on_update
         def _(event):
             rec = self._cam()
-            if rec is None or not rec.simulated or not self.cam_move.value:
+            if rec is None or not rec.simulated or not rec.enabled or not self.cam_move.value:
                 return
             T_w = pose(wxyz_to_mat(self.cam_gizmo.wxyz), np.asarray(self.cam_gizmo.position))
             self._place_sim_camera(rec, T_w, rebuild=False)
@@ -563,7 +768,10 @@ class TwinApp:
             try:
                 self.twin.render_with(move)
             except KeyError:
-                self.twin.rebuild()
+                # Kamery nie ma w skompilowanym modelu: przebudowa RAZ, gdy przeciaganie ucichnie
+                # (petla panelu). Przebudowa w kazdym zdarzeniu myszy (~250 ms, 60 zdarzen/s)
+                # zapychala pule watkow visera - STOP czekal za nimi dziesiatki sekund.
+                self._dirty_rebuild = time.monotonic()
             self._dirty_save = time.monotonic()
         self._update_frustum(rec)
 
@@ -577,12 +785,66 @@ class TwinApp:
         img = self.twin.cameras.frame(name)
         if img is None:
             raise RuntimeError(f"{name}: brak kadru")
-        mask = None
-        try:
-            mask = self.twin.render_with(lambda s: arm_mask(s, name))
-        except KeyError:
-            pass
+        mask = (self._arm_masks([name]) or {}).get(name)
         self.watch.remember(name, img, mask)
+
+    # ------------------------------------------------------ maska ramienia
+    def _joints_at(self, t: float | None) -> dict[str, float] | None:
+        """Katy ramienia z chwili `t` (historia z petli panelu); None = brak historii / teraz."""
+        if t is None or not self._joint_hist:
+            return None
+        hist = list(self._joint_hist)
+        if t - hist[-1][0] > 0.3:
+            return None                                     # historia urwana (rozlaczone) - poza z teraz
+        before = [j for (ti, j) in hist if ti <= t]
+        return before[-1] if before else hist[0][1]
+
+    def _arm_speed_deg(self, t: float, window: tuple[float, float] = (-0.15, 0.25)) -> float:
+        """Najwiekszy ruch stawu ramienia [st.] w oknie wokol `t` - niepewnosc chwili kadru."""
+        near = [j for (ti, j) in list(self._joint_hist) if t + window[0] <= ti <= t + window[1]]
+        if len(near) < 2:
+            return 0.0
+        arm = [n for n in self.ws.spec().joints if n != self.ws.spec().gripper]
+        a = np.array([[j.get(n, 0.0) for n in arm] for j in near])
+        return float((a.max(axis=0) - a.min(axis=0)).max())
+
+    def _arm_masks(self, names: list[str], t: float | None = None, dilate: int = 9) -> dict[str, np.ndarray] | None:
+        """Maski ramienia (piksele zasloniete) w geometrii SUROWYCH kadrow kamer `names`.
+
+        Render blizniaka to kamera otworkowa w pozie z chwili renderu, a kadr jest
+        z dystorsja i sprzed 0-200 ms (plus opoznienie kamery). Dlatego: poza ramienia
+        z chwili kadru `t` (historia katow), maska przepuszczona przez dystorsje kamery
+        i poszerzona o to, ile ramie moglo przejechac w niepewnosci chwili kadru -
+        ~10 cm/s przy kostce to 1-3 cm, dziesiatki px.
+        """
+        names = [n for n in names if n in {c.name for c in self.ws.cameras}]
+        if not names:
+            return None
+        joints = self._joints_at(t)
+        extra = {}
+        if t is not None:
+            speed = np.radians(self._arm_speed_deg(t))
+            for n in names:
+                K, _ = self.ws.camera(n).intrinsics()
+                # ramie ~0,35 m od osi obrotu, kamera ~0,6 m od niego - przesuniecie w px
+                extra[n] = int(min(40.0, K[0, 0] * 0.35 * speed / 0.6))
+
+        def render(s):
+            if joints:
+                s.set_joints(joints)                        # kopia stanu do renderu - scena bez zmian
+            return {n: arm_mask(s, n, dilate=dilate + extra.get(n, 0)) for n in names}
+        try:
+            masks = self.twin.render_with(render)
+        except KeyError:                                    # kamery nie ma w modelu (wylaczona, bez pozy)
+            return None
+        out = {}
+        for n, m in masks.items():
+            rec = self.ws.camera(n)
+            if not rec.simulated:
+                K, dist = rec.intrinsics()
+                m = distort_mask(m, K, dist)
+            out[n] = m
+        return out
 
     def _refresh_cameras(self, select: str | None = None) -> None:
         names = tuple(c.name for c in self.ws.cameras) or ("-",)
@@ -600,7 +862,7 @@ class TwinApp:
             else:
                 cal = f"niezaufana: {c.calibration.get('reason', '')}"
             sh = self.watch.shift.get(c.name)
-            moved = "-" if sh is None else (f"**TAK {sh:.1f} px**" if self.watch.moved(c.name) else f"nie ({sh:.1f} px)")
+            moved = "-" if sh is None else (f"**TAK {_px(sh)}**" if self.watch.moved(c.name) else f"nie ({_px(sh)})")
             rows.append(f"| {c.name}{'' if c.enabled else ' (wyl.)'} | {c.source} | {c.intrinsics_from} | {cal} | {moved} |")
         self.cams_md.content = "\n".join(rows) if self.ws.cameras else \
             "Brak kamer. Dodaj kamere USB albo symulowana (ponizej)."
@@ -681,7 +943,8 @@ class TwinApp:
             lines.append(f"blad kamery: {err}")
         self.cam_info.content = "  \n".join(lines)
         T = rec.true_pose()
-        show = rec.simulated and self.cam_move.value and T is not None
+        # Wylaczonej kamery nie ma w scenie - uchwyt przy niej przebudowywal scene co ruch myszy.
+        show = rec.simulated and rec.enabled and self.cam_move.value and T is not None
         if show:
             Tw = self.T_b2w @ T
             self.cam_gizmo.position, self.cam_gizmo.wxyz = Tw[:3, 3], mat_to_wxyz(Tw[:3, :3])
@@ -737,8 +1000,10 @@ class TwinApp:
             name = self.intr_cam.value
             rec = self.ws.camera(name)
             board = Board(square=self.board_mm.value / 1000, marker=0.75 * self.board_mm.value / 1000)
+            solve_evt = threading.Event()
             self.intr_job.start(lambda job: jobs.run_intrinsics(job, self.twin.cameras, name, board,
-                                                                 (rec.width, rec.height)))
+                                                                 (rec.width, rec.height), solve=solve_evt))
+            self._intr_solve = solve_evt
             self.intr_img.visible = True
 
         @solve.on_click
@@ -746,7 +1011,7 @@ class TwinApp:
         def _(event):
             if not self.intr_job.running:
                 raise RuntimeError("najpierw zbieraj kadry")
-            self.intr_job.stop()
+            self._intr_solve.set()                      # "Przerwij" to osobny sygnal - bez liczenia K
 
         @wave.on_click
         @self._safe
@@ -764,26 +1029,39 @@ class TwinApp:
         def _(event):
             self.calib_job.stop()
             if self.intr_job.running:
-                self.intr_job.cancel.set()
+                self.intr_job.stop()                    # przerwanie: K zostaje, jakie bylo
 
         @apply.on_click
         @self._safe
         def _(event):
-            fit = self.calib_job.result
-            if fit is None:
-                raise RuntimeError("brak wyniku kalibracji")
-            self.ws.card["tag_size"] = self.tag_mm.value / 1000
-            names = self.ws.apply_fit(fit)
-            self._save()
-            self.twin.rebuild()
-            for n in names:
-                try:
-                    self._remember_reference(n)
-                except RuntimeError:
-                    pass
-            self._refresh_cameras()
-            self.calib_apply.visible = False
+            names = self._apply_calibration()
             self._notify(event, "Zapisano", f"Kalibracja kamer: {', '.join(names)}")
+
+    def _apply_calibration(self) -> list[str]:
+        """Zapis wyniku fali - z bokiem taga i K, z ktorymi ja liczono."""
+        fit = self.calib_job.result
+        if fit is None:
+            raise RuntimeError("brak wyniku kalibracji")
+        used = self.calib_job.data.get("tag_size")
+        if used is None:
+            raise RuntimeError("wynik bez boku taga - uruchom fale ponownie")
+        if abs(self.tag_mm.value / 1000 - used) > 1e-6:
+            # Poza policzona z innym bokiem taga jest przeskalowana (50,0 -> 49,2 mm: 1,6%
+            # translacji) - zapis z nowym bokiem ukrylby te niezgodnosc na zawsze.
+            raise RuntimeError(f"bok taga zmieniony od fali ({used * 1000:.1f} -> {self.tag_mm.value:.1f} mm) "
+                               f"- uruchom fale ponownie z nowym bokiem")
+        self.ws.card["tag_size"] = used
+        names = self.ws.apply_fit(fit, tag_size=used, intrinsics=self.calib_job.data.get("intrinsics"))
+        self._save()
+        self.twin.rebuild()
+        for n in names:
+            try:
+                self._remember_reference(n)
+            except RuntimeError:
+                pass
+        self._refresh_cameras()
+        self.calib_apply.visible = False
+        return names
 
     def _start_card_calibration(self, event, cameras: list[str], quick: bool) -> None:
         if not self.twin.connected:
@@ -792,12 +1070,20 @@ class TwinApp:
             raise RuntimeError("zadna wlaczona kamera nie daje kadru")
         if not self.twin.status.simulated and not self.calib_confirm.value:
             raise RuntimeError("potwierdz, ze karta jest w szczekach, a przestrzen nad stolem wolna")
+        if self.calib_job.running:
+            raise RuntimeError("fala juz trwa")
+        # Fala bierze ramie na wlasnosc PRZED startem: jedzie polityka albo identyfikacja -
+        # odmowa z powodem (wczesniej trzy watki pisaly cel na zmiane i ramie skakalo).
+        # Odebranie ramienia (Dom, STOP, polaczenie) przerywa fale przez `calib_job.stop`.
+        self._take_arm(jobs.CALIB_OWNER, preempt=self.calib_job.stop)
         self.ws.card["tag_size"] = self.tag_mm.value / 1000
-        if self.runner is not None:
-            self.runner.stop("kalibracja")
-        self.arm_engage.value = False
         self.calib_apply.visible = False
-        self.calib_job.start(lambda job: jobs.run_card_calibration(job, self.twin, cameras, quick))
+        try:
+            self.calib_job.start(lambda job: jobs.run_card_calibration(job, self.twin, cameras, quick))
+        except Exception:
+            self.twin.release(jobs.CALIB_OWNER)
+            raise
+        self.calib_confirm.value = False                # nastepna fala (np. relokalizacja) - nowe potwierdzenie
 
     def _tick_calibration(self) -> None:
         j = self.calib_job
@@ -818,7 +1104,9 @@ class TwinApp:
                     from ..calib.handeye import pose_error
                     dt, dr = pose_error(np.asarray(rec.sim_pose), c.T_cam2base)
                     extra = f" (wzgl. prawdy {dt * 1000:.2f} mm, {np.degrees(dr):.3f} st.)"
-                verdict = "zaufana" if c.trusted else f"NIE: {c.reason}"
+                k_problem = rec.intrinsics_problem() if rec is not None else ""
+                # Ten sam werdykt, ktory zapisze `Workspace.apply_fit` - bez zaufanego K poza nie jest zaufana.
+                verdict = f"NIE: {c.reason}" if not c.trusted else (f"NIE: {k_problem}" if k_problem else "zaufana")
                 rows.append(f"| {n} | {c.rms_px:.2f} px | {c.n_obs} | {c.spread_deg:.0f} st. | {verdict}{extra} |")
             self.calib_md.content = "\n".join(rows)
             self.calib_apply.visible = True
@@ -844,7 +1132,15 @@ class TwinApp:
                                         f"tablice; kadr zapisuje sie sam, gdy wnosi nowe ujecie.")
         elif ij.state == jobs.DONE and ij.result is not None and ij.data.get("saved") is not ij.result:
             res = ij.result
-            rec = self.ws.camera(self.intr_cam.value)
+            ij.data["saved"] = res
+            # Kamera, z ktorej ZBIERANO kadry - lista w panelu mogla sie w tym czasie zmienic
+            # (K kamery1 ladowalo w kamerze2 i odbieralo jej zaufanie do pozy).
+            name = ij.data.get("camera")
+            try:
+                rec = self.ws.camera(name)
+            except KeyError:
+                self.intr_md.content = f"**Kamery {name} juz nie ma** - K nie zapisane"
+                return
             rec.K, rec.dist = res.K.tolist(), res.dist.tolist()
             rec.intrinsics_from = "szachownica"
             rec.intrinsics_info = {"rms_px": res.rms_px, "n_views": res.n_views, "coverage": res.coverage,
@@ -856,13 +1152,15 @@ class TwinApp:
             self._save()
             self.twin.rebuild()
             self._refresh_cameras()
-            self.intr_md.content = (f"Zapisano K: fx {res.K[0, 0]:.1f}, fy {res.K[1, 1]:.1f}, cx {res.K[0, 2]:.1f}, "
-                                    f"cy {res.K[1, 2]:.1f}; residuum **{res.rms_px:.3f} px**, {res.n_views} kadrow"
-                                    + ("" if res.trusted else f" - uwaga: {res.reason}"))
-            ij.data["saved"] = res
+            self.intr_md.content = (f"Zapisano K ({name}): fx {res.K[0, 0]:.1f}, fy {res.K[1, 1]:.1f}, "
+                                    f"cx {res.K[0, 2]:.1f}, cy {res.K[1, 2]:.1f}; residuum **{res.rms_px:.3f} px**, "
+                                    f"{res.n_views} kadrow" + ("" if res.trusted else f" - uwaga: {res.reason}"))
         elif ij.state == jobs.FAILED and ij.data.get("saved") != "err":
             self.intr_md.content = f"**Blad**: {ij.error}"
             ij.data["saved"] = "err"
+        elif ij.state == jobs.CANCELLED and ij.data.get("saved") != "cancel":
+            self.intr_md.content = "Przerwano - intrynsyki kamery bez zmian."
+            ij.data["saved"] = "cancel"
 
     # ================================================================== mapa
     def _build_map(self) -> None:
@@ -885,6 +1183,21 @@ class TwinApp:
             lo, hi, lo2, hi2 = CUBE_COLORS[self.cube_color.value]
             self.cube_det.hsv_lo, self.cube_det.hsv_hi, self.cube_det.hsv_lo2, self.cube_det.hsv_hi2 = lo, hi, lo2, hi2
 
+        def vision_off(event):
+            # Bez mapy nie ma detekcji kostki - polityka z kostka "z kamer" jechalaby do
+            # ostatniego polozenia. Zatrzymujemy ja jawnie, zamiast czekac na `hold_s`.
+            if event.client is None or (self.map_on.value and self.cube_on.value):
+                return
+            if self._vision_policy_running():
+                self.runner.stop("mapa albo szukanie kostki wylaczone - kostka z kamer niedostepna")
+                self._notify(event, "Polityka zatrzymana", "Bez mapy i szukania kostki polityka nie wie, gdzie ona jest.")
+        self.map_on.on_update(vision_off)
+        self.cube_on.on_update(vision_off)
+
+    def _vision_policy_running(self) -> bool:
+        return (self.runner is not None and self.runner.status.running
+                and self.runner.cube_provider == self._vision_cube)
+
     def _mapper_now(self) -> TableMapper | None:
         key = tuple((c.name, c.enabled, c.trusted, str(c.T_cam2base), str(c.K)) for c in self.ws.cameras)
         if key != self._mapper_key:
@@ -894,6 +1207,21 @@ class TwinApp:
         return self.mapper
 
     def _tick_map(self, frames: dict[str, np.ndarray]) -> None:
+        """Mapa i detekcja kostki. `last_cube` dostaje NOWA detekcje albo None - nigdy stara.
+
+        Wczesniej `last_cube` zostawal z ostatniej detekcji, gdy mapa byla wylaczona,
+        brakowalo kamer albo cos rzucilo - polityka dostawala ja co takt jako swieza,
+        `hold_s` trackera nie mijal i zgubiona kostka nigdy nie zatrzymywala ramienia.
+        Przypisanie na koncu (zamiast None na poczatku) - watek polityki nie widzi
+        "nie ma kostki" przez caly czas dopasowania.
+        """
+        det = None
+        try:
+            det = self._map_and_detect(frames)
+        finally:
+            self.last_cube = det
+
+    def _map_and_detect(self, frames: dict[str, np.ndarray]):
         mapper = self._mapper_now() if self.map_on.value else None
         if mapper is None:
             self.map_md.content = "Brak zaufanej, skalibrowanej kamery - najpierw kalibracja." if self.map_on.value \
@@ -901,43 +1229,58 @@ class TwinApp:
             if self.map_node is not None:
                 self.map_node.visible = False
             self.cube_node.visible = False
-            return
+            return None
         table, wsum = mapper.fuse(frames)
         self._img(self.map_img, "mapa", table)
         cover = float((wsum > 1e-6).mean())
         txt = f"pokrycie blatu: **{cover:.0%}** z {len(mapper.cameras)} kamer"
+        # Wiersz 0 mapy to brzeg +y podstawy, a viser kladzie wiersz 0 obrazu po stronie -y
+        # wezla: bez odwrocenia wierszy mapa na blacie byla lustrem w y (kostka z +0,10 m
+        # rysowala sie na -0,10 m, obok poprawnej ramki kostki).
+        table3d = np.ascontiguousarray(table[::-1])
         Tm = self.T_b2w @ pose(np.eye(3), np.array([mapper.centre[0], mapper.centre[1], 0.0015]))
         if self.map_3d.value:
             if self.map_node is None:
-                self.map_node = self.server.scene.add_image("/mapa", table, mapper.side, mapper.side,
+                self.map_node = self.server.scene.add_image("/mapa", table3d, mapper.side, mapper.side,
                                                             format="jpeg", position=Tm[:3, 3],
                                                             wxyz=mat_to_wxyz(Tm[:3, :3]))
+                self._map_pose_key = Tm.round(6).tobytes()
             else:
-                self._img(self.map_node, "mapa3d", table)
+                self._img(self.map_node, "mapa3d", table3d)
+                key = Tm.round(6).tobytes()
+                if key != self._map_pose_key:          # stol przestawiony ("Zastosuj") - mapa za podstawa
+                    self.map_node.position, self.map_node.wxyz = Tm[:3, 3], mat_to_wxyz(Tm[:3, :3])
+                    self._map_pose_key = key
                 self.map_node.visible = True
         elif self.map_node is not None:
             self.map_node.visible = False
-        self.last_cube = None
+        det = None
         if self.cube_on.value:
-            # Piksele zasloniete ramieniem (maska z blizniaka, w pozie z serw) nie glosuja.
             names = [n for n in mapper.cameras if n in frames]
-            try:
-                occ = self.twin.render_with(lambda s: {n: arm_mask(s, n, dilate=5) for n in names})
-            except KeyError:
-                occ = None
-            det = self.cube_det.detect_frames(frames, mapper, occ)
+            now = time.monotonic()
+            with self.frame_lock:
+                times = dict(self.frame_times)
+            # Chwila detekcji = chwila NAJSTARSZEGO uzytego kadru (konsument ocenia jej wiek).
+            t_frames = min((times.get(n, now) for n in names), default=now)
+            # Piksele zasloniete ramieniem (maska z blizniaka, w pozie z chwili kadru) nie glosuja.
+            occ = self._arm_masks(names, t_frames, dilate=5) if names else None
+            if names:
+                det = self.cube_det.detect_frames({n: frames[n] for n in names}, mapper, occ, t=t_frames)
             if det is not None:
-                self.last_cube = det
                 Tw = self.T_b2w @ pose(det.rot, det.pos)
                 self.cube_node.position, self.cube_node.wxyz = Tw[:3, 3], mat_to_wxyz(Tw[:3, :3])
                 self.cube_node.visible = True
                 yaw = np.degrees(np.arctan2(det.rot[1, 0], det.rot[0, 0]))
                 txt += (f"  \nkostka: x {det.pos[0] * 100:.1f} cm, y {det.pos[1] * 100:.1f} cm, obrot {yaw:.0f} st., "
-                        f"pewnosc {det.confidence:.2f}")
+                        f"pewnosc {det.confidence:.2f}, {det.n_cameras} kam., "
+                        f"kadr sprzed {1000 * (time.monotonic() - det.t):.0f} ms")
             else:
                 self.cube_node.visible = False
                 txt += "  \nkostka: nie widac"
+        else:
+            self.cube_node.visible = False
         self.map_md.content = txt
+        return det
 
     # =============================================================== trening
     def _build_training(self) -> None:
@@ -999,11 +1342,18 @@ class TwinApp:
                 raise RuntimeError("polacz ramie w zakladce Ramie")
             if not self.twin.status.simulated and not self.dyn_confirm.value:
                 raise RuntimeError("potwierdz, ze wokol ramienia jest wolne miejsce")
-            if self.runner is not None:
-                self.runner.stop("identyfikacja")
-            self.arm_engage.value = False
+            if self.sysid_job.running:
+                raise RuntimeError("identyfikacja juz trwa")
+            # Ramie dla identyfikacji albo odmowa z powodem - fala czy polityka w toku mieszaly
+            # swoje cele z pobudzeniem, a nagranie z obu szlo do dopasowania dynamiki.
+            self._take_arm(jobs.SYSID_OWNER, preempt=self.sysid_job.stop)
             self.dyn_keep.visible = False
-            self.sysid_job.start(lambda job: jobs.run_sysid(job, self.twin))
+            try:
+                self.sysid_job.start(lambda job: jobs.run_sysid(job, self.twin))
+            except Exception:
+                self.twin.release(jobs.SYSID_OWNER)
+                raise
+            self.dyn_confirm.value = False
 
         @keep.on_click
         @self._safe
@@ -1105,10 +1455,7 @@ class TwinApp:
 
         @self.goal_gizmo.on_update
         def _(event):
-            p = (inverse(self.T_b2w) @ np.r_[self.goal_gizmo.position, 1.0])[:3]
-            if self.runner is not None:
-                self.runner.goal = p
-            self.goal_node.position = self.goal_gizmo.position
+            self._set_goal((inverse(self.T_b2w) @ np.r_[self.goal_gizmo.position, 1.0])[:3])
 
         @new_goal.on_click
         @self._safe
@@ -1171,11 +1518,27 @@ class TwinApp:
         self.pol_md.content = "\n".join(lines)
 
     def _set_goal(self, p_base: np.ndarray) -> None:
-        pw = (self.T_b2w @ np.r_[p_base, 1.0])[:3]
+        """Cel reach: rzutowany na obszar, z ktorego losowano cele w treningu, i tam pokazany.
+
+        Uchwyt celu mozna bylo zaciagnac pod blat - polityka bez limitu epizodu wciskala
+        wtedy szczeki w stol, az serwo zablokowalo sie na 25 st. rozjazdu. Uchwyt
+        wraca na rzutowany punkt, zeby bylo widac, dokad ramie naprawde jedzie.
+        """
+        from ..rl import task as tk
+        from ..rl.runner import project_goal
+        runner = self.runner if self.runner is not None and self.runner.task.name == "reach" else None
+        if runner is not None:
+            runner.goal = np.asarray(p_base, float)       # setter rzutuje na obszar zadania tej polityki
+            g = np.asarray(runner.goal, float)
+        else:
+            if self._reach_task is None:
+                self._reach_task = tk.make_task("reach")
+            g = project_goal(self._reach_task, np.asarray(p_base, float))
+        self._goal_base = g
+        pw = (self.T_b2w @ np.r_[g, 1.0])[:3]
         self.goal_node.position = pw
-        self.goal_gizmo.position = pw
-        if self.runner is not None:
-            self.runner.goal = np.asarray(p_base, float)
+        if np.abs(np.asarray(self.goal_gizmo.position) - pw).max() > 1e-4:
+            self.goal_gizmo.position = pw
 
     def _cube_in_scene(self) -> bool:
         with self.twin.lock:
@@ -1211,13 +1574,25 @@ class TwinApp:
             return (Ti[:3, :3] @ s.data.xpos[b] + Ti[:3, 3]).copy(), (Ti[:3, :3] @ s.data.xmat[b].reshape(3, 3)).copy()
 
     def _vision_cube(self):
-        """Kostka z kamer dla polityki - z dlonia, gdy szczeki ja zaslaniaja albo niosa."""
+        """Kostka z kamer dla polityki - z dlonia, gdy szczeki ja zaslaniaja albo niosa.
+
+        Do trackera idzie tylko detekcja NOWA (z kadrow pozniejszych niz poprzednio
+        podana) i mlodsza niz `CUBE_MAX_AGE`. Stara detekcja podawana co takt jako
+        swieza odnawiala `hold_s` w nieskonczonosc - zamrozona kamera albo wylaczona
+        mapa i polityka jechala po kostke, ktorej juz tam nie bylo.
+        """
         kin = self._kin_vision
         joints = dict(self.twin.status.measured) or self.twin.joints()
         q = kin.to_q(joints)
         cmd = self.runner.q_cmd[5] if self.runner is not None else q[5]
-        det = self.last_cube if self.last_cube is not None and self.last_cube.confidence > 0.4 else None
-        return self.cube_tracker.update(det, kin.tcp(joints), q[5], cmd, kin.lo[5], time.monotonic())
+        now = time.monotonic()
+        det = self.last_cube
+        if det is not None and (det.confidence <= 0.4 or not det.t or det.t <= self._cube_used_t
+                                or now - det.t > CUBE_MAX_AGE):
+            det = None
+        if det is not None:
+            self._cube_used_t = det.t
+        return self.cube_tracker.update(det, kin.tcp(joints), q[5], cmd, kin.lo[5], now)
 
     def _start_policy(self, event) -> None:
         from ..rl.policy import Policy
@@ -1228,6 +1603,9 @@ class TwinApp:
             raise RuntimeError("prawdziwe ramie: zaznacz potwierdzenie, ze sie ruszy")
         if self.twin.safety_state is not None and self.twin.safety_state.value == "ESTOP":
             raise RuntimeError("aktywny STOP - skasuj go w zakladce Ramie")
+        busy = self._busy(POLICY_OWNER)
+        if busy:
+            raise RuntimeError(f"ramie zajete: {busy} - najpierw je zatrzymaj")
         if self.runner is not None:
             self.runner.stop("nowa polityka")
         pol = Policy.load(self._policy_path())
@@ -1242,9 +1620,12 @@ class TwinApp:
             else:
                 if self.mapper is None:
                     raise RuntimeError("kostka z kamer wymaga co najmniej jednej skalibrowanej kamery (zakladka Mapa)")
+                if not (self.map_on.value and self.cube_on.value):
+                    raise RuntimeError("kostka z kamer wymaga wlaczonej mapy i szukania kostki (zakladka Mapa)")
                 self.cube_tracker = CubeTracker()
+                self._cube_used_t = 0.0
                 provider = self._vision_cube
-        self.arm_engage.value = False
+        self._release_panel()
         self.policy = pol
         self.runner = PolicyRunner(self.twin, pol, cube_provider=provider)
         if pol.task.name == "reach":
@@ -1255,7 +1636,8 @@ class TwinApp:
             self._set_goal(p)
             self.runner.episode_limit = False                # cel przeciagany na zywo - bez limitu epizodu
         self.goal_node.visible = self.goal_gizmo.visible = pol.task.name == "reach"
-        self.runner.start()
+        self.runner.start()                                  # bierze ramie ("polityka") albo RuntimeError
+        self.pol_confirm.value = False                       # nastepne uruchomienie - nowe potwierdzenie
 
     def _tick_policies(self) -> None:
         if self.runner is not None:
@@ -1263,6 +1645,8 @@ class TwinApp:
             txt = (f"{'**jedzie**' if rs.running else 'stoi'} - krok {rs.step}, {rs.hz:.0f} Hz")
             if self.runner.task.name == "reach" and np.isfinite(rs.distance):
                 txt += f", do celu **{rs.distance * 1000:.0f} mm**" + (" (w celu)" if rs.success else "")
+                if rs.goal_clamped:
+                    txt += " - cel przyciety do obszaru z treningu"
             if self.runner.cube_provider == self._vision_cube:
                 txt += f", kostka: **{self.cube_tracker.source}**"
             if self.runner.task.name == "lift" and self.twin.status.simulated and self._cube_in_scene():
@@ -1312,6 +1696,12 @@ class TwinApp:
         if real is None or not rec.calibrated:
             self.sr_md.content = "Potrzebny kadr i skalibrowana poza kamery."
             return
+        K, dist = rec.intrinsics()
+        if dist is not None and np.any(dist):
+            # Render blizniaka to kamera otworkowa (samo K) - kadr musi byc bez dystorsji,
+            # inaczej przy k1 = -0,25 krawedzie przy brzegu rozjezdzaly sie o dziesiatki px
+            # przy dobrej kalibracji, a wynik ponizej kazal ja powtarzac.
+            real = cv2.undistort(real, K, dist)
         sim = self.twin.render(name)
         if sim.shape != real.shape:
             sim = cv2.resize(sim, (real.shape[1], real.shape[0]))
@@ -1331,21 +1721,38 @@ class TwinApp:
 
     # ================================================================== petla
     def _grab(self) -> dict[str, np.ndarray]:
-        frames = {}
+        """Kadry wlaczonych kamer z chwilami ich wykonania (`frame_times`).
+
+        Kadr starszy niz `FRAME_MAX_AGE` jest pomijany: strumien, ktory stanal
+        (przekazanie USB na Shadow), oddawal te sama klatke w nieskonczonosc,
+        a mapa co takt "widziala" w niej kostke od nowa.
+        """
+        frames, times = {}, {}
+        now = time.monotonic()
         for c in self.ws.cameras:
             if not c.enabled:
                 continue
             try:
-                img = self.twin.cameras.frame(c.name)
+                img, t = self.twin.cameras.frame_t(c.name)
             except Exception:
-                img = None
-            if img is not None:
-                frames[c.name] = img
+                img, t = None, 0.0
+            if img is None or (t and now - t > FRAME_MAX_AGE):
+                continue
+            frames[c.name] = img
+            times[c.name] = t or now
         with self.frame_lock:
-            self.frames = frames
+            self.frames, self.frame_times = frames, times
+            self._t_grab = now
         return frames
 
-    def _tick_slow(self) -> None:
+    def _fresh_frames(self, max_age: float) -> dict[str, np.ndarray]:
+        """Kadry z ostatniego `_grab`, jesli sa mlodsze niz `max_age` [s], inaczej nowe."""
+        with self.frame_lock:
+            if time.monotonic() - self._t_grab < max_age:
+                return dict(self.frames)
+        return self._grab()
+
+    def _tick_slow(self, frames: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
         self.status_md.content = self._status_text()
         opts = tuple(c.name for c in self.ws.cameras) or ("-",)
         for dd in (self.intr_cam, self.reloc_cam, self.sr_cam):
@@ -1353,10 +1760,14 @@ class TwinApp:
                 cur = dd.value
                 dd.options = opts
                 dd.value = cur if cur in opts else opts[0]
-        frames = self._grab()
+        if frames is None:
+            frames = self._grab()
         rec = self._cam()
-        if rec is not None and rec.name in frames:
-            self._img(self.cam_preview, "podglad", thumb(frames[rec.name], 480))
+        if rec is not None:
+            # Wybrana kamera bez kadru (nie otworzyla sie, wylaczona, strumien stanal) - napis,
+            # a nie ostatni kadr POPRZEDNIEJ kamery pod nazwa nowej.
+            img = frames.get(rec.name)
+            self._img(self.cam_preview, "podglad", thumb(img, 480) if img is not None else no_frame_image())
         with self.scene_lock:
             for name, img in frames.items():
                 h = self.frustums.get(name)
@@ -1373,17 +1784,15 @@ class TwinApp:
             if c.name not in frames or c.name not in self.watch.refs:
                 continue
             was = self.watch.moved(c.name)
-            mask = None
-            try:
-                mask = self.twin.render_with(lambda s, n=c.name: arm_mask(s, n))
-            except KeyError:
-                pass
+            with self.frame_lock:
+                t = self.frame_times.get(c.name)
+            mask = (self._arm_masks([c.name], t) or {}).get(c.name)
             self.watch.check(c.name, frames[c.name], mask)
             if self.watch.moved(c.name) != was:
                 changed = True
                 if not was:
                     self._notify(None, "Kamera przestawiona",
-                                 f"{c.name}: kadr przesunal sie o {self.watch.shift[c.name]:.1f} px od kalibracji. "
+                                 f"{c.name}: kadr przesunal sie o {_px(self.watch.shift[c.name])} od kalibracji. "
                                  f"Zrob szybka relokalizacje (zakladka Kalibracja).", error=True)
         if changed:
             self._refresh_cameras()
@@ -1398,6 +1807,30 @@ class TwinApp:
                 logger.exception("Blad w odswiezaniu panelu (%s) - petla dziala dalej", what)
             return None
 
+    def _sync_mirror(self) -> None:
+        """Widok 3D za scena: przebudowa po `twin.rebuild`, potem tylko pozy cial.
+
+        Wersja i model czytane RAZEM pod blokada: przebudowa w trakcie budowy widoku
+        (~0,6 s) zapisywala nowa wersje przy siatkach ze starego modelu - widok zostawal
+        na starym modelu na zawsze, a `update` czytal ciala nowego modelu po starych numerach.
+        """
+        with self.twin.lock:
+            v, model = self.twin.version, self.twin.scene.model
+        if v != self._mirror_version:
+            if self.mirror is not None:
+                self.mirror.remove()
+            self.mirror = SceneMirror(self.server, model)
+            self._mirror_version = v
+        with self.twin.lock:
+            if self.twin.version == self._mirror_version:
+                self.mirror.update(self.twin.scene.data)
+
+    def _record_joints(self, now: float) -> None:
+        """Historia katow do masek ramienia w chwili kadru (`_arm_masks`)."""
+        st = self.twin.status
+        if st.connected and st.measured:
+            self._joint_hist.append((now, dict(st.measured)))
+
     def run(self) -> None:
         port = self.server.get_port()
         print(f"Panel blizniaka: http://localhost:{port}  (zdalnie: http://<adres-maszyny>:{port})", flush=True)
@@ -1406,21 +1839,20 @@ class TwinApp:
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
-                if self.twin.version != self._mirror_version:
-                    self.mirror.remove()
-                    self.mirror = SceneMirror(self.server, self.twin.scene.model)
-                    self._mirror_version = self.twin.version
-                with self.twin.lock:
-                    data = self.twin.scene.data
-                    self._guard("scena", self.mirror.update, data)
+                self._guard("scena", self._sync_mirror)
+                self._record_joints(t0)
                 self._guard("ramie", self._tick_arm)
+                vision_policy = self._vision_policy_running()
                 if t0 - t_slow > 0.2:
                     t_slow = t0
-                    frames = self._guard("odswiezanie", self._tick_slow) or frames
-                vision_policy = (self.runner is not None and self.runner.status.running
-                                 and self.runner.cube_provider == self._vision_cube)
+                    # Kadry osobno od reszty odswiezania: blad w zakladce Trening nie moze
+                    # zostawic mapy z kadrami sprzed minuty (wczesniej `... or frames`).
+                    frames = self._guard("kadry", self._fresh_frames, 0.1) or {}
+                    self._guard("odswiezanie", self._tick_slow, frames)
                 if t0 - t_map > (0.12 if vision_policy else 0.33):
                     t_map = t0
+                    if vision_policy:                          # polityka z kamer: kadry swieze na te mape
+                        frames = self._guard("kadry", self._fresh_frames, 0.05) or {}
                     self._guard("mapa", self._tick_map, frames)
                     self._guard("sim-real", self._tick_simreal, frames)
                 if t0 - t_watch > 2.0:
@@ -1433,6 +1865,9 @@ class TwinApp:
                 if self._dirty_save and t0 - self._dirty_save > 1.0:
                     self._dirty_save = 0.0
                     self._guard("zapis", self._save)
+                if self._dirty_rebuild and t0 - self._dirty_rebuild > 1.0:
+                    self._dirty_rebuild = 0.0
+                    self._guard("przebudowa", self.twin.rebuild)
                 time.sleep(max(0.0, 1 / 30 - (time.monotonic() - t0)))
         except KeyboardInterrupt:
             pass
@@ -1443,7 +1878,10 @@ class TwinApp:
         self._stop.set()
         if self.runner is not None:
             self.runner.stop("zamkniecie panelu")
-        self.calib_job.stop()
+        for job in (self.calib_job, self.sysid_job, self.intr_job, self.eval_job):
+            job.stop()
+        # Trening w osobnym procesie bez konsoli - bez tego zostawal po zamknieciu panelu.
+        self._guard("trening", self.train.shutdown)
         self.twin.close()
         self.server.stop()
 
