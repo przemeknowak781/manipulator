@@ -155,6 +155,27 @@ def test_randomization_around_measured_dynamics_centres_on_it():
     assert s["kp"].min() >= 1.3 * r.kp[0] - 1e-9
 
 
+def test_randomization_widens_what_identification_did_not_fit():
+    """kp i tarcie z modelu (nie z pomiaru) - po identyfikacji szeroko, bo reszta wyniku jest
+    dobra tylko razem z ich PRAWDZIWA wartoscia. Stare kp 0,85-1,15 nie zawieralo kp 0,7-1,3."""
+    from lerobot_mp.twin.rl.randomize import UNFITTED_RANGES
+
+    default = Randomization()
+    menagerie = Randomization.around(Dynamics())               # nic nie mierzono - zakresy domyslne
+    assert menagerie.kp == default.kp and menagerie.frictionloss == default.frictionloss
+    fitted = Dynamics(damping=1.3, armature=1.1, delay=1.1, source="identyfikacja",
+                      fitted=("damping", "armature", "delay"))
+    r = Randomization.around(fitted)
+    assert r.kp == UNFITTED_RANGES["kp"] and r.frictionloss == UNFITTED_RANGES["frictionloss"]
+    assert r.kp[0] <= 0.7 and r.kp[1] >= 1.3 and r.frictionloss[0] <= 0.6 and r.frictionloss[1] >= 1.4
+    assert r.damping == default.damping and r.armature == default.armature
+    half = Randomization.around(fitted, spread=0.5)            # `spread` skaluje tez szerokie zakresy
+    assert half.kp == pytest.approx((0.8, 1.25))
+    assert not Randomization.around(fitted, spread=0.0).randomized
+    both = Randomization.around(Dynamics(kp=0.9, fitted=("kp", "damping")))   # kp zmierzone - zwykly zakres
+    assert both.kp == default.kp and both.frictionloss == UNFITTED_RANGES["frictionloss"]
+
+
 def test_no_randomization_keeps_the_measured_arm_and_the_camera_model():
     """--no-rand = zmierzona dynamika bez rozrzutu (a nie Menagerie), percepcja kostki jak z kamer."""
     dyn = Dynamics(kp=0.8, damping=1.4, delay=1.6, source="identyfikacja")

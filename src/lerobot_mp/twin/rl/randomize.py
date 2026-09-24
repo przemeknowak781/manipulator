@@ -5,7 +5,15 @@ modelem z MuJoCo Menagerie: `Workspace.dynamics` trzyma wynik identyfikacji
 serw zmierzony na prawdziwym ramieniu (`rl.sysid`), a `Randomization.around`
 stawia zakresy wokol niego - wtedy randomizacja pokrywa niepewnosc pomiaru,
 a nie zgadywanie. To jest "kalibracja treningu": polityka uczy sie na
-rozrzucie, w ktorym na pewno lezy prawdziwe ramie.
+rozrzucie wokol zmierzonego ramienia.
+
+Nie ma tu obietnicy, ze prawdziwe ramie na pewno lezy w tym rozrzucie.
+Zmierzone na nagraniach syntetycznych o znanej dynamice (pelne pobudzenie,
+kp 0,7-1,3, tarcie 0,6-1,4 - patrz `tests/test_twin_sysid.py`): po
+identyfikacji tlumienie, armatura i opoznienie prawdy leza w zakresach wokol
+wyniku, a kp i tarcie suche - ktorych ruch nie wyznacza - tylko dzieki
+szerszym zakresom `UNFITTED_RANGES`. Ramie z kp 0,5 albo tarciem x3 byloby
+poza nimi.
 """
 
 from __future__ import annotations
@@ -14,6 +22,15 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 import numpy as np
+
+#: Zakresy mnoznikow parametrow, ktorych identyfikacja NIE dopasowala (`Dynamics.fitted`),
+#: gdy randomizacja stoi wokol jej wyniku. Wynik identyfikacji zostawia je na modelu
+#: (1,0), a dopasowane tlumienie, armatura i opoznienie kompensuja ich prawdziwa wartosc:
+#: przy prawdzie kp 0,8 wynik mial armature -13 % - czyli jest dobry tylko RAZEM z kp,
+#: ktore naprawde ma ramie. Domyslne kp 0,85-1,15 wokol 1,0 nie zawieralo prawd kp
+#: 0,7 / 0,75 / 0,8 / 1,2 / 1,3 z przegladu - trening nie widzial ani jednego swiata
+#: z taka dynamika. `rl.sysid` mierzy niepewnosc wyniku wlasnie na tych zakresach.
+UNFITTED_RANGES: dict[str, tuple[float, float]] = {"kp": (0.6, 1.5), "frictionloss": (0.5, 2.0)}
 
 
 @dataclass
@@ -30,13 +47,24 @@ class Dynamics:
     source: str = "menagerie"
     #: Blad dopasowania identyfikacji [st.], jesli byla.
     fit_deg: float | None = None
+    #: Parametry, ktore identyfikacja NAPRAWDE dopasowala (reszta zostala z modelu).
+    #: Puste = nic nie mierzono (Menagerie albo dynamika sprzed tego pola).
+    fitted: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        out["fitted"] = list(self.fitted)                 # JSON workspace'u nie ma krotek
+        return out
 
     @staticmethod
     def from_dict(data: dict[str, Any] | None) -> Dynamics:
-        return Dynamics(**(data or {}))
+        data = dict(data or {})
+        data["fitted"] = tuple(data.get("fitted") or ())
+        return Dynamics(**data)
+
+    def is_fitted(self, name: str) -> bool:
+        """Czy `name` pochodzi z pomiaru (a nie z modelu Menagerie)."""
+        return name in self.fitted
 
 
 @dataclass
@@ -91,9 +119,15 @@ class Randomization:
         ZOSTAJE - to nie jest niepewnosc modelu, tylko to, co kamery daja na biurku.
         Wczesniej "bez randomizacji" bralo `none()`: model Menagerie zamiast identyfikacji
         i kostke z fizyki, na ktorej polityka lift podnosila z kamer 1 z 8.
+
+        Po identyfikacji (`dyn.fitted` niepuste) parametry, ktorych NIE dopasowala (kp,
+        tarcie suche), dostaja szerokie `UNFITTED_RANGES` zamiast domyslnych: ich 1,0 to
+        model, a nie pomiar, a reszta wyniku jest dobra tylko razem z ich prawdziwa wartoscia.
         """
         base = Randomization()
         spread = max(0.0, float(spread))
+        if dyn.fitted:
+            base = replace(base, **{k: r for k, r in UNFITTED_RANGES.items() if k not in dyn.fitted})
 
         def widen(r):
             return (1.0 - (1.0 - r[0]) * spread, 1.0 + (r[1] - 1.0) * spread)

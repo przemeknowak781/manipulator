@@ -107,8 +107,14 @@ def test_lift_policy_lifts_a_cube_seen_only_by_cameras():
             s = twin.scene
             Ti = inverse(s.T_base2world)
             height = (Ti[:3, :3] @ s.data.xpos[s.model.body("cube").id] + Ti[:3, 3])[2] - h
+        # Przeglad raz widzial ten test czerwony w pelnym przebiegu i nie zlapal komunikatu - teraz
+        # kazdy blad mowi, gdzie lancuch stanal (takt, powod, zrodlo kostki w trackerze, wysokosc).
+        # Lancuch jest deterministyczny: 33 przebiegi (sam, z innymi testami blizniaka w jednym
+        # procesie, pod obciazeniem CPU i GPU) daly bit w bit to samo - takt 36, kostka 110,555 mm.
+        where = (f"takt {runner.status.step}, powod {runner.status.stopped_because!r}, kostka ze zrodla "
+                 f"{tracker.source!r}, {height * 100:.1f} cm nad blatem")
         # Koniec po sukcesie (kostka nad blatem przez `end_on_success` taktow) albo limit epizodu.
-        assert runner.status.stopped_because in ("zadanie wykonane", "koniec epizodu"), runner.status.stopped_because
-        assert height > task.lift_height, f"kostka tylko {height * 100:.1f} cm nad blatem"
+        assert runner.status.stopped_because in ("zadanie wykonane", "koniec epizodu"), where
+        assert height > task.lift_height, where
     finally:
         twin.close()
