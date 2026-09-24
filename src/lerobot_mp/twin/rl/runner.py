@@ -12,12 +12,20 @@ akcja przez `task.apply_action` - tylko katy nie pochodza z fizyki, a z serw
 `Twin.set_target`, a stamtad przez `SafetySupervisor` (limity pozycji
 i predkosci, STOP), tak samo jak kazdy inny rozkaz w tej aplikacji.
 
+Polityka bierze ramie na wlasnosc (`Twin.claim("polityka")`): nie ruszy, gdy
+jedzie fala albo identyfikacja, a Dom/STOP/ponowne polaczenie ja zatrzymuja.
+
 Straznicy, ktorych srodowisko treningowe nie ma, a prawdziwe ramie potrzebuje:
 
 * **stop przy rozjezdzie** - gdy zmierzona poza odjezdza od celu o wiecej niz
   `max_tracking_deg` (staw zablokowany, kolizja, serwo nie nadaza), polityka
-  sie zatrzymuje, zamiast dociskac dalej;
-* **limit czasu** - epizod na ramieniu trwa tyle, ile w treningu.
+  sie zatrzymuje, a ramie staje w ZMIERZONEJ pozie - nie dociska dalej;
+* **limit czasu** - epizod na ramieniu trwa tyle, ile w treningu;
+* **koniec po sukcesie** - `end_on_success` taktow sukcesu z rzedu konczy
+  epizod (lift: kostka nad blatem), zamiast pozwalac polityce krecic ramieniem
+  z kostka do limitow stawow przez reszte epizodu;
+* **cel reach w obszarze treningu** - cel spoza niego (pod blatem, za
+  podstawa) jest rzutowany na obszar, z ktorego losowano cele w treningu.
 """
 
 from __future__ import annotations
@@ -35,6 +43,9 @@ from .policy import Policy
 
 logger = logging.getLogger(__name__)
 
+#: Nazwa wlasciciela ramienia (`Twin.claim`).
+OWNER = "polityka"
+
 
 class NoCube(RuntimeError):
     """Zadanie z kostka, a percepcja nie wie, gdzie ona jest."""
@@ -49,6 +60,28 @@ class RunnerStatus:
     success: bool = False
     stopped_because: str = ""
     last_action: list[float] = field(default_factory=list)
+    #: Ile taktow z rzedu zadanie jest wykonane.
+    success_streak: int = 0
+    #: reach: cel przyciety do obszaru treningu (panel pokazuje, ze kula stoi gdzie indziej).
+    goal_clamped: bool = False
+
+
+def project_goal(task: tk.TaskConfig, goal: np.ndarray) -> np.ndarray:
+    """Najblizszy punkt obszaru, z ktorego `sample_goals` losowal cele reach.
+
+    Promien od osi podstawy w `goal_radius`, wysokosc w `goal_height`, x > 0,05 m.
+    Polityka poza nim nigdy nie byla - cel pod blatem prowadzil szczeki w blat.
+    """
+    g = np.asarray(goal, float).copy()
+    g[2] = np.clip(g[2], *task.goal_height)
+    r = float(np.hypot(g[0], g[1]))
+    r_new = float(np.clip(r, *task.goal_radius))
+    bearing = float(np.arctan2(g[1], g[0])) if r > 1e-9 else 0.0
+    # x > 0,05 przy promieniu r to kat od osi x najwyzej arccos(0,05 / r); margines 1 mm.
+    b_max = float(np.arccos(min(1.0, 0.051 / r_new)))
+    bearing = float(np.clip(bearing, -b_max, b_max))
+    g[0], g[1] = r_new * np.cos(bearing), r_new * np.sin(bearing)
+    return g
 
 
 class PolicyRunner:
@@ -64,18 +97,40 @@ class PolicyRunner:
         # z innego watku, a `tcp()` pisze do swojego MjData.
         self.kin = RobotKinematics(twin.workspace.spec())
         self.limits = tk.Limits.of(self.kin)
-        self.goal = np.array([0.22, 0.0, 0.12])
+        self.status = RunnerStatus()
+        self._goal = np.array([0.22, 0.0, 0.12])
         #: lift: (polozenie (3,), obrot (3, 3)) kostki w ukladzie podstawy - z wizji albo z symulacji.
         self.cube_provider = cube_provider
         self.max_tracking = np.radians(max_tracking_deg)
         self.episode_limit = episode_limit
         #: Ile sekund ramie stoi, czekajac na pierwsza pozycje kostki z kamer.
         self.wait_for_cube = 3.0
-        self.status = RunnerStatus()
+        end = getattr(self.task, "end_on_success", None)
+        #: Po ilu taktach sukcesu z rzedu epizod sie konczy (0 = nigdy). Z zadania (K8);
+        #: polityki zapisane przed tym polem - lift 10, reach 0 (cel przeciagany na zywo).
+        self.end_on_success = int(end) if end is not None else (10 if self.task.name == "lift" else 0)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.q_cmd = self.limits.home.copy()
         self.prev_action = np.zeros(6)
+        self._hw_lo, self._hw_hi = self.limits.lo, self.limits.hi
+        self._t_start: float | None = None
+        self._t_hz, self._ticks = 0.0, 0
+        self._cube: np.ndarray | None = None
+
+    # ------------------------------------------------------------------ cel
+    @property
+    def goal(self) -> np.ndarray:
+        return self._goal
+
+    @goal.setter
+    def goal(self, value) -> None:
+        g = np.asarray(value, float)
+        if self.task.name == "reach":
+            p = project_goal(self.task, g)
+            self.status.goal_clamped = bool(np.linalg.norm(p - g) > 1e-4)
+            g = p
+        self._goal = g
 
     # ------------------------------------------------------------ obserwacja
     def observation(self, measured: dict[str, float]) -> np.ndarray:
@@ -87,6 +142,7 @@ class PolicyRunner:
             if got is None:
                 raise NoCube("zadanie lift potrzebuje polozenia kostki - kamery jej nie widza")
             cube_pos, cube_rot = got
+            self._cube = np.asarray(cube_pos, float).copy()
             if self.policy.meta.randomization.get("fold_yaw", False):
                 # W treningu polityka widziala obrot zlozony do +-45 st. (jak z detektora);
                 # poza "w dloni" i prawda z symulacji tego nie maja - skladamy tak samo.
@@ -96,18 +152,52 @@ class PolicyRunner:
         return obs[0].astype(np.float32)
 
     # ------------------------------------------------------------------ petla
-    def start(self) -> None:
+    def start(self, *, threaded: bool = True) -> None:
+        """Bierze ramie i rusza. `threaded=False`: bez watku - takty robi `step_once`."""
         if not self.twin.connected:
             raise RuntimeError("ramie blizniaka nie jest polaczone")
         self.stop()
+        # Najpierw wlasnosc: fala albo identyfikacja w toku -> RuntimeError, nic nie rusza.
+        self.twin.claim(OWNER, preempt=self._preempted)
         measured = self.twin.joints() if self.twin.status.simulated else dict(self.twin.status.measured)
-        self.q_cmd = np.clip(self.kin.to_q(measured), self.limits.lo, self.limits.hi)
+        self._hw_lo, self._hw_hi = self._hardware_limits()
+        self.q_cmd = np.clip(self.kin.to_q(measured), self._hw_lo, self._hw_hi)
         self.prev_action = np.zeros(6)
-        self.status = RunnerStatus(running=True)
+        self.status = RunnerStatus(running=True, goal_clamped=self.status.goal_clamped)
+        self._cube = None
         self._stop.clear()
+        self._t_start, self._ticks = None, 0            # zegar startuje z pierwszym taktem
         self.twin.set_engaged(True)
-        self._thread = threading.Thread(target=self._loop, name="polityka", daemon=True)
-        self._thread.start()
+        if self.twin.owner != OWNER:                      # odebrane (STOP, Dom) miedzy claim a sprzeglem
+            self.twin.set_engaged(False)
+            self.status.running = False
+            self.status.stopped_because = f"przerwana: {getattr(self.twin, 'preempt_reason', '')}"
+            raise RuntimeError(f"ramie odebrane ({getattr(self.twin, 'preempt_reason', '')})")
+        if threaded:
+            self._thread = threading.Thread(target=self._loop, name="polityka", daemon=True)
+            self._thread.start()
+
+    def _hardware_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """Limity treningu przeciete z limitami, ktore naprawde obowiazuja na ramieniu (`Twin.joint_limits`).
+
+        Normalizacja obserwacji zostaje na limitach treningu - zmiana skali
+        bylaby dla polityki inna obserwacja. Przycinamy tylko cel: inaczej
+        q_cmd stal do 7 st. za limitem serwa (ramie nr 2, wrist_flex +88).
+        """
+        lo, hi = self.limits.lo.copy(), self.limits.hi.copy()
+        fn = getattr(self.twin, "joint_limits", None)
+        hw = fn() if fn is not None else {}
+        for k, name in enumerate(self.kin.spec.joints):
+            if name in hw:
+                a, b = self.kin.to_q({name: hw[name][0]})[k], self.kin.to_q({name: hw[name][1]})[k]
+                lo[k], hi[k] = max(lo[k], min(a, b)), min(hi[k], max(a, b))
+        bad = lo > hi
+        lo[bad], hi[bad] = self.limits.lo[bad], self.limits.hi[bad]
+        return lo, hi
+
+    def _preempted(self) -> None:
+        """Twin odebral ramie (Dom, STOP, polaczenie, inny wlasciciel) - tylko zatrzymanie watku."""
+        self.stop(f"przerwana: {getattr(self.twin, 'preempt_reason', '') or 'ramie odebrane'}")
 
     def stop(self, reason: str = "") -> None:
         self._stop.set()
@@ -117,58 +207,98 @@ class PolicyRunner:
         if self.status.running:
             self.status.running = False
             self.status.stopped_because = reason or "zatrzymana"
-            self.twin.set_engaged(False)          # ramie trzyma pozycje
+            self._let_go(hold_measured=False)             # ramie trzyma ostatni cel
 
     def _loop(self) -> None:
         period = 1.0 / self.task.control_hz
-        t_hz, ticks = time.monotonic(), 0
-        t_start = time.monotonic()
         while not self._stop.is_set():
             t0 = time.monotonic()
-            try:
-                measured = dict(self.twin.status.measured) or self.twin.joints()
-                q = self.kin.to_q(measured)
-                lag = np.abs(q[:5] - self.q_cmd[:5]).max()
-                if lag > self.max_tracking:
-                    self._halt(f"ramie nie nadaza za celem ({np.degrees(lag):.0f} st.) - kolizja albo blokada")
-                    return
-                obs = self.observation(measured)
-                action = self.policy.act(obs)
-                self.q_cmd = tk.apply_action(np, self.task, self.limits, self.q_cmd[None], action[None])[0]
-                self.twin.set_target(self.kin.from_q(self.q_cmd))
-                self.prev_action = action
-                st = self.status
-                st.step += 1
-                st.stopped_because = ""
-                st.last_action = action.tolist()
-                if self.task.name == "reach":
-                    st.distance = float(np.linalg.norm(self.goal - self.kin.tcp(measured)[:3, 3]))
-                    st.success = st.distance < self.task.success_dist
-                ticks += 1
-                now = time.monotonic()
-                if now - t_hz >= 1.0:
-                    st.hz, ticks, t_hz = ticks / (now - t_hz), 0, now
-                if self.episode_limit and st.step >= self.task.episode_steps:
-                    self._halt("koniec epizodu")
-                    return
-            except NoCube as exc:
-                # Na starcie percepcja moze jeszcze nie miec pierwszej detekcji - ramie
-                # stoi i czekamy; zgubiona kostka W TRAKCIE epizodu zatrzymuje polityke.
-                if self.status.step == 0 and time.monotonic() - t_start < self.wait_for_cube:
-                    self.status.stopped_because = "czekam na kostke z kamer"
-                    time.sleep(period)
-                    continue
-                self._halt(str(exc))
-                return
-            except Exception as exc:                        # ramie sie rozlaczylo, blad percepcji...
-                logger.exception("Petla polityki przerwana")
-                self._halt(f"{type(exc).__name__}: {exc}")
+            if not self.step_once(t0):
                 return
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
-    def _halt(self, reason: str) -> None:
+    def step_once(self, now: float | None = None) -> bool:
+        """Jeden takt polityki. False = polityka skonczyla (powod w `status.stopped_because`).
+
+        `now` - czas taktu [s]; watek podaje zegar, test - czas symulowany
+        (wtedy `wait_for_cube` i czestotliwosc licza sie w tym samym czasie).
+        """
+        if not self.status.running:
+            return False
+        now = time.monotonic() if now is None else now
+        if self._t_start is None:
+            self._t_start = self._t_hz = now
+        try:
+            if not self.twin.connected:
+                self._halt("ramie rozlaczone")
+                return False
+            measured = dict(self.twin.status.measured) or self.twin.joints()
+            q = self.kin.to_q(measured)
+            lag = np.abs(q[:5] - self.q_cmd[:5]).max()
+            if lag > self.max_tracking:
+                self._halt(f"ramie nie nadaza za celem ({np.degrees(lag):.0f} st.) - kolizja albo blokada",
+                           hold_measured=True)
+                return False
+            obs = self.observation(measured)
+            action = self.policy.act(obs)
+            q_cmd = tk.apply_action(np, self.task, self.limits, self.q_cmd[None], action[None])[0]
+            self.q_cmd = np.clip(q_cmd, self._hw_lo, self._hw_hi)
+            self.twin.set_target(self.kin.from_q(self.q_cmd), owner=OWNER)
+            self.prev_action = action
+            st = self.status
+            st.step += 1
+            st.stopped_because = ""
+            st.last_action = action.tolist()
+            if self.task.name == "reach":
+                st.distance = float(np.linalg.norm(self.goal - self.kin.tcp(measured)[:3, 3]))
+                st.success = st.distance < self.task.success_dist
+            else:
+                # Na ramieniu nie ma czujnikow kontaktu szczek - sukcesem jest kostka
+                # (z kamer albo "w dloni") wyzej nad blatem niz `lift_height`.
+                st.success = self._cube is not None and self._cube[2] - self.task.cube_half > self.task.lift_height
+            st.success_streak = st.success_streak + 1 if st.success else 0
+            self._ticks += 1
+            if now - self._t_hz >= 1.0:
+                st.hz, self._ticks, self._t_hz = self._ticks / (now - self._t_hz), 0, now
+            if self.end_on_success > 0 and st.success_streak >= self.end_on_success:
+                self._halt("zadanie wykonane")
+                return False
+            if self.episode_limit and st.step >= self.task.episode_steps:
+                self._halt("koniec epizodu")
+                return False
+        except NoCube as exc:
+            # Na starcie percepcja moze jeszcze nie miec pierwszej detekcji - ramie
+            # stoi i czekamy; zgubiona kostka W TRAKCIE epizodu zatrzymuje polityke.
+            if self.status.step == 0 and now - self._t_start < self.wait_for_cube:
+                self.status.stopped_because = "czekam na kostke z kamer"
+                return True
+            self._halt(str(exc))
+            return False
+        except Exception as exc:                        # ramie sie rozlaczylo, ramie odebrane, blad percepcji...
+            if self.twin.owner != OWNER and self._stop.is_set():
+                return False                            # zatrzymana przez `stop` w trakcie taktu
+            logger.exception("Petla polityki przerwana")
+            self._halt(f"{type(exc).__name__}: {exc}")
+            return False
+        return True
+
+    def _halt(self, reason: str, hold_measured: bool = False) -> None:
         self.status.running = False
         self.status.stopped_because = reason
-        self.twin.set_engaged(False)
+        self._let_go(hold_measured)
         self._stop.set()
         logger.info("Polityka zatrzymana: %s", reason)
+
+    def _let_go(self, hold_measured: bool) -> None:
+        """Oddaje ramie - tylko jesli wciaz je mamy: po odebraniu nalezy juz do kogos innego.
+
+        `hold_measured` (rozjazd, kolizja): ramie staje tam, gdzie JEST. Ostatni cel
+        lezy wtedy ~25 st. za przeszkoda i trzymanie go dociskalo serwa do niej
+        z pelnym momentem. Zwykly koniec trzyma cel - szczeki dalej sciskaja kostke.
+        """
+        if self.twin.owner != OWNER:
+            return
+        if hold_measured:
+            self.twin.hold_measured()
+        self.twin.set_engaged(False)
+        self.twin.release(OWNER)

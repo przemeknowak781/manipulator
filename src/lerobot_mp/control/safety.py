@@ -62,6 +62,16 @@ class SafetySupervisor:
         self._estop = False
         self._was_active = False
         self.home = self._clamped_home()
+        #: Tryb blizniaka (`start(..., keep_outside=True)`): staw, ktory stoi poza
+        #: limitami konfiguracji, dostaje wlasne, poszerzone limity az do miejsca,
+        #: gdzie stoi. Limity ida za rozkazem do srodka i znikaja, gdy staw wroci
+        #: w zakres. Pusty slownik = zwykle limity (aplikacja dloni).
+        self._soft: dict[str, tuple[float, float]] = {}
+        self._keep_outside = False
+        #: Predkosc [jednostka/s], z jaka staw spoza limitow wraca w zakres.
+        #: Zmierzone na ramieniu nr 2 (shoulder_lift -101 st. przy limicie -95):
+        #: przyciecie na starcie dawalo skok 6 st. z pelna predkoscia serwa.
+        self.outside_vel = 15.0
 
     # ------------------------------------------------------------- pomocnicze
     def _clamped_home(self) -> dict[str, float]:
@@ -76,19 +86,31 @@ class SafetySupervisor:
         return max(self.cfg.joint(name).max_vel * self.cfg.safety.velocity_scale, 1e-3)
 
     # ------------------------------------------------------------------ start
-    def start(self, measured: dict[str, float], go_home: bool = True) -> None:
+    def start(self, measured: dict[str, float], go_home: bool = True, *, keep_outside: bool = False) -> None:
         """Inicjalizuje nadzor aktualna, *zmierzona* pozycja robota.
 
         Startujemy dokladnie tam, gdzie ramie faktycznie stoi, i dopiero stamtad
         plynnie jedziemy do pozycji domowej - inaczej pierwszy rozkaz bylby
         skokiem o kilkadziesiat stopni. `go_home=False` zostawia ramie tam,
         gdzie stoi - panel blizniaka laczy sie bez ruchu i ma osobny przycisk.
+
+        `keep_outside=True` (blizniak): staw poza limitami NIE jest przycinany
+        na starcie - rozkaz zaczyna sie dokladnie od zmierzonej pozy, a do
+        zakresu staw wraca powoli (`outside_vel`) dopiero po wlaczeniu sterowania
+        (ACTIVE) albo w rampie do domu.
+        Bez tego "polacz bez ruchu" wysylal pierwszym rozkazem skok do limitu.
         """
         self._command = {}
         self._limiters = {}
+        self._soft = {}
+        self._keep_outside = keep_outside
         for name in JOINT_NAMES:
             jc = self.cfg.joint(name)
-            value = min(max(float(measured.get(name, self.home[name])), jc.min), jc.max)
+            value = float(measured.get(name, self.home[name]))
+            if keep_outside and not jc.min <= value <= jc.max:
+                self._soft[name] = (min(jc.min, value), max(jc.max, value))
+            else:
+                value = min(max(value, jc.min), jc.max)
             self._command[name] = value
             self._limiters[name] = RateLimiter(self._max_vel(name), value)
 
@@ -127,17 +149,34 @@ class SafetySupervisor:
         for name in JOINT_NAMES:
             jc = self.cfg.joint(name)
             raw = float(target.get(name, self._command[name]))
+            outside = name in self._soft
+            lo, hi = self._soft.get(name, (jc.min, jc.max))
+            if outside and self.state == SafetyState.ACTIVE:
+                # Sterowanie wlaczone: staw wraca w zakres (powoli, patrz nizej), nawet gdy
+                # cel go nie rusza - sterowniki dopisuja do celu biezacy rozkaz, wiec staw
+                # stalby poza limitami do konca sesji, w pozie spoza treningu polityk.
+                lo, hi = jc.min, jc.max
 
-            clamped = min(max(raw, jc.min), jc.max)
-            if abs(clamped - raw) > 1e-6:
+            clamped = min(max(raw, lo), hi)
+            if abs(clamped - raw) > 1e-6 or outside:
                 report.at_limit.append(name)
 
             limiter = self._limiters[name]
             limiter.max_rate = self._max_vel(name)
+            if outside and not jc.min <= limiter.value <= jc.max:
+                limiter.max_rate = min(limiter.max_rate, self.outside_vel)
             value = limiter(clamped, dt)
             if abs(value - clamped) > 1e-6:
                 report.rate_limited.append(name)
             command[name] = value
+            if outside:
+                # Limit idzie za rozkazem do srodka - z powrotem na zewnatrz juz nie.
+                lo, hi = self._soft[name]
+                lo, hi = min(jc.min, max(lo, value)), max(jc.max, min(hi, value))
+                if lo >= jc.min and hi <= jc.max:
+                    del self._soft[name]
+                else:
+                    self._soft[name] = (lo, hi)
 
         self._command = command
         return dict(command), report
@@ -195,6 +234,41 @@ class SafetySupervisor:
         self._was_active = False
         self.state = SafetyState.HOMING
 
+    def reseed(self, joints: dict[str, float]) -> None:
+        """Rozkaz i ograniczniki predkosci podanych stawow od nowa w tej pozie, bez zmiany stanu.
+
+        Dla blizniaka: gdy backend wyslal co innego niz rozkaz (serwo przycina
+        do swoich limitow), nadzor ma liczyc dalej od tego, co naprawde poszlo.
+        """
+        if not self._command:
+            return
+        for name, raw in joints.items():
+            if name not in self._command:
+                continue
+            jc = self.cfg.joint(name)
+            value = float(raw)
+            if self._keep_outside and not jc.min <= value <= jc.max:
+                self._soft[name] = (min(jc.min, value), max(jc.max, value))
+            else:
+                self._soft.pop(name, None)
+                value = min(max(value, jc.min), jc.max)
+            self._command[name] = value
+            self._limiters[name].reset(value)
+
+    def hold(self, joints: dict[str, float]) -> None:
+        """Stoimy tam, gdzie ramie JEST (zmierzona poza), a nie tam, dokad jechal rozkaz.
+
+        Przerywa rampe i sterowanie. Ostatni rozkaz po kolizji lezy kilkadziesiat
+        stopni za przeszkoda - trzymanie go (jak robi `set_engaged(False)` samo
+        w sobie) zostawialo serwa dociskajace do niej z pelnym momentem. STOP
+        awaryjny zostaje STOP-em, tylko trzyma zmierzona poze.
+        """
+        self.reseed(joints)
+        self._no_hand_for = 0.0
+        self._was_active = False
+        if not self._estop:
+            self.state = SafetyState.IDLE
+
     def trigger_estop(self) -> None:
         self._estop = True
         self.state = SafetyState.ESTOP
@@ -214,6 +288,11 @@ class SafetySupervisor:
     @property
     def command(self) -> dict[str, float]:
         return dict(self._command)
+
+    @property
+    def outside(self) -> dict[str, tuple[float, float]]:
+        """Stawy poza limitami konfiguracji i ich chwilowo poszerzone limity (tylko `keep_outside`)."""
+        return dict(self._soft)
 
     @property
     def is_homing_done(self) -> bool:

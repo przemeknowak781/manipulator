@@ -150,3 +150,46 @@ def test_disengaged_holds_position(supervisor):
     held = supervisor.command["shoulder_pan"]
     command = settle(supervisor, {"shoulder_pan": 80.0}, seconds=1.0, hand=True, engaged=False)
     assert command["shoulder_pan"] == pytest.approx(held)
+
+
+# ------------------------------------------------------------ tryb blizniaka (dodatki)
+def test_hand_app_start_still_clamps_a_joint_outside_the_limits(cfg):
+    """Bez `keep_outside` (aplikacja dloni) zachowanie jak dotad: start przyciety do limitu."""
+    sup = SafetySupervisor(cfg)
+    lo = cfg.joint("shoulder_lift").min
+    sup.start({"shoulder_lift": lo - 6.0}, go_home=False)
+    assert sup.command["shoulder_lift"] == pytest.approx(lo)
+    assert sup.outside == {}
+
+
+def test_twin_start_keeps_a_joint_outside_and_brings_it_back_slowly(cfg):
+    """Ramie nr 2 spoczywa 6 st. za limitem: rozkaz startuje DOKLADNIE tam i wraca w zakres
+    z `outside_vel`, dopiero gdy sterowanie jest wlaczone - nie skokiem do limitu."""
+    sup = SafetySupervisor(cfg)
+    lo = cfg.joint("shoulder_lift").min
+    sup.start({"shoulder_lift": lo - 6.0}, go_home=False, keep_outside=True)
+    command = settle(sup, None, seconds=1.0, hand=True, engaged=False)
+    assert command["shoulder_lift"] == pytest.approx(lo - 6.0)
+    prev = command["shoulder_lift"]
+    for _ in range(int(0.3 / DT)):
+        command, _ = sup.step({"shoulder_pan": 0.0}, DT, hand_present=True, engaged=True)
+        assert abs(command["shoulder_lift"] - prev) <= sup.outside_vel * DT + 1e-6
+        prev = command["shoulder_lift"]
+    command = settle(sup, {"shoulder_pan": 0.0}, seconds=1.0)
+    assert command["shoulder_lift"] == pytest.approx(lo)
+    assert sup.outside == {}
+    command = settle(sup, {"shoulder_lift": lo - 20.0}, seconds=1.0)     # z powrotem na zewnatrz - nie
+    assert command["shoulder_lift"] == pytest.approx(lo)
+
+
+def test_hold_stops_a_ramp_at_the_measured_pose(supervisor):
+    """Po kolizji rozkaz lezy za przeszkoda - `hold` zaczyna od pozy zmierzonej, bez skoku."""
+    settle(supervisor, {"shoulder_pan": 30.0}, seconds=2.0)
+    supervisor.begin_homing()
+    supervisor.hold({"shoulder_pan": 12.0})
+    assert supervisor.state is SafetyState.IDLE
+    command = settle(supervisor, None, seconds=1.0, engaged=False)
+    assert command["shoulder_pan"] == pytest.approx(12.0)
+    supervisor.trigger_estop()
+    supervisor.hold({"shoulder_pan": 11.0})
+    assert supervisor.state is SafetyState.ESTOP and supervisor.command["shoulder_pan"] == pytest.approx(11.0)

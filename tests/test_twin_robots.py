@@ -60,17 +60,28 @@ def test_units_round_trip(kin):
             assert back[name] == pytest.approx(joints[name], abs=1e-9)
 
 
-def test_gripper_scale_matches_the_preview_mapping(kin):
-    """0..100 LeRobota ma trafic w ten sam kat szczeki, co w podgladzie 3D."""
-    preview = pytest.importorskip("lerobot_mp.preview.model")
-    art = preview.load_model()
-    if art is None:
-        pytest.skip("brak modelu podgladu 3D w repozytorium")
+def test_gripper_angle_is_the_servo_angle_of_the_feetech_backend(kin):
+    """0..100 chwytaka ma byc w blizniaku TYM SAMYM katem szczeki, co na serwie.
+
+    Wczesniej 0..100 szlo liniowo na caly zakres MJCF (-10..100 st.), a backend
+    `feetech` rozciaga je na tiki 1986..2670 (60 st. skoku serwa) - jednostka
+    chwytaka byla w symulacji 1,8 raza wieksza niz na ramieniu.
+    """
+    from lerobot_mp.config import load_config
+    from lerobot_mp.robot.feetech import FeetechArm
+
+    cfg = load_config(overrides={"robot": {"backend": "feetech", "port": "COM_TEST"}})
+    arm = FeetechArm(cfg, bus=object())                   # tylko przeliczenia, bez portu
+    rc = cfg.robot
     k = SO101.joints.index("gripper")
-    for pct in (0.0, 35.0, 100.0):
-        want = art.from_lerobot({"gripper": pct})["gripper"]
-        # MJCF trzyma zakres w zaokraglonych radianach (-0.174533 = -10.000004 stopnia).
-        assert np.degrees(kin.to_q({"gripper": pct})[k]) == pytest.approx(want, abs=1e-3)
+    for ticks in (rc.gripper_closed_ticks, 2100, 2300, rc.gripper_open_ticks):
+        servo_deg = (ticks - rc.center_ticks) * 360.0 / 4096
+        units = arm._to_units("gripper", ticks)
+        assert np.degrees(kin.to_q({"gripper": units})[k]) == pytest.approx(servo_deg, abs=1e-6)
+        assert kin.from_q(kin.to_q({"gripper": units}))["gripper"] == pytest.approx(units, abs=1e-6)
+    # Poza zakresem stawu MJCF kat jest przyciety, a nie zawiniety.
+    assert kin.to_q({"gripper": 1000.0})[k] == pytest.approx(kin.hi[k])
+    assert kin.to_q({"gripper": -1000.0})[k] == pytest.approx(kin.lo[k])
 
 
 def test_approach_axis_points_out_of_the_jaws(kin):
