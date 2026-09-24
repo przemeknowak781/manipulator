@@ -55,8 +55,8 @@ graficzna, także zintegrowana). Trening polityk wymaga karty **NVIDIA z CUDA**
 (sterownik z obsługą CUDA 12). Bez niej działa wszystko poza treningiem: panel,
 kalibracja, percepcja, identyfikacja dynamiki i ewaluacja polityk na CPU.
 Miejsce na dysku: ok. 5 GB na `.venv` z torchem CUDA (sam torch ok. 3,9 GB),
-__CPUSIZE__; na czas instalacji dodatkowo ok. 3 GB pamięci podręcznej pip
-(`pip install --no-cache-dir …` jej nie tworzy).
+ok. 1 GB bez NVIDIA (torch CPU); przy instalacji z CUDA dodatkowo ok. 3 GB
+pamięci podręcznej pip (`pip install --no-cache-dir …` jej nie tworzy).
 Sprawdzone wersje pakietów są w [`constraints.txt`](constraints.txt).
 
 ### 1. Instalacja
