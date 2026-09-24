@@ -73,7 +73,10 @@ class PolicyMeta:
     notes: str = ""
 
     def task_config(self) -> tk.TaskConfig:
-        data = dict(self.task)
+        # Pola dodane pozniej (np. `end_on_success`) biora wartosc zadania z `make_task`,
+        # a nie zero z klasy: stara lift-v2 ma sie na ramieniu zatrzymac po sukcesie tak
+        # samo jak nowa, a douczana z niej - dostac nowe kary.
+        data = {**asdict(tk.make_task(self.task.get("name", "reach"))), **self.task}
         for k, v in data.items():
             if isinstance(v, list):
                 data[k] = tuple(v)

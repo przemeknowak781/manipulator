@@ -9,6 +9,7 @@
     lerobot-twin eval <policy.pt> --rand     # ewaluacja polityki w zwyklym MuJoCo
     lerobot-twin policies                    # zapisane polityki i ich wyniki
     lerobot-twin ui                          # panel w przegladarce: http://localhost:8080
+    lerobot-twin ui --host 0.0.0.0           # ... dostepny z sieci (bez hasla - tylko w zaufanej)
 """
 
 from __future__ import annotations
@@ -138,6 +139,32 @@ def _workspace(a: argparse.Namespace) -> int:
     return 0
 
 
+def _train_plan(dyn, no_rand: bool, spread: float):
+    """(randomizacja treningu, [(etykieta, klucz w meta.evals, randomizacja ewaluacji)]).
+
+    "Bez randomizacji" to zmierzona dynamika bez rozrzutu - nie model Menagerie
+    (`Randomization.none()` gubil identyfikacje i model percepcji kostki, a log
+    i tak pisal "dynamika: identyfikacja"). Ewaluacja "z randomizacja" jest tylko
+    wtedy, gdy trening ja mial: wczesniej przy --no-rand druga ewaluacja nominalna
+    trafiala do `cpu_rand` i panel pokazywal ja jako odpornosc na randomizacje.
+    """
+    from .rl.randomize import Randomization
+
+    rand = Randomization.around(dyn, 0.0 if no_rand else spread)
+    evals = [("bez randomizacji", "cpu_nominal", Randomization.nominal(dyn))]
+    if rand.randomized:
+        evals.append(("z randomizacja", "cpu_rand", rand))
+    return rand, evals
+
+
+def _describe(rand) -> str:
+    c = rand.centre
+    delay = f"{rand.min_delay}" if rand.min_delay == rand.max_delay else f"{rand.min_delay}-{rand.max_delay}"
+    return (f"dynamika: {c.source} (kp x{c.kp:.2f}, tlumienie x{c.damping:.2f}, opoznienie {delay} takt.); "
+            f"randomizacja: {'tak' if rand.randomized else 'brak'}; "
+            f"percepcja kostki: {'jak z kamer' if rand.fold_yaw or rand.cube_delay else 'idealna'}")
+
+
 def _train(a: argparse.Namespace) -> int:
     import json
     import time
@@ -145,14 +172,14 @@ def _train(a: argparse.Namespace) -> int:
     from .rl.evaluate import evaluate
     from .rl.policy import DEFAULT_DIR
     from .rl.ppo import PPOConfig, train
-    from .rl.randomize import Dynamics, Randomization
+    from .rl.randomize import Dynamics
     from .workspace import Workspace
 
     ws = Workspace.load(a.workspace)
     name = a.name or f"{a.task}-{time.strftime('%Y%m%d-%H%M%S')}"
     out = Path(a.out or DEFAULT_DIR) / name
     dyn = Dynamics.from_dict(ws.dynamics)
-    rand = Randomization.none() if a.no_rand else Randomization.around(dyn, a.spread)
+    rand, evals = _train_plan(dyn, a.no_rand, a.spread)
     cfg = PPOConfig(num_envs=a.envs, iterations=a.iters, seed=a.seed)
     init = None
     if a.init:
@@ -163,7 +190,7 @@ def _train(a: argparse.Namespace) -> int:
         cfg.init_std = 0.25                            # douczanie: mniejsza eksploracja na starcie
         print(f"Start z polityki {a.init} ({init.task.name})")
     print(f"Trening {a.task}: {a.envs} swiatow x {a.iters} iteracji -> {out}")
-    print(f"  dynamika: {dyn.source}; randomizacja: {'brak' if a.no_rand else f'rozrzut x{a.spread}'}")
+    print(f"  {_describe(rand)}{'' if a.no_rand else f', rozrzut x{a.spread}'}")
 
     def show(p):
         if p.iteration == 1 or p.iteration % 10 == 0 or p.status != "uczenie":
@@ -188,9 +215,9 @@ def _train(a: argparse.Namespace) -> int:
                 init=init)
     pol = pol.to("cpu")
     print("Ewaluacja na CPU (zwykle MuJoCo, inny silnik niz w treningu):")
-    for label, r in (("bez randomizacji", None), ("z randomizacja", rand)):
+    for label, key, r in evals:
         res = evaluate(pol, a.eval_episodes, randomization=r, workspace=ws)
-        pol.meta.evals[f"cpu_{'rand' if r else 'nominal'}"] = res
+        pol.meta.evals[key] = res
         print(f"  {label:17s} sukces {res['success']:5.1%}  ({json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in res.items()})})")
     pol.save(out / "policy.pt")
     print(f"Zapisano {out / 'policy.pt'}")
@@ -200,12 +227,14 @@ def _train(a: argparse.Namespace) -> int:
 def _eval(a: argparse.Namespace) -> int:
     from .rl.evaluate import evaluate
     from .rl.policy import Policy
-    from .rl.randomize import Randomization
+    from .rl.randomize import Dynamics, Randomization
     from .workspace import Workspace
 
+    ws = Workspace.load(a.workspace)
     pol = Policy.load(a.policy)
-    res = evaluate(pol, a.episodes, randomization=Randomization() if a.rand else None,
-                   workspace=Workspace.load(a.workspace))
+    # Randomizacja wokol zmierzonej dynamiki - jak w treningu i w panelu, nie wokol Menagerie.
+    rand = Randomization.around(Dynamics.from_dict(ws.dynamics)) if a.rand else None
+    res = evaluate(pol, a.episodes, randomization=rand, workspace=ws)
     print(f"{a.policy}: {res}")
     return 0
 
@@ -216,10 +245,15 @@ def _policies(a: argparse.Namespace) -> int:
     items = list_policies(a.dir or DEFAULT_DIR)
     if not items:
         print("Brak zapisanych polityk. Naucz pierwsza:  lerobot-twin train --task reach")
+
+    def pct(key):
+        v = p["evals"].get(key, {}).get("success")
+        return "  -  " if v is None else f"{v:5.1%}"
+
     for p in items:
-        cpu = p["evals"].get("cpu_rand", {}).get("success")
         print(f"  {p['name']:32s} {p['task']:6s} GPU {p['success'] or 0:5.1%}  "
-              f"CPU {'-' if cpu is None else f'{cpu:5.1%}'}  {p['steps'] / 1e6:6.1f} M  {p['created']}")
+              f"CPU bez/z rand. {pct('cpu_nominal')} / {pct('cpu_rand')}  "
+              f"{p['steps'] / 1e6:6.1f} M  {p['created']}")
     return 0
 
 
@@ -233,6 +267,11 @@ def _ui(a: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    a = parser().parse_args(argv)
+    return a.fn(a)
+
+
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lerobot-twin", description="Cyfrowy blizniak stanowiska SO-101.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -289,13 +328,15 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=_policies)
 
     p = sub.add_parser("ui", help="panel blizniaka w przegladarce (viser)")
-    p.add_argument("--host", default="0.0.0.0")
+    # Panel rusza prawdziwym ramieniem i nie ma hasla, a viser dzieli stan GUI miedzy
+    # wszystkich podlaczonych - kazdy, kto dosiegnie portu, moze nacisnac "Polacz" albo
+    # uruchomic polityke. Dlatego domyslnie tylko ten komputer; siec na wyrazne zyczenie.
+    p.add_argument("--host", default="127.0.0.1",
+                   help="adres nasluchu (domyslnie tylko ten komputer; 0.0.0.0 = cala siec, BEZ hasla)")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--workspace", default=None)
     p.set_defaults(fn=lambda a: _ui(a))
-
-    a = ap.parse_args(argv)
-    return a.fn(a)
+    return ap
 
 
 if __name__ == "__main__":  # pragma: no cover

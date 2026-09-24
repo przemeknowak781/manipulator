@@ -126,6 +126,11 @@ class CubeDetection:
     rot: np.ndarray          # obrot (3, 3) - tylko wokol z
     area_px: float
     confidence: float
+    #: Ile kamer realnie widzialo kostke w dopasowanej pozie (0 = nie wiadomo, np. z mapy).
+    #: Jedna kamera nie odrozni kostki podniesionej od lezacej dalej na tym samym promieniu.
+    n_cameras: int = 0
+    #: Chwila wykonania kadrow (time.monotonic), z ktorych jest detekcja; 0 = nie podano.
+    t: float = 0.0
 
 
 class CubeTracker:
@@ -145,17 +150,42 @@ class CubeTracker:
     Zablokowana szczeka, a nie "rozkaz = zamknij do konca": nauczona polityka
     sciska kostke celem tylko troche ciasniejszym niz jej szerokosc - pierwsza
     wersja czekala na pelne zamkniecie i gubila kostke niesiona w powietrzu.
+
+    Detekcja z JEDNEJ kamery (`n_cameras == 1`) przy dloni jest pomijana: jedna
+    kamera nie odrozni kostki podniesionej w szczekach od kostki lezacej dalej na
+    tym samym promieniu, a prog IoU odrzuca podniesiona kostke tylko wtedy, gdy
+    dwie kamery sie nie zgadzaja. Zmierzone w blizniaku (lift-v2, tylko kamera
+    `a`): podniesiona kostka przechodzila bramke z pewnoscia 0,87-0,98 i bledem
+    3-40 cm, a tracker podawal ja polityce jako "kamery" zamiast "w dloni" -
+    polityka wracala po nia na blat. Z dala od dloni kostka lezy na blacie
+    (nic innego jej nie podnosi), wiec tam jedna kamera wystarcza.
     """
 
     def __init__(self, hold_s: float = 6.0, grab_radius: float = 0.06, grip_margin: float = 0.05,
-                 block_margin: float = 0.05):
+                 block_margin: float = 0.05, near_radius: float = 0.10, confirm_dist: float = 0.01):
         self.hold_s, self.grab_radius = hold_s, grab_radius
         self.grip_margin, self.block_margin = grip_margin, block_margin
+        #: "Przy dloni": TCP blizej kostki (ostatniej albo wykrytej) niz tyle [m].
+        self.near_radius = near_radius
+        #: Pominieta detekcja blizej ostatniego polozenia niz tyle [m] tylko je potwierdza.
+        self.confirm_dist = confirm_dist
         self.last: tuple[np.ndarray, np.ndarray] | None = None
         self.t_last = -np.inf
         self.in_hand: np.ndarray | None = None          # poza kostki w ukladzie TCP
         self.source = "brak"
         self._grip_prev: float | None = None
+
+    def _single_camera_near_hand(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool) -> bool:
+        """Czy detekcja moze byc podniesiona kostka, ktora jedna kamera "polozyla" na blacie."""
+        if not 0 < det.n_cameras < 2:
+            return False
+        if self.in_hand is not None or squeezing:
+            return True
+        tcp = T_tcp[:3, 3]
+        near = np.linalg.norm(det.pos - tcp) < self.near_radius
+        if self.last is not None:
+            near |= np.linalg.norm(self.last[0] - tcp) < self.near_radius
+        return bool(near)
 
     def update(self, det: CubeDetection | None, T_tcp: np.ndarray, grip_q: float, grip_cmd: float,
                grip_closed: float, now: float) -> tuple[np.ndarray, np.ndarray] | None:
@@ -164,7 +194,15 @@ class CubeTracker:
         # wlaczalo sie, zanim szczeka w ogole dotknela kostki.
         still = self._grip_prev is not None and abs(grip_q - self._grip_prev) < 0.02
         self._grip_prev = grip_q
-        holding = still and grip_q - grip_cmd > self.block_margin and grip_q > grip_closed + self.grip_margin
+        squeezing = grip_q - grip_cmd > self.block_margin and grip_q > grip_closed + self.grip_margin
+        holding = still and squeezing
+        if det is not None and self._single_camera_near_hand(det, T_tcp, squeezing):
+            # Zgodna z ostatnim polozeniem (kostka lezy, dlon nad nia) - tylko odswieza jego
+            # waznosc, zeby kostka nie "znikala" po `hold_s`, gdy dlon dlugo nad nia krazy.
+            if self.in_hand is None and self.last is not None \
+                    and np.linalg.norm(det.pos - self.last[0]) < self.confirm_dist:
+                self.t_last = now
+            det = None
         if det is not None and not (holding and self.in_hand is not None):
             self.last, self.t_last, self.source = (det.pos, det.rot), now, "kamery"
             if not holding:
@@ -204,6 +242,9 @@ class CubeDetector:
     cube_half: float = 0.015
     #: Najmniejsze pokrycie sylwetki (IoU), przy ktorym kostka "lezy na blacie tam, gdzie mowimy".
     min_iou: float = 0.75
+    #: Kamera liczy sie do `n_cameras`, gdy widzi (nie zaslonieta ramieniem) co najmniej
+    #: taka czesc przewidzianej sylwetki.
+    min_visible: float = 0.5
 
     def mask(self, table: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(table, cv2.COLOR_RGB2HSV)
@@ -238,7 +279,7 @@ class CubeDetector:
         return cv2.morphologyEx(top.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     def detect_frames(self, frames: dict[str, np.ndarray], mapper: TableMapper,
-                      occluders: dict[str, np.ndarray] | None = None) -> CubeDetection | None:
+                      occluders: dict[str, np.ndarray] | None = None, t: float = 0.0) -> CubeDetection | None:
         """Kostka z kadrow kamer: start z czesci wspolnej masek, potem dopasowanie sylwetki.
 
         Czesc wspolna na plaszczyznie gornej sciany potrzebuje dwoch kamer, ktore
@@ -246,6 +287,9 @@ class CubeDetector:
         bocznymi i pewnosc spada do zera (4 z 8 epizodow `lift` w symulacji tracilo
         kostke wlasnie tak). Dopasowanie sylwetki bryly do masek wszystkich kamer
         dziala z jedna kamera i z wieloma - boki kostki sa czescia modelu.
+
+        `t` - chwila wykonania kadrow; trafia do detekcji, zeby konsument wiedzial,
+        jak stara jest (dopasowanie trwa, a kadry bywaja sprzed kilku taktow).
         """
         top = mapper if abs(mapper.table_z - 2 * self.cube_half) < 1e-6 else mapper.at_height(2 * self.cube_half)
         init = self._from_mask(self.top_mask(frames, top, occluders), top)
@@ -255,7 +299,10 @@ class CubeDetector:
             start = self._ray_guess(masks, mapper.cameras, occluders)
         if start is None:
             return None
-        return self.fit_silhouette(masks, mapper.cameras, start, occluders)
+        det = self.fit_silhouette(masks, mapper.cameras, start, occluders)
+        if det is not None:
+            det.t = float(t)
+        return det
 
     # ------------------------------------------------------ dopasowanie sylwetki
     def _corners(self, x: float, y: float, yaw: float) -> np.ndarray:
@@ -323,23 +370,31 @@ class CubeDetector:
         if not prepared:
             return None
 
-        def score(p) -> float:
+        def stats(p) -> tuple[float, int, int]:
+            """(suma IoU, ile kamer liczy sie do sredniej, ile widzi wiekszosc sylwetki)."""
             corners = self._corners(*p)
-            total, n_used = 0.0, 0
+            total, n_used, n_seen = 0.0, 0, 0
             for obs, valid, Ks, dist, Ti in prepared:
                 pc = corners @ Ti[:3, :3].T + Ti[:3, 3]
                 if (pc[:, 2] < 0.05).any():
                     continue
                 px, _ = cv2.projectPoints(corners, cv2.Rodrigues(Ti[:3, :3])[0], Ti[:3, 3], Ks, dist)
                 hull = cv2.convexHull(px.reshape(-1, 2).astype(np.float32)).astype(np.int32)
-                pred = np.zeros(obs.shape, np.uint8)
-                cv2.fillConvexPoly(pred, hull, 1)
-                pred = (pred > 0) & valid
+                full = np.zeros(obs.shape, np.uint8)
+                cv2.fillConvexPoly(full, hull, 1)
+                pred = (full > 0) & valid
                 union = (pred | obs).sum()
                 if union == 0 or pred.sum() < 4:
                     continue
                 total += (pred & obs).sum() / union
                 n_used += 1
+                # Kamera, ktorej ramie zaslania prawie cala przewidziana sylwetke, glosuje
+                # kilkoma pikselami - nie jest drugim, niezaleznym swiadkiem polozenia.
+                n_seen += int(pred.sum() >= self.min_visible * full.sum())
+            return total, n_used, n_seen
+
+        def score(p) -> float:
+            total, n_used, _ = stats(p)
             return -total / n_used if n_used else 0.0
 
         best, best_s = np.asarray(start, float), score(start)
@@ -355,12 +410,16 @@ class CubeDetector:
         # "wcisnac" w jakas poze na blacie, ktora czesciowo pasuje - zmierzone wzdluz
         # epizodow lift: prawdziwe detekcje na blacie IoU 0,88-0,96, falszywe przy
         # podniesionej kostce 0,36-0,64 (i 26-970 mm bledu). Prog miedzy nimi.
+        # Dziala tylko wtedy, gdy kostke widza co najmniej DWIE kamery: jednej kamerze
+        # kostke podniesiona o 2-6 cm zastepuje lezaca dalej na tym samym promieniu
+        # (IoU 0,96-0,82 przy 26-92 mm bledu) - stad `n_cameras` w detekcji.
         if iou < self.min_iou:
             return None
+        n_seen = stats(best)[2]
         yaw = (best[2] + np.pi / 4) % (np.pi / 2) - np.pi / 4
         c_, s_ = np.cos(yaw), np.sin(yaw)
         R = np.array([[c_, -s_, 0.0], [s_, c_, 0.0], [0.0, 0.0, 1.0]])
-        return CubeDetection(np.array([best[0], best[1], self.cube_half]), R, float(iou), float(iou))
+        return CubeDetection(np.array([best[0], best[1], self.cube_half]), R, float(iou), float(iou), n_seen)
 
     def detect(self, table: np.ndarray, mapper: TableMapper) -> CubeDetection | None:
         """Kostka na gotowej mapie (np. z jednej kamery) - mniej dokladnie niz `detect_frames`."""

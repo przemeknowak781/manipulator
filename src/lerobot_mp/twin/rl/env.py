@@ -119,6 +119,7 @@ class TwinEnv(gym.Env):
         self.q_cmd = self.limits.home.copy()
         self.prev_action = np.zeros(6)
         self.t = 0
+        self._streak = 0                     # takty sukcesu z rzedu (`task.end_on_success`)
         self._delay: list[np.ndarray] = []
         self._noise = 0.0
         self._cube_delay, self._cube_period = 0, 1
@@ -196,9 +197,10 @@ class TwinEnv(gym.Env):
         self.q_cmd = q0.copy()
         self.prev_action = np.zeros(6)
         self.t = 0
+        self._streak = 0
         s0 = self.state()
         self._perceive(s0, force=True)
-        return self._obs(s0), {"success": False}
+        return self._obs(s0), {"success": False, "finished": False}
 
     def set_cube(self, pos_base: np.ndarray, quat_base: np.ndarray) -> None:
         """Kostka w pozie podanej w ukladzie podstawy (kwaternion w, x, y, z)."""
@@ -223,21 +225,30 @@ class TwinEnv(gym.Env):
         d = self.scene.data
         d.ctrl[self.scene.act_ids] = self.q_cmd
         mujoco.mj_step(self.scene.model, d, nstep=self.task.substeps)
+        # Po mj_step qpos jest juz po calkowaniu, a site_xpos/xpos/xmat - z przejscia w przod
+        # PRZED nim (5 ms starsze). TCP w obserwacji rozjezdzal sie z FK(q) o 4-8 mm w ruchu,
+        # a runner na ramieniu liczy TCP dokladnie z q - polityka uczyla sie relacji,
+        # ktorej na biurku nie ma. Kinematyka od nowa: wszystko z tego samego q.
+        mujoco.mj_kinematics(self.scene.model, d)
         self.t += 1
 
         s = self.state()
         r, success, failure = tk.reward(np, self.task, s["tcp"][None], action[None], self.prev_action[None],
                                         goal=self.goal[None], cube_pos=s.get("cube_pos", np.zeros(3))[None],
-                                        jaw_contacts=s.get("jaws", np.zeros(2))[None])
+                                        jaw_contacts=s.get("jaws", np.zeros(2))[None],
+                                        q_cmd=self.q_cmd[None], limits=self.limits)
         self.prev_action = action
-        info = {"success": bool(success[0])}
+        streak, finished = tk.success_streak(np, self.task, np.array([self._streak]), success)
+        self._streak = int(streak[0])
+        info = {"success": bool(success[0]), "finished": bool(finished[0])}
         if self.task.name == "reach":
             info["distance"] = float(np.linalg.norm(self.goal - s["tcp"]))
         else:
             info["height"] = float(s["cube_pos"][2] - self.task.cube_half)
             info["grasped"] = bool(s["jaws"].min() > 0.5)
         terminated = bool(failure[0])
-        truncated = self.t >= self.task.episode_steps
+        # Koniec po serii sukcesow to uciecie jak limit czasu (patrz `task.success_streak`).
+        truncated = self.t >= self.task.episode_steps or info["finished"]
         self._perceive(s)
         return self._obs(s), float(r[0]), terminated, truncated, info
 

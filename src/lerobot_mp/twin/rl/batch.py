@@ -11,8 +11,9 @@ swiata zgadza sie z MuJoCo na CPU do 0,001 st. po 2 s.
 
 Konwencja jak w legged_gym / rsl_rl: srodowiska resetuja sie same, `done`
 oznacza koniec epizodu w tym kroku, a zwracana obserwacja jest juz z nowego
-epizodu. `info["time_outs"]` mowi, ktore skonczyly sie limitem czasu - PPO
-dolicza im wartosc stanu zamiast zera.
+epizodu. `info["time_outs"]` mowi, ktore skonczyly sie limitem czasu albo seria
+sukcesow (`task.end_on_success`, wtedy tez `info["finished"]`) - PPO dolicza
+im wartosc stanu zamiast zera.
 
 Stan MuJoCo Warp jest wystawiony jako widoki torch (`wp.to_torch`) - bez kopii.
 Fizyka to jeden przechwycony graf CUDA z `substeps` krokami; torch i Warp
@@ -114,9 +115,16 @@ class BatchEnv:
         self.goal = torch.zeros(N, 3, **f32)
         self.q_cmd = self.home.repeat(N, 1)
         self.prev_action = torch.zeros(N, 6, **f32)
-        self.pending = torch.zeros(N, 6, **f32)          # akcja czekajaca na opoznienie
-        self.delay = torch.zeros(N, dtype=torch.bool, device=dev)
+        # Opoznienie akcji: ostatnie akcje w buforze pierscieniowym, dla kazdego swiata
+        # wlasne {min_delay .. max_delay} taktow - jak kolejka w TwinEnv. Wczesniej byl tu
+        # jeden slot i opoznienie sciete do 0/1 taktu: po identyfikacji (1,4 taktu,
+        # max_delay 3) trening nie widzial nigdy 2-3 taktow, a ewaluacja na CPU - tak.
+        self.Hd = int(self.rand.max_delay) + 1
+        self.act_hist = torch.zeros(self.Hd, N, 6, **f32)
+        self.delay_n = torch.zeros(N, dtype=torch.long, device=dev)
+        self.ar = torch.arange(N, device=dev)
         self.t = torch.zeros(N, dtype=torch.long, device=dev)
+        self.streak = torch.zeros(N, dtype=torch.long, device=dev)   # takty sukcesu z rzedu
         self.noise = float(np.radians(self.rand.obs_noise_deg))
         # Percepcja kostki (patrz Randomization.cube_*): historia w buforze pierscieniowym,
         # opoznienie i okres odswiezania osobno dla kazdego swiata.
@@ -134,6 +142,9 @@ class BatchEnv:
         with wp.ScopedCapture() as cap:
             for _ in range(self.task.substeps):
                 mjw.step(self.m, self.d)
+            # Jak w TwinEnv.step: po krokach xpos/site_xpos sa sprzed ostatniego calkowania,
+            # wiec kinematyka od nowa - TCP i kostka z tego samego q, co katy w obserwacji.
+            mjw.kinematics(self.m, self.d)
         self.graph = cap.graph
 
     # ------------------------------------------------------------ pomocnicze
@@ -193,7 +204,7 @@ class BatchEnv:
             f["body_mass"][ids, b] = nom["body_mass"][b] * s["cube_mass"]
             f["body_inertia"][ids, b] = nom["body_inertia"][b] * s["cube_mass"][:, None]
             f["geom_friction"][ids, g, 0] = nom["geom_friction"][g, 0] * s["cube_friction"]
-        self.delay[ids] = s["delay"] > 0.5
+        self.delay_n[ids] = s["delay"].long().clamp(0, self.Hd - 1)
         self.cube_d[ids] = s["cube_delay"].long()
         self.cube_p[ids] = s["cube_period"].long()
         torch.cuda.synchronize(self.device)
@@ -247,8 +258,8 @@ class BatchEnv:
         self.ctrl[ids[:, None], self.act] = q0
         self.q_cmd[ids] = q0
         self.prev_action[ids] = 0.0
-        self.pending[ids] = 0.0
         self.t[ids] = 0
+        self.streak[ids] = 0
 
     # ------------------------------------------------------------------ api
     def reset(self) -> torch.Tensor:
@@ -261,8 +272,10 @@ class BatchEnv:
     @torch.no_grad()
     def step(self, action: torch.Tensor):
         action = torch.clamp(action.to(self.device, torch.float32), -1.0, 1.0)
-        executed = torch.where(self.delay[:, None], self.pending, action)
-        self.pending = action
+        # Akcja sprzed `delay_n` taktow; w pierwszych taktach epizodu zero (jak kolejka zer na CPU).
+        self.act_hist[self.t % self.Hd, self.ar] = action
+        executed = self.act_hist[(self.t - self.delay_n) % self.Hd, self.ar]
+        executed = torch.where((self.t >= self.delay_n)[:, None], executed, torch.zeros_like(executed))
         self.q_cmd = tk.apply_action(torch, self.task, self.limits, self.q_cmd, executed)
         self.ctrl[:, self.act] = self.q_cmd
         torch.cuda.synchronize(self.device)
@@ -272,7 +285,9 @@ class BatchEnv:
 
         s = self._state()
         rew, success, failure = tk.reward(torch, self.task, s["tcp"], action, self.prev_action, goal=self.goal,
-                                          cube_pos=s.get("cube_pos"), jaw_contacts=s.get("jaws"))
+                                          cube_pos=s.get("cube_pos"), jaw_contacts=s.get("jaws"),
+                                          q_cmd=self.q_cmd, limits=self.limits)
+        self.streak, finished = tk.success_streak(torch, self.task, self.streak, success)
         if self.task.cube:
             self._perceive(s)
         # Straznik: swiat, ktory mimo wszystko wybuchl, konczy epizod bez nagrody,
@@ -280,10 +295,13 @@ class BatchEnv:
         broken = ~torch.isfinite(self.qvel).all(1) | (self.qvel.abs().amax(1) > 100.0)
         rew = torch.where(broken, torch.zeros_like(rew), rew)
         self.prev_action = action
-        time_out = self.t >= self.task.episode_steps
+        # Seria sukcesow konczy epizod jak limit czasu - PPO dolicza wartosc stanu
+        # (patrz `task.success_streak`), inaczej oplacaloby sie nie konczyc.
+        time_out = (self.t >= self.task.episode_steps) | finished
         terminated = failure | broken
         done = terminated | time_out
-        info = {"success": success, "time_outs": time_out & ~terminated, "broken": broken}
+        info = {"success": success, "time_outs": time_out & ~terminated, "broken": broken,
+                "finished": finished & ~terminated}
         if self.task.name == "reach":
             info["distance"] = ((self.goal - s["tcp"]) ** 2).sum(1).sqrt()
         else:
