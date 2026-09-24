@@ -3,3 +3,4 @@
 *.npz binary
 *.task binary
 *.stl binary
+*.pt binary

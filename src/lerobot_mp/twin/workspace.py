@@ -51,10 +51,25 @@ class CameraRecord:
     #: Wynik ostatniej kalibracji polozenia: rms_px, spread_deg, n_obs, trusted, reason, time.
     calibration: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
+    #: Tylko kamery symulowane: gdzie kamera NAPRAWDE stoi w blizniaku (ustawiana
+    #: w panelu). Kalibracja jej nie zna - wyznacza `T_cam2base` z kadrow, tak
+    #: jak dla prawdziwej kamery - wiec wynik da sie ocenic wzgledem prawdy.
+    sim_pose: list[list[float]] | None = None
+    #: Wynik kalibracji intrynsyk: rms_px, n_views, coverage, trusted, reason, time.
+    intrinsics_info: dict[str, Any] = field(default_factory=dict)
 
     @property
     def calibrated(self) -> bool:
         return self.T_cam2base is not None
+
+    @property
+    def simulated(self) -> bool:
+        return self.source == "sim"
+
+    def true_pose(self) -> np.ndarray | None:
+        """Poza, z ktorej kamera widzi scene: prawda dla symulowanej, kalibracja dla prawdziwej."""
+        T = self.sim_pose if self.simulated and self.sim_pose is not None else self.T_cam2base
+        return None if T is None else np.asarray(T, float)
 
     @property
     def trusted(self) -> bool:
@@ -66,11 +81,17 @@ class CameraRecord:
         return K, dist
 
     def view(self) -> CameraView | None:
-        """Kamera jako czesc sceny - tylko, gdy wiadomo, gdzie stoi."""
-        if self.T_cam2base is None:
+        """Kamera jako czesc sceny - tylko, gdy wiadomo, gdzie stoi.
+
+        Kamera symulowana renderuje z prawdziwej pozy (`sim_pose`) i z prawdziwym
+        K - jej "prawdziwe" intrynsyki to te zapisane w `K`, a nominalne sa tylko
+        dla kamer, ktore jeszcze nie widzialy szachownicy.
+        """
+        T = self.true_pose()
+        if T is None:
             return None
         K, _ = self.intrinsics()
-        return CameraView(self.name, K, self.width, self.height, np.asarray(self.T_cam2base, float))
+        return CameraView(self.name, K, self.width, self.height, T)
 
 
 @dataclass
@@ -82,6 +103,9 @@ class Workspace:
     table: dict[str, Any] = field(default_factory=lambda: asdict(Table()))
     card: dict[str, Any] = field(default_factory=lambda: asdict(Card()))
     cameras: list[CameraRecord] = field(default_factory=list)
+    #: Dynamika serw zidentyfikowana na tym ramieniu (`rl.randomize.Dynamics`);
+    #: pusta = model Menagerie. Srodek randomizacji w treningu.
+    dynamics: dict[str, Any] = field(default_factory=dict)
     path: Path | None = field(default=None, compare=False, repr=False)
 
     # --------------------------------------------------------------- obiekty

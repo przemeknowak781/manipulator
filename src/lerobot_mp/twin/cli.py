@@ -2,8 +2,13 @@
 
     lerobot-twin check                       # czy srodowisko jest gotowe (bez renderu)
     lerobot-twin card --tag-mm 50            # arkusz karty kalibracyjnej do druku
+    lerobot-twin board --square-mm 28        # tablica ChArUco do intrynsyk kamery
     lerobot-twin calib-sim --n 5 --cameras 2 # kalibracja w symulacji, oceniana wzgledem prawdy
     lerobot-twin workspace                   # co wiadomo o stanowisku (kamery, kalibracja)
+    lerobot-twin train --task reach          # polityka PPO na GPU (MuJoCo Warp) + ewaluacja na CPU
+    lerobot-twin eval <policy.pt> --rand     # ewaluacja polityki w zwyklym MuJoCo
+    lerobot-twin policies                    # zapisane polityki i ich wyniki
+    lerobot-twin ui                          # panel w przegladarce: http://localhost:8080
 """
 
 from __future__ import annotations
@@ -87,6 +92,21 @@ def _card(a: argparse.Namespace) -> int:
     return 0
 
 
+def _board(a: argparse.Namespace) -> int:
+    import cv2
+
+    from .calib.intrinsics import Board
+
+    board = Board(square=a.square_mm / 1000.0, marker=0.75 * a.square_mm / 1000.0)
+    sheet = board.image(dpi=a.dpi)
+    out = Path(a.out)
+    cv2.imwrite(str(out), sheet)
+    print(f"Zapisano {out} ({sheet.shape[1]} x {sheet.shape[0]} px, {a.dpi} dpi).")
+    print(f"Drukuj w skali 100%. Bok kwadratu ma miec {a.square_mm:.1f} mm - ZMIERZ go po wydruku "
+          f"i wpisz w panelu (zakladka Kalibracja).")
+    return 0
+
+
 def _calib_sim(a: argparse.Namespace) -> int:
     from .calib import simulate
 
@@ -118,6 +138,100 @@ def _workspace(a: argparse.Namespace) -> int:
     return 0
 
 
+def _train(a: argparse.Namespace) -> int:
+    import json
+    import time
+
+    from .rl.evaluate import evaluate
+    from .rl.policy import DEFAULT_DIR
+    from .rl.ppo import PPOConfig, train
+    from .rl.randomize import Dynamics, Randomization
+    from .workspace import Workspace
+
+    ws = Workspace.load(a.workspace)
+    name = a.name or f"{a.task}-{time.strftime('%Y%m%d-%H%M%S')}"
+    out = Path(a.out or DEFAULT_DIR) / name
+    dyn = Dynamics.from_dict(ws.dynamics)
+    rand = Randomization.none() if a.no_rand else Randomization.around(dyn, a.spread)
+    cfg = PPOConfig(num_envs=a.envs, iterations=a.iters, seed=a.seed)
+    init = None
+    if a.init:
+        from .rl.policy import Policy
+
+        init = Policy.load(a.init)
+        a.task = init.task.name
+        cfg.init_std = 0.25                            # douczanie: mniejsza eksploracja na starcie
+        print(f"Start z polityki {a.init} ({init.task.name})")
+    print(f"Trening {a.task}: {a.envs} swiatow x {a.iters} iteracji -> {out}")
+    print(f"  dynamika: {dyn.source}; randomizacja: {'brak' if a.no_rand else f'rozrzut x{a.spread}'}")
+
+    def show(p):
+        if p.iteration == 1 or p.iteration % 10 == 0 or p.status != "uczenie":
+            print(f"  it {p.iteration:4d}/{p.iterations}  {p.steps / 1e6:7.2f} M krokow  {p.fps / 1e3:5.0f} k/s  "
+                  f"sukces {p.success:5.1%}  nagroda {p.reward:7.2f}  {p.elapsed:5.0f} s", flush=True)
+
+    stop = None
+    if a.stop_file:
+        # Panel zatrzymuje trening, tworzac plik - polityka z tego miejsca zostaje zapisana.
+        import threading
+
+        stop = threading.Event()
+        flag = Path(a.stop_file)
+
+        def watch():
+            while not stop.is_set():
+                if flag.exists():
+                    stop.set()
+                time.sleep(0.5)
+        threading.Thread(target=watch, daemon=True).start()
+    pol = train(a.task, cfg, workspace=ws, randomization=rand, out_dir=out, on_progress=show, stop=stop,
+                init=init)
+    pol = pol.to("cpu")
+    print("Ewaluacja na CPU (zwykle MuJoCo, inny silnik niz w treningu):")
+    for label, r in (("bez randomizacji", None), ("z randomizacja", rand)):
+        res = evaluate(pol, a.eval_episodes, randomization=r, workspace=ws)
+        pol.meta.evals[f"cpu_{'rand' if r else 'nominal'}"] = res
+        print(f"  {label:17s} sukces {res['success']:5.1%}  ({json.dumps({k: round(v, 3) if isinstance(v, float) else v for k, v in res.items()})})")
+    pol.save(out / "policy.pt")
+    print(f"Zapisano {out / 'policy.pt'}")
+    return 0
+
+
+def _eval(a: argparse.Namespace) -> int:
+    from .rl.evaluate import evaluate
+    from .rl.policy import Policy
+    from .rl.randomize import Randomization
+    from .workspace import Workspace
+
+    pol = Policy.load(a.policy)
+    res = evaluate(pol, a.episodes, randomization=Randomization() if a.rand else None,
+                   workspace=Workspace.load(a.workspace))
+    print(f"{a.policy}: {res}")
+    return 0
+
+
+def _policies(a: argparse.Namespace) -> int:
+    from .rl.policy import DEFAULT_DIR, list_policies
+
+    items = list_policies(a.dir or DEFAULT_DIR)
+    if not items:
+        print("Brak zapisanych polityk. Naucz pierwsza:  lerobot-twin train --task reach")
+    for p in items:
+        cpu = p["evals"].get("cpu_rand", {}).get("success")
+        print(f"  {p['name']:32s} {p['task']:6s} GPU {p['success'] or 0:5.1%}  "
+              f"CPU {'-' if cpu is None else f'{cpu:5.1%}'}  {p['steps'] / 1e6:6.1f} M  {p['created']}")
+    return 0
+
+
+def _ui(a: argparse.Namespace) -> int:
+    from .ui.app import main as ui_main
+
+    argv = ["--host", a.host, "--port", str(a.port)]
+    if a.workspace:
+        argv += ["--workspace", a.workspace]
+    return ui_main(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="lerobot-twin", description="Cyfrowy blizniak stanowiska SO-101.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -130,6 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dpi", type=int, default=300)
     p.set_defaults(fn=_card)
 
+    p = sub.add_parser("board", help="tablica ChArUco do intrynsyk kamery (PNG, A4)")
+    p.add_argument("--out", default="tablica_charuco.png")
+    p.add_argument("--square-mm", type=float, default=28.0, help="bok kwadratu szachownicy [mm]")
+    p.add_argument("--dpi", type=int, default=300)
+    p.set_defaults(fn=_board)
+
     p = sub.add_parser("calib-sim", help="kalibracja w symulacji wzgledem prawdy (renderuje!)")
     p.add_argument("--n", type=int, default=5, help="ile losowych stanowisk")
     p.add_argument("--cameras", type=int, default=2)
@@ -141,6 +261,38 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("workspace", help="co wiadomo o stanowisku")
     p.add_argument("--path", default=None)
     p.set_defaults(fn=_workspace)
+
+    p = sub.add_parser("train", help="naucz polityke PPO na GPU (MuJoCo Warp)")
+    p.add_argument("--task", choices=("reach", "lift"), default="reach")
+    p.add_argument("--envs", type=int, default=4096, help="ile swiatow naraz")
+    p.add_argument("--iters", type=int, default=300)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--name", default=None, help="nazwa przebiegu (domyslnie zadanie + data)")
+    p.add_argument("--out", default=None, help="katalog polityk (domyslnie workspace/policies)")
+    p.add_argument("--workspace", default=None, help="plik stanowiska (domyslnie workspace/twin.json)")
+    p.add_argument("--no-rand", action="store_true", help="bez randomizacji dziedziny")
+    p.add_argument("--spread", type=float, default=1.0, help="szerokosc randomizacji wokol zmierzonej dynamiki")
+    p.add_argument("--eval-episodes", type=int, default=50)
+    p.add_argument("--stop-file", default=None, help="przerwij trening, gdy ten plik sie pojawi")
+    p.add_argument("--init", default=None, help="douczanie: start z tej polityki (policy.pt)")
+    p.set_defaults(fn=_train)
+
+    p = sub.add_parser("eval", help="ewaluacja polityki na CPU (zwykle MuJoCo)")
+    p.add_argument("policy", help="sciezka do policy.pt")
+    p.add_argument("--episodes", type=int, default=50)
+    p.add_argument("--rand", action="store_true", help="z randomizacja dziedziny")
+    p.add_argument("--workspace", default=None)
+    p.set_defaults(fn=_eval)
+
+    p = sub.add_parser("policies", help="zapisane polityki i ich wyniki")
+    p.add_argument("--dir", default=None)
+    p.set_defaults(fn=_policies)
+
+    p = sub.add_parser("ui", help="panel blizniaka w przegladarce (viser)")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--workspace", default=None)
+    p.set_defaults(fn=lambda a: _ui(a))
 
     a = ap.parse_args(argv)
     return a.fn(a)

@@ -77,6 +77,20 @@ class Box:
 
 
 @dataclass
+class Panel:
+    """Plaski obraz w scenie - tablica kalibracyjna, plakat, wydruk na blacie.
+
+    `image` (H, W) albo (H, W, 3) uint8 wypelnia prostokat `size` [m] w plaszczyznie
+    xy panelu, gorny wiersz obrazu na +y, patrzy wzdluz +z. Poza wzgledem podstawy.
+    """
+
+    name: str
+    image: np.ndarray
+    size: tuple[float, float]
+    T_panel2base: np.ndarray
+
+
+@dataclass
 class SceneConfig:
     robot: RobotSpec
     table: Table = field(default_factory=Table)
@@ -88,6 +102,10 @@ class SceneConfig:
     #: kolizji, zeby fala trzymala prawdziwy odstep, a nie zera milimetrow.
     card_collider: float | None = None
     objects: list[Box] = field(default_factory=list)
+    #: Obiekty, dla ktorych scena dostaje czujniki kontaktu z kazda ze szczek -
+    #: `<obiekt>_jaw0` (stala) i `<obiekt>_jaw1` (ruchoma), 1 gdy sie stykaja.
+    grasp_sensors: list[str] = field(default_factory=list)
+    panels: list[Panel] = field(default_factory=list)
     #: Oswietlenie: lista (pozycja swiatla nad blatem, jasnosc).
     lights: list[tuple[tuple[float, float, float], float]] = field(
         default_factory=lambda: [((0.4, -0.6, 1.6), 0.55), ((-0.5, 0.3, 1.4), 0.35)]
@@ -254,6 +272,39 @@ def _add_card(spec: mujoco.MjSpec, robot: mujoco.MjSpec, rspec: RobotSpec, card:
         g.group = 1
 
 
+def _add_panel(spec: mujoco.MjSpec, panel: Panel, T_base2world: np.ndarray) -> None:
+    img = np.asarray(panel.image, np.uint8)
+    if img.ndim == 2:
+        img = np.repeat(img[:, :, None], 3, axis=2)
+    tex = spec.add_texture()
+    tex.name = f"panel_{panel.name}"
+    tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    tex.width, tex.height, tex.nchannel = img.shape[1], img.shape[0], 3
+    tex.data = np.ascontiguousarray(img).tobytes()
+    mat = spec.add_material()
+    mat.name = f"panel_{panel.name}"
+    mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = tex.name
+    mat.texuniform = False
+    w, h = panel.size[0] / 2, panel.size[1] / 2
+    mesh = spec.add_mesh()
+    mesh.name = f"panel_{panel.name}"
+    mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
+    mesh.uservert = np.array([-w, -h, 0, w, -h, 0, w, h, 0, -w, h, 0], np.float32)
+    mesh.userface = np.array([0, 1, 2, 0, 2, 3], np.int32)
+    # Wiersz 0 obrazu na gorze (+y) - tak jak tagi karty.
+    mesh.usertexcoord = np.array([0, 1, 1, 1, 1, 0, 0, 0], np.float32)
+    mesh.userfacetexcoord = np.array([0, 1, 2, 0, 2, 3], np.int32)
+    T = T_base2world @ np.asarray(panel.T_panel2base, float)
+    g = spec.worldbody.add_geom()
+    g.name = f"panel_{panel.name}"
+    g.type = mujoco.mjtGeom.mjGEOM_MESH
+    g.meshname = mesh.name
+    g.material = mat.name
+    g.pos, g.quat = T[:3, 3], _quat(T[:3, :3])
+    g.contype = g.conaffinity = 0
+    g.group = 1
+
+
 def _rotmat(quat) -> np.ndarray:
     R = np.zeros(9)
     q = np.asarray(quat, float)
@@ -333,6 +384,18 @@ def build(cfg: SceneConfig) -> Scene:
         g.condim = 4
         g.friction = [1.0, 0.02, 0.002]
 
+    for panel in cfg.panels:
+        _add_panel(spec, panel, T_base2world)
+
+    for obj in cfg.grasp_sensors:
+        for k, jaw in enumerate(cfg.robot.jaw_bodies):
+            s = spec.add_sensor()
+            s.name = f"{obj}_jaw{k}"
+            s.type = mujoco.mjtSensor.mjSENS_CONTACT
+            s.objtype, s.objname = mujoco.mjtObj.mjOBJ_BODY, PREFIX + jaw
+            s.reftype, s.refname = mujoco.mjtObj.mjOBJ_BODY, obj
+            s.intprm = [1, 0, 1]                 # dane: "found"; bez redukcji; jeden kontakt
+
     for view in cfg.cameras:
         T_world = T_base2world @ np.asarray(view.T_cam2base, float)
         cam = world.add_camera()
@@ -347,16 +410,19 @@ def build(cfg: SceneConfig) -> Scene:
         cam.focal_pixel = [K[0, 0], K[1, 1]]
         # Punkt glowny jako przesuniecie srodka obrazu wzgledem niego, w obu osiach
         # "srodek minus K". Srodek piksela (0, 0) to w OpenCV 0, wiec srodek
-        # obrazu to (W - 1) / 2. Obie rzeczy ZMIERZONE na renderze, nie wziete
-        # z dokumentacji:
-        #   * znak w x - przy odwrotnym kadr przesuwal sie o dwukrotnosc
-        #     przesuniecia (62 px przy 30 px), zgodnie w calym kadrze;
-        #   * pol piksela w y - render wychodzil stale 0,5 px wyzej niz rzut K,
-        #     niezaleznie od K, takze przy punkcie glownym w srodku. To roznica
-        #     rasteryzacji OpenGL i modelu otworkowego OpenCV w pionie; w poziomie
-        #     jej nie ma (0,05 px). Przy residuach kalibracji rzedu 0,1 px
-        #     systematyczne 0,5 px przesuneloby wyniki.
-        # Pilnuje tego `test_twin_scene.py` na kulkach w znanych punktach.
-        cam.principal_pixel = [(view.width - 1) / 2 - K[0, 2], view.height / 2 - 1 - K[1, 2]]
+        # obrazu to (W - 1) / 2 i (H - 1) / 2. Znak ZMIERZONY na renderze, nie
+        # wziety z dokumentacji: przy odwrotnym kadr przesuwal sie o dwukrotnosc
+        # przesuniecia (62 px przy 30 px), zgodnie w calym kadrze.
+        #
+        # Obie osie sa symetryczne. Wczesniej w y bylo dodatkowe pol piksela,
+        # zmierzone na srodkach CZERWONYCH plam - a dolna polowa kulki jest
+        # w cieniu, odpada na progu koloru i podnosi srodek plamy o ~0,4 px.
+        # Maska segmentacji (czysta geometria) pokazala, ze to pol piksela
+        # przesuwalo caly kadr o 0,5 px w dol wzgledem rzutu K - to samo
+        # w OpenGL i w rendererze MuJoCo Warp, ktory liczy promienie przez
+        # srodki pikseli z tych samych intrynsyk. Przy f = 600 px to 0,05 st
+        # pochylenia kamery w kalibracji.
+        # Pilnuje tego `test_twin_scene.py` na maskach kulek w znanych punktach.
+        cam.principal_pixel = [(view.width - 1) / 2 - K[0, 2], (view.height - 1) / 2 - K[1, 2]]
 
     return Scene(cfg, spec.compile())

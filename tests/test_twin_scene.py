@@ -33,24 +33,40 @@ def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
     return pose(np.column_stack([x, np.cross(z, x), z]), np.asarray(eye, float))
 
 
+#: Identyfikatory kulek w renderze segmentacji - poza zakresem geomow sceny.
+PROBE_ID = 1000
+
+
 def sphere_centres(scene: sc.Scene, camera: str, points) -> list[np.ndarray]:
-    """Renderuje male czerwone kulki w punktach stolu i zwraca srodki ich plam."""
+    """Renderuje male kulki w punktach stolu i zwraca srodki ich MASEK segmentacji.
+
+    Maska, a nie plama koloru: dolna polowa kulki jest w cieniu i odpada na
+    progu "czerwony", co podnosilo srodek plamy o ~0,4 px - i przykrylo
+    polpikselowy blad punktu glownego w pionie. Maska to czysta geometria.
+    """
     view = scene.camera(camera)
     r = mujoco.Renderer(scene.model, height=view.height, width=view.width)
     try:
+        r.enable_segmentation_rendering()
         r.update_scene(scene.data, camera=camera)
-        for x, y in points:
+        for k, (x, y) in enumerate(points):
             p = scene.T_base2world @ np.array([x, y, 0.004, 1.0])
             g = r.scene.geoms[r.scene.ngeom]
             mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_SPHERE, np.array([0.004, 0.0, 0.0]), p[:3],
                                 np.eye(3).ravel(), np.array([1.0, 0.0, 0.0, 1.0], np.float32))
+            # `mjv_initGeom` zostawia segid 0 - kulka dostalaby kolor pierwszego geomu sceny.
+            g.segid = r.scene.ngeom
+            g.objid = PROBE_ID + k
             r.scene.ngeom += 1
-        img = r.render()
+        seg = r.render()[..., 0]
     finally:
         r.close()
-    red = ((img[..., 0] > 150) & (img[..., 1] < 90) & (img[..., 2] < 90)).astype(np.uint8)
-    n, _, stats, cent = cv2.connectedComponentsWithStats(red)
-    return [cent[i] for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] > 3]
+    centres = []
+    for k in range(len(points)):
+        v, u = np.nonzero(seg == PROBE_ID + k)
+        if len(u) > 3:
+            centres.append(np.array([u.mean(), v.mean()]))
+    return centres
 
 
 @pytest.mark.parametrize(
@@ -74,7 +90,7 @@ def test_sim_camera_renders_where_its_intrinsics_project(K):
         uv = (K @ pc[:3])[:2] / pc[2]
         errs.append(min(blobs, key=lambda b: np.linalg.norm(b - uv)) - uv)
     errs = np.array(errs)
-    # Srodek plamy kuli to rzut jej srodka tylko w przyblizeniu; systematyczne
+    # Srodek maski kuli to rzut jej srodka tylko w przyblizeniu; systematyczne
     # przesuniecie (srednia) ma byc zerowe, rozrzut - pojedyncze dziesiate piksela.
     assert np.abs(errs.mean(axis=0)).max() < 0.15, f"systematyczne przesuniecie {errs.mean(axis=0)} px"
     assert np.linalg.norm(errs, axis=1).max() < 0.4

@@ -23,7 +23,10 @@ feetech = ["pyserial>=3.5"]
 # Most COM <-> TCP - potrzebny tylko na maszynie, do ktorej wpiete jest ramie.
 bridge = ["pyserial>=3.5"]
 # Cyfrowy blizniak: symulacja, srodowisko RL i panel webowy.
-twin = ["mujoco>=3.3", "gymnasium>=1.0", "viser>=1.0", "pyserial>=3.5"]
+twin = ["mujoco>=3.3", "gymnasium>=1.0", "viser>=1.1", "pyserial>=3.5"]
+# Trening na GPU: tysiace swiatow MuJoCo Warp + PPO w torchu. UWAGA: na Windows
+# PyPI daje torch BEZ CUDA - koło z CUDA trzeba wziac z indeksu PyTorcha, patrz docs/TWIN.md.
+train = ["mujoco>=3.14", "mujoco-warp>=3.14", "torch>=2.2"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]

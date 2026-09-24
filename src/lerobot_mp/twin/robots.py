@@ -73,6 +73,8 @@ class RobotSpec:
     wave_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     #: Kamery zamontowane na ramieniu (nazwy kamer w MJCF).
     onboard_cameras: tuple[str, ...] = ()
+    #: Ciala obu szczek (stala, ruchoma) - czujniki kontaktu chwytu w zadaniach RL.
+    jaw_bodies: tuple[str, str] = ("", "")
 
     @property
     def mjcf_path(self) -> Path:
@@ -110,6 +112,7 @@ SO101 = RobotSpec(
         "wrist_flex": (-70.0, 80.0),
     },
     onboard_cameras=("wrist_cam",),
+    jaw_bodies=("gripper", "moving_jaw_so101_v1"),
 )
 
 REGISTRY: dict[str, RobotSpec] = {SO101.name: SO101}

@@ -104,7 +104,7 @@ class CameraHub:
         """Najnowszy kadr RGB albo None."""
         rec = self.workspace.camera(name)
         if rec.source == "sim":
-            return self.sim_render(name) if self.sim_render and rec.calibrated else None
+            return self.sim_render(name) if self.sim_render and rec.true_pose() is not None else None
         with self._lock:
             live = self._live.get(name)
         return live.rgb() if live else None

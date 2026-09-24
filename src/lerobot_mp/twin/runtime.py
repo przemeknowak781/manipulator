@@ -89,6 +89,47 @@ def smoothstep(s: float) -> float:
     return s * s * (3 - 2 * s)
 
 
+class RenderWorker:
+    """Jeden watek, ktory robi wszystkie rendery OpenGL blizniaka.
+
+    Kontekst OpenGL moze byc biezacy tylko w jednym watku naraz, a render
+    zamawiaja: panel (podglady kamer), fala kalibracyjna (kamery symulowane),
+    mapa stolu i porownanie sim-real - kazde z innego watku. Zamiast pilnowac
+    `make_current` w kazdym z nich, wszystko idzie przez kolejke do tego watku.
+    """
+
+    def __init__(self):
+        import queue
+
+        self._q: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="render", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            fn, done, box = self._q.get()
+            if fn is None:
+                return
+            try:
+                box["out"] = fn()
+            except BaseException as exc:                   # przekazane do zamawiajacego
+                box["err"] = exc
+            done.set()
+
+    def call(self, fn):
+        if threading.current_thread() is self._thread:
+            return fn()
+        done, box = threading.Event(), {}
+        self._q.put((fn, done, box))
+        done.wait()
+        if "err" in box:
+            raise box["err"]
+        return box.get("out")
+
+    def stop(self) -> None:
+        self._q.put((None, None, None))
+
+
 class Twin:
     """Scena + ramie + kamery jednego stanowiska."""
 
@@ -96,6 +137,12 @@ class Twin:
         self.workspace = workspace
         self.lock = threading.RLock()
         self.loop_hz = loop_hz
+        #: Dodatki sceny ponad stanowisko: karta w szczekach (`with_card`, `card_pose`),
+        #: obiekty zadania (`objects`, `grasp_sensors`). Przezywaja przebudowe sceny.
+        self.extras: dict = {}
+        #: Zwiekszany przy kazdej przebudowie - widoki (panel) wiedza, ze trzeba odswiezyc siatki.
+        self.version = 0
+        self.renderer = RenderWorker()
         self.scene: sc.Scene = sc.build(workspace.scene_config())
         with self.lock:
             self.scene.set_joints(workspace.spec().home)
@@ -113,18 +160,41 @@ class Twin:
     # ------------------------------------------------------------ scena
     def rebuild(self) -> None:
         """Przebudowa sceny po zmianie stanowiska (kamery, stol) - poza ramienia zostaje."""
-        with self.lock:
-            joints = self.scene.joints()
-            ctrl = self.scene.data.ctrl.copy()
-            self.scene.close()
-            self.scene = sc.build(self.workspace.scene_config())
-            self.scene.set_joints(joints)
-            if len(ctrl) == len(self.scene.data.ctrl):
-                self.scene.data.ctrl[:] = ctrl
+        # Cala przebudowa w watku renderujacym: kontekst GL zamyka watek, ktory go
+        # stworzyl. Blokada brana DOPIERO tam - czekanie na watek renderujacy
+        # z blokada w reku zakleszczyloby sie z renderem, ktory czeka na blokade.
+        cfg = self.workspace.scene_config(**self.extras)
+
+        def job():
+            new = sc.build(cfg)
+            with self.lock:
+                joints = self.scene.joints()
+                ctrl = self.scene.data.ctrl.copy()
+                self.scene.close()
+                self.scene = new
+                self.scene.set_joints(joints)
+                if len(ctrl) == len(self.scene.data.ctrl):
+                    self.scene.data.ctrl[:] = ctrl
+                self.version += 1
+        self.renderer.call(job)
+
+    def configure(self, **extras) -> None:
+        """Nowe dodatki sceny (np. `with_card=True` albo kostka) i przebudowa."""
+        self.extras = {k: v for k, v in extras.items() if v is not None}
+        self.rebuild()
 
     def render(self, camera: str) -> np.ndarray:
-        with self.lock:
-            return self.scene.render(camera)
+        def job():
+            with self.lock:
+                return self.scene.render(camera)
+        return self.renderer.call(job)
+
+    def render_with(self, fn):
+        """Dowolny render na scenie (np. segmentacja) w watku renderujacym, pod blokada."""
+        def job():
+            with self.lock:
+                return fn(self.scene)
+        return self.renderer.call(job)
 
     def joints(self) -> dict[str, float]:
         with self.lock:
@@ -264,5 +334,9 @@ class Twin:
     def close(self) -> None:
         self.disconnect()
         self.cameras.close()
-        with self.lock:
-            self.scene.close()
+
+        def job():
+            with self.lock:
+                self.scene.close()
+        self.renderer.call(job)
+        self.renderer.stop()
