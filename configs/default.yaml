@@ -27,7 +27,7 @@ camera:
 
 tracker:
   backend: auto        # auto | tasks (MediaPipe 1.x) | legacy (0.10.x)
-  model_path: models/hand_landmarker.task   # pobiera sie sam przy 1. starcie
+  model_path: models/hand_landmarker.task   # w repozytorium (models/README.md); brakujacy pobiera sie sam z model_url
   num_hands: 2
   preferred_hand: any  # any | Left | Right
   min_detection_confidence: 0.6

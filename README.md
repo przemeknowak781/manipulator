@@ -54,6 +54,9 @@ podręczna kerneli MuJoCo Warp (ok. 100 s kompilacji przy pierwszym treningu).
 graficzna, także zintegrowana). Trening polityk wymaga karty **NVIDIA z CUDA**
 (sterownik z obsługą CUDA 12). Bez niej działa wszystko poza treningiem: panel,
 kalibracja, percepcja, identyfikacja dynamiki i ewaluacja polityk na CPU.
+Miejsce na dysku: ok. 5 GB na `.venv` z torchem CUDA (sam torch ok. 3,9 GB),
+ok. 1 GB bez NVIDIA (torch CPU); przy instalacji z CUDA dodatkowo ok. 3 GB
+pamięci podręcznej pip (`pip install --no-cache-dir …` jej nie tworzy).
 Sprawdzone wersje pakietów są w [`constraints.txt`](constraints.txt).
 
 ### 1. Instalacja
@@ -64,6 +67,7 @@ Sprawdzone wersje pakietów są w [`constraints.txt`](constraints.txt).
 git clone <adres-repozytorium> manipulator
 cd manipulator
 py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass   # tylko to okno; bez tego Activate.ps1 jest zablokowany
 .venv\Scripts\activate
 python -m pip install --upgrade pip
 # torch z CUDA NAJPIERW - torch z PyPI na Windows jest bez CUDA
@@ -71,9 +75,20 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
 pip install -e ".[twin,train,feetech,dev]" -c constraints.txt
 ```
 
-Karty RTX 50xx: `cu128` zamiast `cu126`. Mało miejsca na `C:`? Ustaw
-`$env:TMP` i `$env:PIP_CACHE_DIR` na inny dysk przed instalacją (koło torcha
-z CUDA ma ok. 2,6 GB).
+Świeży Windows blokuje skrypty PowerShella („running scripts is disabled on
+this system”), stąd `Set-ExecutionPolicy` przed aktywacją — w każdym nowym
+oknie przed `.venv\Scripts\activate`, albo raz na stałe:
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. W `cmd.exe` aktywacja to
+`.venv\Scripts\activate.bat` i nic więcej nie trzeba. Można też nie aktywować
+wcale i pisać `.venv\Scripts\python -m pip …`, `.venv\Scripts\lerobot-twin …`.
+
+Karty RTX 50xx: `cu128` zamiast `cu126`. Mało miejsca na `C:`? Przed
+instalacją (w tym samym oknie PowerShella) przenieś pliki tymczasowe i pamięć
+podręczną pip na inny dysk:
+
+```powershell
+$env:TMP='D:\tmp'; $env:PIP_CACHE_DIR='D:\tmp\pipcache'   # cmd.exe: set TMP=D:\tmp & set PIP_CACHE_DIR=D:\tmp\pipcache
+```
 
 **Linux + karta NVIDIA** (x86_64, glibc ≥ 2.28, np. Ubuntu 22.04/24.04):
 
@@ -90,9 +105,25 @@ sudo usermod -aG dialout $USER    # dostęp do portu ramienia (po tym wyloguj si
 Torch z PyPI na Linuksie jest z CUDA 13 i wymaga sterownika ≥ 580 — dlatego
 też tu indeks `cu126`. Na serwerze bez ekranu: `export MUJOCO_GL=egl`.
 
-**Bez karty NVIDIA** (Windows, Linux; macOS z Apple Silicon):
+**Bez karty NVIDIA** — te same kroki, tylko torch z indeksu `cpu` i bez `train`:
+
+```powershell
+# Windows (PowerShell)
+git clone <adres-repozytorium> manipulator
+cd manipulator
+py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[twin,feetech,dev]" -c constraints.txt
+```
 
 ```bash
+# Linux (pakiety systemowe jak wyżej) i macOS z Apple Silicon
+git clone <adres-repozytorium> manipulator && cd manipulator
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu   # macOS: pip install torch==2.11.0
 pip install -e ".[twin,feetech,dev]" -c constraints.txt
 ```
@@ -109,8 +140,8 @@ lerobot-twin check
 
 Wypisuje wersje (mujoco, viser, torch, cv2…), model SO-101 i porty USB-serial,
 a osobno gotowość do treningu: torch z CUDA (`cuda.is_available`, karta), warp
-i mujoco_warp. „Trening na GPU: niedostępny” na komputerze bez NVIDIA to nie
-błąd.
+i mujoco_warp — `OK` przy każdej gotowej pozycji, `--` przy niedostępnej.
+„Trening na GPU: niedostępny” na komputerze bez NVIDIA to nie błąd.
 
 ### 3. Panel bliźniaka z przykładowym stanowiskiem
 
@@ -118,6 +149,12 @@ błąd.
 lerobot-twin demo     # examples/twin.sim.json -> workspace/twin.json (istniejącego nie nadpisze bez --force)
 lerobot-twin ui       # http://localhost:8080
 ```
+
+Port 8080 zajęty (inny serwer, proxy)? `lerobot-twin ui --port 8765` i adres
+`http://localhost:8765`. Na starcie panel wypisuje w konsoli pełną ścieżkę pliku
+stanowiska (`istnieje` albo `nowe, puste`) i katalog polityk — tak widać, że
+użyty jest `workspace/twin.json` z klonu, także gdy panel odpalono z innego
+katalogu. To samo pokazuje `lerobot-twin workspace`.
 
 W panelu: zakładka **Ramię** → `sim` → **Połącz**; zakładka **Polityki** →
 `lift-v3`, `lift: skad polozenie kostki` = **kamery**, kostkę kładzie przycisk
@@ -130,13 +167,17 @@ Karta z panelem musi być widoczna: viser w karcie w tle nic nie rysuje.
 ### 4. Testy
 
 ```bash
-pytest -q                     # ok. 6 min na RTX A4500 (+ ok. 100 s kompilacji kerneli Warp za 1. razem)
+pytest -q                     # ok. 3-4 min na RTX A4500 (+ ok. 100 s kompilacji kerneli Warp za 1. razem)
 pytest -q -m "not render"     # komputer bez OpenGL
 ```
 
 Testy GPU pomijają się same bez CUDA albo bez `mujoco_warp`; testy bliźniaka —
 bez `mujoco`/`torch`. Jeden stary test (`test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`)
 jest oznaczony jako znany problem (`xfail`).
+
+Czysty wynik bez NVIDIA i bez LeRobota: same `passed` poza **7 skipped**
+(4 testy GPU, 3 testy LeRobota) i **1 xfailed**; ok. 2–3 min na CPU. Z kartą
+NVIDIA zostają tylko 3 pominięcia LeRobota (albo żadne, gdy jest zainstalowany).
 
 ### 5. Trening (tylko NVIDIA)
 

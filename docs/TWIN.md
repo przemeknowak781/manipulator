@@ -52,6 +52,7 @@ Najważniejsze zasady:
 ```bash
 # Windows + NVIDIA (PowerShell); Linux: python3.12 i source .venv/bin/activate
 py -3.12 -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass   # świeży Windows blokuje Activate.ps1; cmd.exe: .venv\Scripts\activate.bat
 .venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126   # bez NVIDIA: .../whl/cpu
@@ -96,14 +97,15 @@ Shadow to Windows x86-64 z **RTX A4500 (20 GB)**, sterownik 565.90 (CUDA 12.7)
 — `cu126` na nim działa. WSL2 nie ruszy (wirtualka nie udostępnia
 zagnieżdżonej wirtualizacji), ale nie jest potrzebne: MuJoCo Warp i PyTorch
 z CUDA działają natywnie. Na `C:` zostaje niewiele miejsca — duże pakiety
-instaluj z `TMP` i `PIP_CACHE_DIR` na `D:` (`set TMP=D:\tmp`) albo
-z `--no-cache-dir`. Czasy w tym dokumencie bez innego opisu są zmierzone
+instaluj z `TMP` i `PIP_CACHE_DIR` na `D:` — w PowerShellu
+`$env:TMP='D:\tmp'; $env:PIP_CACHE_DIR='D:\tmp\pipcache'` (w `cmd.exe`:
+`set TMP=D:\tmp`) — albo z `--no-cache-dir`. Czasy w tym dokumencie bez innego opisu są zmierzone
 na Shadow.
 
 ## Panel
 
 ```bash
-lerobot-twin ui                  # http://localhost:8080
+lerobot-twin ui                  # http://localhost:8080; zajęty port: --port 8765
 lerobot-twin ui --host 0.0.0.0   # także z sieci — panel nie ma hasła, tylko w zaufanej sieci
 ```
 

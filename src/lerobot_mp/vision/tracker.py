@@ -8,6 +8,7 @@ i w obu przypadkach zwraca ten sam `TrackResult`.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import urllib.request
 from pathlib import Path
@@ -37,25 +38,45 @@ def model_location(model_path: str | Path) -> Path:
     return path
 
 
+class ModelDownloadError(RuntimeError):
+    """Modelu nie ma na dysku i nie udalo sie go pobrac."""
+
+
+def manual_download_hint(path: Path, url: str) -> str:
+    """Polecenie do recznego pobrania modelu, dzialajace w danej powloce.
+
+    W Windows PowerShell 5.1 `curl` to alias Invoke-WebRequest (bez `-L`),
+    wiec podajemy `curl.exe` (jest w Windows 10/11) i wariant PowerShella.
+    """
+    if os.name == "nt":
+        return (
+            f"  curl.exe -L -o {path} {url}\n"
+            f"  albo w PowerShell: Invoke-WebRequest -Uri {url} -OutFile {path}"
+        )
+    return f"  curl -L -o {path} {url}"
+
+
 def download_model(model_path: str, url: str, label: str = "MediaPipe") -> Path:
     """Zwraca sciezke do modelu `.task`, pobierajac go przy pierwszym uzyciu."""
     path = model_location(model_path)
     if path.is_file() and path.stat().st_size > 0:
         return path
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Pobieram model %s do %s ...", label, path)
     tmp = path.with_suffix(path.suffix + ".part")
     try:
         with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
-            tmp.write_bytes(response.read())
+            data = response.read()
+        # katalog dopiero po udanym pobraniu - nieudana proba nie zostawia pustego models/
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(data)
         tmp.replace(path)
     except Exception as exc:  # pragma: no cover - zalezne od sieci
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(
+        raise ModelDownloadError(
             f"Nie udalo sie pobrac modelu {label} ({exc}).\n"
             f"Pobierz go recznie i zapisz jako {path}:\n"
-            f"  curl -L -o {path} {url}"
+            f"{manual_download_hint(path, url)}"
         ) from exc
     logger.info("Model pobrany (%.1f MB).", path.stat().st_size / 1e6)
     return path
@@ -207,6 +228,9 @@ class HandTracker:
 
         try:
             return _TasksBackend(cfg)
+        except ModelDownloadError:
+            # mediapipe jest, brakuje tylko pliku modelu - stare API tu nie pomoze
+            raise
         except Exception as tasks_exc:
             logger.warning("Tasks API niedostepne (%s) - probuje starego API.", tasks_exc)
             try:
@@ -216,7 +240,11 @@ class HandTracker:
                     "Nie udalo sie uruchomic zadnego backendu MediaPipe.\n"
                     f"  tasks : {tasks_exc}\n"
                     f"  legacy: {legacy_exc}\n"
-                    "Zainstaluj mediapipe: pip install 'mediapipe>=0.10.9'"
+                    + (
+                        "Zainstaluj mediapipe: pip install 'mediapipe>=0.10.9'"
+                        if isinstance(tasks_exc, ImportError) or isinstance(legacy_exc, ImportError)
+                        else ""
+                    )
                 ) from legacy_exc
 
     @property

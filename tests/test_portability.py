@@ -125,3 +125,55 @@ def test_example_workspace_is_not_shipped_as_the_live_one():
     ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
     assert re.search(r"^workspace/$", ignore, re.M)
     assert re.search(r"^\.claude/$", ignore, re.M)
+
+
+def _offline(monkeypatch):
+    import urllib.request
+
+    def fail(*_a, **_k):
+        raise OSError("brak sieci")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+
+
+def test_failed_model_download_leaves_no_folder_and_gives_a_working_command(monkeypatch, tmp_path):
+    import os
+
+    from lerobot_mp.vision.tracker import ModelDownloadError, download_model
+
+    _offline(monkeypatch)
+    target = tmp_path / "nowy" / "hand.task"
+    with pytest.raises(ModelDownloadError) as err:
+        download_model(str(target), "https://example.invalid/hand.task", "dloni")
+    assert not target.parent.exists()
+    msg = str(err.value)
+    # W PowerShell 5.1 `curl` to alias Invoke-WebRequest i nie zna -L.
+    if os.name == "nt":
+        assert "curl.exe -L -o" in msg and "Invoke-WebRequest" in msg
+    else:
+        assert "curl -L -o" in msg
+
+
+def test_missing_model_is_not_reported_as_missing_mediapipe(monkeypatch):
+    pytest.importorskip("mediapipe.tasks.python")
+    from lerobot_mp.vision import tracker
+
+    def no_model(_cfg):
+        raise tracker.ModelDownloadError("Nie udalo sie pobrac modelu dloni")
+
+    monkeypatch.setattr(tracker, "ensure_model", no_model)
+    with pytest.raises(tracker.ModelDownloadError) as err:
+        tracker.HandTracker._make_backend(TrackerConfig(backend="auto"))
+    assert "pip install" not in str(err.value)
+
+
+def test_ui_banner_names_the_workspace_file_from_any_directory(monkeypatch, tmp_path):
+    from lerobot_mp.twin.cli import _ui_banner
+
+    monkeypatch.chdir(tmp_path)
+    text = _ui_banner(None)
+    assert str((REPO_ROOT / "workspace" / "twin.json").resolve()) in text
+    assert str((REPO_ROOT / "workspace" / "policies").resolve()) in text
+    own = tmp_path / "moje.json"
+    own.write_text("{}", encoding="utf-8")
+    assert f"{own.resolve()} (istnieje)" in _ui_banner("moje.json")
