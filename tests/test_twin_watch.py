@@ -1,7 +1,7 @@
 """Straznik przestawionej kamery, maska ramienia w geometrii surowego kadru i wiek kadrow z kamer.
 
-Bez sprzetu i bez przegladarki: syntetyczne kadry z tekstura (jak blat z przedmiotami)
-i atrapa strumienia kamery.
+Bez sprzetu i bez przegladarki: syntetyczne kadry z tekstura (jak blat z przedmiotami),
+kadry z blizniaka z ruchomym ramieniem i atrapa strumienia kamery.
 """
 
 from __future__ import annotations
@@ -40,6 +40,109 @@ def test_roll_and_motion_along_the_optical_axis_are_caught(roll, zoom):
     w.remember("k", img)
     assert w.check("k", moved(img, roll, zoom)) > 8.0
     assert w.moved("k")
+
+
+def corner_shift(roll_deg: float = 0.0, zoom: float = 1.0, tx: float = 0.0,
+                 w: int = 640, h: int = 480) -> float:
+    """Prawdziwe najwieksze przesuniecie naroznika kadru po `moved`."""
+    M = cv2.getRotationMatrix2D(((w - 1) / 2, (h - 1) / 2), roll_deg, zoom)
+    M[0, 2] += tx
+    c = np.array([[0, 0, 1], [w - 1, 0, 1], [0, h - 1, 1], [w - 1, h - 1, 1]], float)
+    return float(np.linalg.norm(c @ M.T - c[:, :2], axis=1).max())
+
+
+@pytest.mark.parametrize("roll, zoom", [(0.0, 1.01), (0.0, 0.99), (0.0, 1.02), (0.0, 1.03), (1.0, 1.0),
+                                        (1.0, 1.01)])
+def test_small_zoom_and_roll_are_measured_not_just_flagged(roll, zoom):
+    """Zblizenie 1% to 4 px naroznika (prog 3 px): wczesniej mierzone 0,1 px, 2% - 2,3 px,
+    3% - 6,7 zamiast 12."""
+    img = textured(5)
+    w = CameraWatch()
+    w.remember("k", img)
+    got = w.check("k", moved(img, roll, zoom))
+    assert got == pytest.approx(corner_shift(roll, zoom), rel=0.1)
+    assert w.moved("k")
+    assert w.detail["k"]["scale"] == pytest.approx(zoom, abs=0.001)
+
+
+@pytest.fixture(scope="module")
+def twin_frames():
+    """Blizniak: kadr odniesienia, ramie w innej pozie (kamera stoi) i ta sama poza po ruchu kamery.
+
+    Scena uboga w teksture (gladki blat, jedna kostka) z twardym cieniem ramienia -
+    gorszy przypadek niz biurko: cien ramienia jest tu jedyna "tekstura", ktora sie zmienia.
+    """
+    mujoco = pytest.importorskip("mujoco")
+    from lerobot_mp.twin import scene as sc
+    from lerobot_mp.twin.kinematics import pose
+    from lerobot_mp.twin.robots import SO101
+    from lerobot_mp.twin.ui.watch import arm_mask
+
+    K = np.array([[560.0, 0, 322.0], [0, 560.0, 236.0], [0, 0, 1]])
+    eye, target = np.array([0.6, -0.45, 0.4]), np.array([0.15, 0, 0.05])
+    z = (target - eye) / np.linalg.norm(target - eye)
+    x = np.cross(z, [0, 0, 1.0])
+    x /= np.linalg.norm(x)
+    T = pose(np.column_stack([x, np.cross(z, x), z]), eye)
+    other = dict(SO101.home, shoulder_pan=40.0, elbow_flex=10.0)
+
+    def render(Kc, Tc, joints):
+        cfg = sc.SceneConfig(SO101, cameras=[sc.CameraView("c", Kc, 640, 480, Tc)],
+                             objects=[sc.Box("k", (0.02,) * 3, (0.25, 0.1))])
+        with sc.build(cfg) as s:
+            s.set_joints(joints)
+            mujoco.mj_forward(s.model, s.data)
+            return s.render("c"), arm_mask(s, "c")
+
+    frames = {"ref": render(K, T, SO101.home), "still": render(K, T, other)}
+    mask = frames["still"][1]                    # maska z blizniaka: kamera w SKALIBROWANEJ pozie
+    a = np.radians(1.0)
+    Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+    frames["roll 1 st."] = (render(K, pose(T[:3, :3] @ Rz, T[:3, 3]), other)[0], mask)
+    for zoom in (1.01, 1.02, 1.03):
+        Kz = K.copy()
+        Kz[:2, :2] *= zoom                        # czysta skala wokol punktu glownego
+        frames[f"zoom {zoom}"] = (render(Kz, T, other)[0], mask)
+    return frames
+
+
+def test_camera_motion_is_measured_while_the_arm_moves_in_the_twin(twin_frames):
+    """Ramie w innej pozie + kamera obrocona o 1 st. albo zblizona o 1/2/3%.
+
+    Przed zmiana (ECC euklidesowe + skala z afinicznego z martwa strefa 1,5%):
+    zblizenie 1% 4-5 px tylko dzieki falszywemu obrotowi 0,25 st., 2% - 12-15 px
+    przy prawdzie 8, 3% - 20-44 px przy prawdzie 12.
+    """
+    frames = twin_frames
+    w = CameraWatch()
+    w.remember("c", *frames["ref"])
+    # Kamera stoi, ruszylo sie tylko ramie (z cieniem): szum ponizej polowy progu.
+    assert w.check("c", *frames["still"]) < 1.5
+    assert not w.moved("c")
+    corners = np.array([[0, 0], [639, 0], [0, 479], [639, 479]], float) - [322.0, 236.0]
+    half_diag = float(np.linalg.norm(corners, axis=1).max())
+    for name, true in (("roll 1 st.", half_diag * np.radians(1.0)), ("zoom 1.01", half_diag * 0.01),
+                       ("zoom 1.02", half_diag * 0.02), ("zoom 1.03", half_diag * 0.03)):
+        got = w.check("c", *frames[name])
+        assert w.moved("c"), f"{name}: {got:.2f} px"
+        assert got == pytest.approx(true, abs=1.0), name
+
+
+def test_a_check_costs_a_few_milliseconds_not_hundreds(twin_frames):
+    """`_tick_watch` idzie w petli panelu co 2 s dla kazdej kamery - wczesniej 30-300 ms na kamere
+    (mediana 88 ms na tych kadrach), a petla panelu stala; teraz ~10-15 ms.
+
+    Mediana po roznych ruchach kamery z ruchomym ramieniem, kadr 640x480.
+    """
+    w = CameraWatch()
+    w.remember("c", *twin_frames["ref"])
+    times = []
+    for _ in range(2):
+        for name in ("still", "roll 1 st.", "zoom 1.01", "zoom 1.02", "zoom 1.03"):
+            t0 = time.perf_counter()
+            w.check("c", *twin_frames[name])
+            times.append(time.perf_counter() - t0)
+    assert np.median(times) < 0.030, f"mediana {1000 * np.median(times):.0f} ms"
 
 
 def test_translation_is_measured_and_a_still_camera_stays_quiet_after_many_checks():

@@ -126,9 +126,12 @@ class CubeDetection:
     rot: np.ndarray          # obrot (3, 3) - tylko wokol z
     area_px: float
     confidence: float
-    #: Ile kamer realnie widzialo kostke w dopasowanej pozie (0 = nie wiadomo, np. z mapy).
-    #: Jedna kamera nie odrozni kostki podniesionej od lezacej dalej na tym samym promieniu.
-    n_cameras: int = 0
+    #: Ile kamer realnie widzialo kostke w dopasowanej pozie; -1 = nie wiadomo (z mapy,
+    #: `CubeDetector.detect`). Jedna kamera nie odrozni kostki podniesionej od lezacej
+    #: dalej na tym samym promieniu, wiec dla trackera ponizej 2 (takze 0 i -1) to jeden swiadek.
+    #: 0 to NIE "nie wiadomo": dopasowanie sylwetki daje 0, gdy ramie zaslania kostke kazdej
+    #: kamerze w ponad polowie - czyli wlasnie przy kostce w szczekach.
+    n_cameras: int = -1
     #: Chwila wykonania kadrow (time.monotonic), z ktorych jest detekcja; 0 = nie podano.
     t: float = 0.0
 
@@ -159,25 +162,60 @@ class CubeTracker:
     3-40 cm, a tracker podawal ja polityce jako "kamery" zamiast "w dloni" -
     polityka wracala po nia na blat. Z dala od dloni kostka lezy na blacie
     (nic innego jej nie podnosi), wiec tam jedna kamera wystarcza.
+
+    Wyjatek: kostka potracona chwytakiem. Lezy wtedy obok, jedna kamera widzi ja
+    dobrze - a pomijanie zamrazalo ja w starym miejscu na `hold_s` (zmierzone:
+    lift-v3, tylko kamera `a`, kostka wypadla ze szczek 3,5 cm dalej - polityka
+    przez 130 taktow chwytala puste miejsce, potem "kamery jej nie widza").
+    Pojedynczy swiadek przy dloni jest wiec przyjmowany, gdy szczeka nic nie trzyma
+    (nie sciska, brak kostki w dloni), a `settle_n` kolejnych detekcji lezy w
+    promieniu `settle_spread` od siebie, choc TCP przesunal sie w tym czasie
+    w poziomie o `settle_move` (wiecej niz `settle_spread`). Duch kostki niesionej
+    w szczekach tak nie umie: to rzut kostki wzdluz promienia kamery na blat, wiec
+    jedzie w poziomie razem z dlonia (i szybciej od niej). Dlon stojaca w miejscu
+    niczego nie dowodzi - wtedy zostaje stare polozenie, a zrodlo mowi, ze jedna
+    kamera widzi kostke gdzie indziej.
+
+    Kostka w dloni, a szczeka przestaje sciskac (zamknela sie na pustym albo
+    otworzyla) - kostka wypadla. Nie wisi w powietrzu tam, gdzie byla w szczekach:
+    zmierzone (lift-v3, kamera `a`) - "ostatnie widziane" 8 cm nad blatem po
+    upuszczeniu, runner liczyl to jako podniesiona i konczyl "zadanie wykonane"
+    z kostka na blacie. Teraz: ostatnie polozenie opuszczone na blat (pod dlonia).
     """
 
     def __init__(self, hold_s: float = 6.0, grab_radius: float = 0.06, grip_margin: float = 0.05,
-                 block_margin: float = 0.05, near_radius: float = 0.10, confirm_dist: float = 0.01):
+                 block_margin: float = 0.05, near_radius: float = 0.10, confirm_dist: float = 0.01,
+                 settle_n: int = 3, settle_spread: float = 0.01, settle_move: float = 0.015,
+                 settle_window: float = 1.5, drop_height: float = 0.01):
         self.hold_s, self.grab_radius = hold_s, grab_radius
         self.grip_margin, self.block_margin = grip_margin, block_margin
         #: "Przy dloni": TCP blizej kostki (ostatniej albo wykrytej) niz tyle [m].
         self.near_radius = near_radius
         #: Pominieta detekcja blizej ostatniego polozenia niz tyle [m] tylko je potwierdza.
         self.confirm_dist = confirm_dist
+        #: Pojedynczy swiadek przy dloni przyjety, gdy `settle_n` detekcji z ostatnich
+        #: `settle_window` s lezy parami blizej niz `settle_spread` [m], a TCP w tym czasie
+        #: przejechal w poziomie co najmniej `settle_move` [m]. Rozrzut polozenia kostki
+        #: lezacej z jednej kamery w blizniaku: 1-3 mm, toczacej sie jeszcze po upadku do 9 mm.
+        self.settle_n, self.settle_spread = settle_n, settle_spread
+        self.settle_move, self.settle_window = settle_move, settle_window
+        #: Kostka upuszczona wyzej niz tyle [m] nad polozeniem lezacej - opuszczana na blat.
+        self.drop_height = drop_height
         self.last: tuple[np.ndarray, np.ndarray] | None = None
         self.t_last = -np.inf
         self.in_hand: np.ndarray | None = None          # poza kostki w ukladzie TCP
         self.source = "brak"
         self._grip_prev: float | None = None
+        self._witness: list[tuple[float, np.ndarray, np.ndarray]] = []   # (t, kostka, TCP) pominiete
+        self._rest_z: float | None = None               # wysokosc srodka kostki lezacej (z kamer)
+        self._carried = False                           # byla w dloni, szczeka dalej sciska
+        #: Dopisek do "ostatnie widziane": pominieta detekcja widzi kostke gdzie indziej
+        #: albo kostka wypadla z dloni - panel mowi to wprost zamiast cicho trzymac stare.
+        self._note = ""
 
     def _single_camera_near_hand(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool) -> bool:
         """Czy detekcja moze byc podniesiona kostka, ktora jedna kamera "polozyla" na blacie."""
-        if not 0 < det.n_cameras < 2:
+        if det.n_cameras >= 2:
             return False
         if self.in_hand is not None or squeezing:
             return True
@@ -186,6 +224,43 @@ class CubeTracker:
         if self.last is not None:
             near |= np.linalg.norm(self.last[0] - tcp) < self.near_radius
         return bool(near)
+
+    def _settled(self, det: CubeDetection, T_tcp: np.ndarray, squeezing: bool, now: float) -> bool:
+        """Czy pojedynczy swiadek przy dloni to kostka LEZACA: stoi, choc dlon jedzie."""
+        if self.in_hand is not None or squeezing:
+            self._witness.clear()
+            return False
+        new = (now, np.asarray(det.pos, float).copy(), T_tcp[:3, 3].copy())
+        # Ciagly ogon swiadkow, ktorzy PARAMI leza blizej niz `settle_spread` - duch, ktory
+        # "wraca" z dlonia w to samo miejsce, i tak przerywa ciag po drodze.
+        keep = [new]
+        for w in reversed(self._witness):
+            if now - w[0] > self.settle_window \
+                    or any(np.linalg.norm(w[1] - k[1]) > self.settle_spread for k in keep):
+                break
+            keep.append(w)
+        self._witness = keep[::-1]
+        if len(self._witness) < self.settle_n:
+            return False
+        # W POZIOMIE: dlon jadaca tylko w gore/dol nad kamera patrzaca z gory przesuwa
+        # ducha kostki w szczekach o ulamek swojego ruchu - moglby "stac".
+        xy = np.array([w[2][:2] for w in self._witness])
+        if np.linalg.norm(xy[:, None] - xy[None], axis=2).max() < self.settle_move:
+            return False
+        self._witness.clear()
+        return True
+
+    def _dropped(self, now: float) -> None:
+        """Kostka byla w dloni, szczeka juz nic nie trzyma - lezy na blacie pod miejscem upadku."""
+        if self.last is None or self._rest_z is None or self.last[0][2] < self._rest_z + self.drop_height:
+            return
+        p = self.last[0].copy()
+        p[2] = self._rest_z
+        # Po upadku zostaje tylko obrot wokol pionu (kostka lezy na scianie).
+        yaw = np.arctan2(self.last[1][1, 0], self.last[1][0, 0])
+        c, s = np.cos(yaw), np.sin(yaw)
+        self.last = (p, np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]))
+        self.t_last, self._note = now, "upuszczona"
 
     def update(self, det: CubeDetection | None, T_tcp: np.ndarray, grip_q: float, grip_cmd: float,
                grip_closed: float, now: float) -> tuple[np.ndarray, np.ndarray] | None:
@@ -197,14 +272,20 @@ class CubeTracker:
         squeezing = grip_q - grip_cmd > self.block_margin and grip_q > grip_closed + self.grip_margin
         holding = still and squeezing
         if det is not None and self._single_camera_near_hand(det, T_tcp, squeezing):
-            # Zgodna z ostatnim polozeniem (kostka lezy, dlon nad nia) - tylko odswieza jego
-            # waznosc, zeby kostka nie "znikala" po `hold_s`, gdy dlon dlugo nad nia krazy.
-            if self.in_hand is None and self.last is not None \
-                    and np.linalg.norm(det.pos - self.last[0]) < self.confirm_dist:
-                self.t_last = now
-            det = None
+            if not self._settled(det, T_tcp, squeezing, now):
+                # Zgodna z ostatnim polozeniem (kostka lezy, dlon nad nia) - tylko odswieza jego
+                # waznosc, zeby kostka nie "znikala" po `hold_s`, gdy dlon dlugo nad nia krazy.
+                if self.in_hand is None and self.last is not None:
+                    if np.linalg.norm(det.pos - self.last[0]) < self.confirm_dist:
+                        self.t_last, self._note = now, ""
+                    elif self._note != "upuszczona":
+                        self._note = "1 kamera widzi ja gdzie indziej"
+                det = None
+        elif det is not None:
+            self._witness.clear()
         if det is not None and not (holding and self.in_hand is not None):
             self.last, self.t_last, self.source = (det.pos, det.rot), now, "kamery"
+            self._rest_z, self._note, self._carried = float(det.pos[2]), "", False
             if not holding:
                 self.in_hand = None
             return self.last
@@ -220,11 +301,22 @@ class CubeTracker:
             if self.in_hand is not None:
                 T = T_tcp @ self.in_hand
                 self.last, self.t_last, self.source = (T[:3, 3].copy(), T[:3, :3].copy()), now, "w dloni"
+                self._note, self._carried = "", False
                 return self.last
         else:
+            # Szczeka stoi ciasniej niz kostka (albo sie otworzyla) - w dloni nic nie ma.
+            # Samo "jeszcze jedzie" przy sciskaniu (drgniecie serwa, kostka sie przekreca)
+            # to jeszcze NIE upadek - ale zapamietane: w blizniaku szczeka po takim takcie
+            # zamykala sie na pustym w nastepnym i upadek przechodzil niezauwazony.
+            if self.in_hand is not None or self._carried:
+                if squeezing:
+                    self._carried = True
+                else:
+                    self._dropped(now)
+                    self._carried = False
             self.in_hand = None
         if self.last is not None and now - self.t_last < self.hold_s:
-            self.source = "ostatnie widziane"
+            self.source = f"ostatnie widziane ({self._note})" if self._note else "ostatnie widziane"
             return self.last
         self.source = "brak"
         return None
