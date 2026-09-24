@@ -7,6 +7,7 @@ nie zalezy od obciazenia procesora.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import asdict
 
 import numpy as np
@@ -101,10 +102,13 @@ def test_home_stops_the_runner(twin, monkeypatch):
 
 
 # ------------------------------------------------------------ koniec po sukcesie (lift)
-def lift_runner(twin, cube_z: float) -> PolicyRunner:
+def lift_runner(twin, cube_z: float, source: str | None = "w dloni", as_tuple: bool = False) -> PolicyRunner:
     task = tk.make_task("lift")
     cube = (np.array([0.2, 0.0, cube_z]), np.eye(3))
-    return PolicyRunner(twin, constant_policy(task), cube_provider=lambda: cube)
+    if as_tuple:                                           # dostawca sam podaje zrodlo pozy
+        return PolicyRunner(twin, constant_policy(task), cube_provider=lambda: (*cube, source))
+    return PolicyRunner(twin, constant_policy(task), cube_provider=lambda: cube,
+                        cube_source=(lambda: source) if source is not None else None)
 
 
 def test_lift_ends_when_the_cube_is_held_above_the_table(twin, monkeypatch):
@@ -126,6 +130,91 @@ def test_lift_does_not_end_while_the_cube_is_on_the_table(twin, monkeypatch):
     runner.start(threaded=False)
     drive(twin, runner, 2.0)
     assert runner.status.running and not runner.status.success
+
+
+@pytest.mark.parametrize("source,as_tuple", [("ostatnie widziane", False), ("ostatnie widziane", True),
+                                             (None, False)])
+def test_lift_success_is_not_counted_from_a_stale_pose(twin, monkeypatch, source, as_tuple):
+    """Kostka wypadla ze szczek, a tracker podawal przez 6 s ostatnia poze w powietrzu jako
+    "ostatnie widziane": runner konczyl "zadanie wykonane" z kostka na blacie. Na prawdziwym
+    ramieniu bez zrodla pozy (stary dostawca) sukces tez sie nie liczy."""
+    connect_fake(twin, monkeypatch, FakeArm())
+    runner = lift_runner(twin, cube_z=0.015 + 0.08, source=source, as_tuple=as_tuple)
+    runner.start(threaded=False)
+    drive(twin, runner, 2.0)
+    assert runner.status.running and not runner.status.success
+    assert runner.status.stopped_because == ""
+
+
+@pytest.mark.parametrize("source", ["kamery", "w dloni"])
+def test_lift_success_counts_from_a_fresh_pose_given_by_the_provider(twin, monkeypatch, source):
+    connect_fake(twin, monkeypatch, FakeArm())
+    runner = lift_runner(twin, cube_z=0.015 + 0.08, source=source, as_tuple=True)
+    runner.start(threaded=False)
+    drive(twin, runner, 2.0)
+    assert runner.status.stopped_because == "zadanie wykonane"
+
+
+# ------------------------------------------------------------ wyscigi przy starcie
+def test_preempt_between_thread_creation_and_start_does_not_leave_the_runner_stuck(twin, monkeypatch):
+    """Dom wcisniety tuz po `Thread()`, przed `.start()`: `stop()` robil join na niewystartowanym
+    watku (RuntimeError), `status.running` zostawal True, a panel widzial "polityka" do recznego Stop."""
+    from lerobot_mp.twin.rl import runner as rn
+
+    connect_fake(twin, monkeypatch, FakeArm())
+    real = threading.Thread
+
+    class RacyThread(real):
+        def start(self):
+            if self.name == "polityka":
+                twin.home()                                # UI wcisnelo Dom wlasnie teraz
+            super().start()
+    monkeypatch.setattr(rn.threading, "Thread", RacyThread)
+    runner = PolicyRunner(twin, constant_policy(tk.make_task("reach"), {0: 0.3}), episode_limit=False)
+    runner.start()
+    if runner._thread is not None:
+        runner._thread.join(1.0)
+    assert not runner.status.running
+    assert "pozycja domowa" in runner.status.stopped_because
+    assert twin.owner is None
+
+
+def test_start_does_not_switch_off_the_clutch_of_the_next_owner(twin, monkeypatch):
+    """STOP miedzy `claim` a sprzeglem runnera, a zaraz potem panel bierze ramie i wlacza sprzeglo:
+    runner wylaczal sprzeglo panelu (pole wyboru w panelu dalej "wlaczone")."""
+    connect_fake(twin, monkeypatch, FakeArm())
+    real_claim = twin.claim
+
+    def claim_then_race(owner, preempt=None):
+        real_claim(owner, preempt)
+        twin.estop("STOP z panelu")
+        twin.clear_estop()
+        real_claim("panel")
+        twin.set_engaged(True)
+    monkeypatch.setattr(twin, "claim", claim_then_race)
+    runner = PolicyRunner(twin, constant_policy(tk.make_task("reach")))
+    with pytest.raises(RuntimeError, match="odebrane"):
+        runner.start(threaded=False)
+    assert twin.owner == "panel"
+    twin.step(0.02)
+    assert twin.status.engaged
+
+
+# ------------------------------------------------------------ chwytak przy stopie na rozjezdzie
+def test_tracking_stop_keeps_the_gripper_squeeze(twin, monkeypatch):
+    """Stop na rozjezdzie trzyma zmierzone stawy ramienia, ale chwytak sciskajacy kostke zostaje
+    przy swoim rozkazie - zmierzony kat zablokowanej szczeki to zerowa sila i kostka wypada."""
+    arm = FakeArm()
+    connect_fake(twin, monkeypatch, arm)
+    arm.blocked["shoulder_pan"] = 10.0
+    arm.blocked["gripper"] = 30.0
+    runner = PolicyRunner(twin, constant_policy(tk.make_task("reach"), {0: 1.0, 5: -1.0}), episode_limit=False)
+    runner.start(threaded=False)
+    drive(twin, runner, 3.0)
+    assert "nie nadaza" in runner.status.stopped_because
+    drive(twin, runner, 0.3)
+    assert arm.sent[-1]["shoulder_pan"] == pytest.approx(10.0, abs=0.5)
+    assert 30.0 - arm.sent[-1]["gripper"] > 10.0
 
 
 # ------------------------------------------------------------ cel reach

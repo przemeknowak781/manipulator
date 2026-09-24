@@ -148,6 +148,10 @@ class Scene:
     def step(self, seconds: float) -> None:
         n = max(1, int(round(seconds / self.model.opt.timestep)))
         mujoco.mj_step(self.model, self.data, nstep=n)
+        # Pozy cial i site'ow po `mj_step` sa sprzed ostatniego podkroku, a katy (qpos) - po
+        # nim. Kostka dla polityki sim, HUD i uchwyt TCP czytaja xpos/site_xpos: bez tego
+        # rozjezdzaly sie z katami o ~1 mm przy niesieniu (K7, jak w env i batch).
+        mujoco.mj_kinematics(self.model, self.data)
 
     # ------------------------------------------------------------ kamery
     def render(self, camera: str) -> np.ndarray:
