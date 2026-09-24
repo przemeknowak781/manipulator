@@ -31,10 +31,15 @@ Pliki są skopiowane bez zmian. Zob. też [NOTICE](../NOTICE).
    bieżącego.
 2. Jeśli pliku nie ma, aplikacja pobiera go z adresu `model_url` przy
    pierwszym użyciu (`vision/tracker.py`, `download_model`). Bez internetu
-   kończy się to komunikatem z gotowym poleceniem `curl`, np.:
+   kończy się to komunikatem z gotowym poleceniem do ręcznego pobrania, np.:
 
    ```
+   # Linux / macOS
    curl -L -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+   # Windows: w PowerShellu samo `curl` to Invoke-WebRequest (bez -L), stąd curl.exe
+   curl.exe -L -o models\hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+   # albo
+   Invoke-WebRequest -Uri https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task -OutFile models\hand_landmarker.task
    ```
 
 Dokładniejszy wariant pozy (`pose_landmarker_full.task`, ok. 0,2° zamiast 0,4°

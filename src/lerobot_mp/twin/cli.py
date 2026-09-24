@@ -86,8 +86,9 @@ def _check(_: argparse.Namespace) -> int:
 
     gpu_ok, gpu_lines = _gpu_report()
     print("\nTrening na GPU (lerobot-twin train) - opcjonalny:")
-    for label, value in gpu_lines:
-        print(f"  --   {label:<28} {value}")
+    for label, value, good in gpu_lines:
+        # OK gdy gotowe; "--" (nie BLAD) gdy niedostepne - trening jest opcjonalny
+        print(f"  {'OK ' if good else '-- '}  {label:<28} {value}")
     print("  " + ("Trening na GPU: gotowy." if gpu_ok else
                   "Trening na GPU: niedostepny. Wymaga karty NVIDIA z CUDA, torcha z CUDA i mujoco-warp\n"
                   "  (pip install -e \".[train]\"). Panel, kalibracja, percepcja i ewaluacja polityk\n"
@@ -97,11 +98,11 @@ def _check(_: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _gpu_report() -> tuple[bool, list[tuple[str, str]]]:
+def _gpu_report() -> tuple[bool, list[tuple[str, str, bool]]]:
     """Co wiadomo o GPU: torch (wersja, CUDA, karta), warp i mujoco_warp. Nic tu nie jest bledem."""
     from importlib.metadata import PackageNotFoundError, version
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, bool]] = []
     ready = True
     try:
         import torch
@@ -110,10 +111,10 @@ def _gpu_report() -> tuple[bool, list[tuple[str, str]]]:
         avail = bool(torch.cuda.is_available())
         name = torch.cuda.get_device_name(0) if avail else "-"
         out.append(("torch CUDA", f"kompilacja CUDA {cuda_build or 'brak (kolo CPU)'}, "
-                                  f"cuda.is_available={avail}, karta: {name}"))
+                                  f"cuda.is_available={avail}, karta: {name}", avail))
         ready &= avail
     except ImportError:
-        out.append(("torch", "brak"))
+        out.append(("torch", "brak", False))
         ready = False
     try:
         import warp as wp
@@ -125,13 +126,13 @@ def _gpu_report() -> tuple[bool, list[tuple[str, str]]]:
         wp.init()
         n = wp.get_cuda_device_count()
         names = ", ".join(d.name for d in wp.get_cuda_devices()) if n else "brak karty CUDA"
-        out.append(("warp", f"{wp.config.version}, widzi GPU: {names}"))
+        out.append(("warp", f"{wp.config.version}, widzi GPU: {names}", n > 0))
         ready &= n > 0
     except ImportError:
-        out.append(("warp", "brak - pip install -e \".[train]\""))
+        out.append(("warp", "brak - pip install -e \".[train]\"", False))
         ready = False
     except Exception as exc:  # noqa: BLE001 - sterownik, CUDA: tylko raport
-        out.append(("warp", f"{type(exc).__name__}: {exc}"))
+        out.append(("warp", f"{type(exc).__name__}: {exc}", False))
         ready = False
     try:
         import mujoco_warp  # noqa: F401
@@ -140,9 +141,9 @@ def _gpu_report() -> tuple[bool, list[tuple[str, str]]]:
             ver = version("mujoco-warp")
         except PackageNotFoundError:  # pragma: no cover
             ver = "?"
-        out.append(("mujoco_warp", ver))
+        out.append(("mujoco_warp", ver, True))
     except ImportError:
-        out.append(("mujoco_warp", "brak - pip install -e \".[train]\""))
+        out.append(("mujoco_warp", "brak - pip install -e \".[train]\"", False))
         ready = False
     return ready, out
 
@@ -192,7 +193,8 @@ def _workspace(a: argparse.Namespace) -> int:
 
     ws = Workspace.load(a.path)
     exists = ws.path is not None and Path(ws.path).is_file()
-    print(f"Stanowisko: {ws.path} {'' if exists else '(jeszcze nie zapisane - wartosci domyslne)'}")
+    where = Path(ws.path).resolve() if ws.path is not None else "-"
+    print(f"Stanowisko: {where} {'' if exists else '(jeszcze nie zapisane - wartosci domyslne)'}")
     print(f"  ramie: {ws.robot}, backend: {ws.backend}, port: {ws.port or '-'}")
     print(f"  karta: tag {ws.card_obj().tag_size * 1000:.1f} mm")
     if not ws.cameras:
@@ -358,9 +360,24 @@ def _policies(a: argparse.Namespace) -> int:
     return 0
 
 
+def _ui_banner(workspace: str | None) -> str:
+    """Ktory plik stanowiska i katalog polityk wezmie panel - widac bez przegladarki.
+
+    Te same reguly co `Workspace.load` i `rl.policy.DEFAULT_DIR`, ale bez ich
+    importu (mujoco, torch), zeby napis byl przed wolnym startem panelu.
+    """
+    from ..paths import data_path
+
+    ws = (Path(workspace) if workspace else data_path(Path("workspace") / "twin.json")).resolve()
+    state = "istnieje" if ws.is_file() else "nowe, puste - przyklad: lerobot-twin demo"
+    policies = data_path(Path("workspace") / "policies").resolve()
+    return f"Stanowisko: {ws} ({state})\nPolityki:   {policies}"
+
+
 def _ui(a: argparse.Namespace) -> int:
     from .ui.app import main as ui_main
 
+    print(_ui_banner(a.workspace), flush=True)
     argv = ["--host", a.host, "--port", str(a.port)]
     if a.workspace:
         argv += ["--workspace", a.workspace]
@@ -473,7 +490,8 @@ def parser() -> argparse.ArgumentParser:
     # uruchomic polityke. Dlatego domyslnie tylko ten komputer; siec na wyrazne zyczenie.
     p.add_argument("--host", default="127.0.0.1",
                    help="adres nasluchu (domyslnie tylko ten komputer; 0.0.0.0 = cala siec, BEZ hasla)")
-    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--port", type=int, default=8080,
+                   help="port panelu (domyslnie 8080; zajety przez inna usluge? np. --port 8765)")
     p.add_argument("--workspace", default=None)
     p.set_defaults(fn=lambda a: _ui(a))
     return ap
