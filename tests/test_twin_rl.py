@@ -184,6 +184,46 @@ def test_randomization_widens_what_identification_did_not_fit():
     assert both.kp == default.kp and both.frictionloss == UNFITTED_RANGES["frictionloss"]
 
 
+def test_randomization_widens_fitted_ranges_to_the_measured_band():
+    """Pasmo z identyfikacji (`Dynamics.band`) poszerza zakres dopasowanego parametru.
+
+    Zmierzone przed poprawka: `around` nie czytal pasma - tlumienie z pasmem +-35 % dostawalo
+    stale 0,75-1,3, a armatura x0,45 z pasmem +-inf (s6 weryfikatora) zwykle +-25 %.
+    """
+    from lerobot_mp.twin.rl.randomize import MAX_BAND, MAX_DELAY_BAND
+
+    default = Randomization()
+    dyn = Dynamics(damping=1.2, armature=0.45, delay=1.0, source="identyfikacja",
+                   fitted=("damping", "armature", "delay"),
+                   band={"damping": 0.35, "armature": float("inf"), "delay": 1.4, "kp": 0.9})
+    r = Randomization.around(dyn)
+    assert r.damping == pytest.approx((0.65, 1.35))
+    assert r.armature == pytest.approx((1 - MAX_BAND, 1 + MAX_BAND))       # inf - przyciete, nie <= 0
+    assert r.kp == (0.6, 1.5)                                               # niedopasowane: pasmo nie liczy sie
+    assert r.max_delay == 3 and r.min_delay == 0                            # ceil(1,0 + 1,4)
+    narrow = Randomization.around(Dynamics(damping=1.1, fitted=("damping", "delay"), band={"damping": 0.05}))
+    assert narrow.damping == default.damping                                # waskie pasmo nie zweza zakresu
+    half = Randomization.around(dyn, spread=0.5)
+    assert half.damping == pytest.approx((1 - 0.35 / 2, 1 + 0.35 / 2))
+    assert not Randomization.around(dyn, spread=0.0).randomized
+    huge = Randomization.around(Dynamics(delay=1.0, fitted=("delay",), band={"delay": float("inf")}))
+    assert huge.max_delay == int(np.ceil(1.0 + MAX_DELAY_BAND))
+    assert Randomization.around(Dynamics(delay=1.0, fitted=("delay",), band={"delay": 0.1})).max_delay == 2
+
+
+def test_dynamics_band_survives_strict_json():
+    """Pasmo z inf przezywa zapis workspace'u - takze scisly JSON (bez Infinity)."""
+    import json
+
+    dyn = Dynamics(damping=1.2, fitted=("damping", "armature"), band={"damping": 0.2, "armature": float("inf")})
+    text = json.dumps(dyn.to_dict(), allow_nan=False)
+    back = Dynamics.from_dict(json.loads(text))
+    assert back == dyn and np.isinf(back.band["armature"])
+    old = dyn.to_dict()
+    old.pop("band")
+    assert Dynamics.from_dict(old).band == {}
+
+
 def test_no_randomization_keeps_the_measured_arm_and_the_camera_model():
     """--no-rand = zmierzona dynamika bez rozrzutu (a nie Menagerie), percepcja kostki jak z kamer."""
     dyn = Dynamics(kp=0.8, damping=1.4, delay=1.6, source="identyfikacja")

@@ -32,6 +32,16 @@ import numpy as np
 #: z taka dynamika. `rl.sysid` mierzy niepewnosc wyniku wlasnie na tych zakresach.
 UNFITTED_RANGES: dict[str, tuple[float, float]] = {"kp": (0.6, 1.5), "frictionloss": (0.5, 2.0)}
 
+#: Najszersze pasmo dopasowanego mnoznika, jakie `Randomization.around` przenosi na zakres
+#: (1 - b, 1 + b). Wiecej nie ma sensu: pasmo +-inf (s6 weryfikatora: armatura x0,45 z
+#: dopasowania, ktore nic nie wyjasnilo) dawaloby mnozniki <= 0, a srodek takiego wyniku
+#: i tak jest zly - takiego wyniku nie zapisuje sie jako dynamiki (`FitResult.useful`).
+MAX_BAND = 0.6
+#: Najwieksze dodatkowe opoznienie [takty] z pasma opoznienia - z tego samego powodu.
+MAX_DELAY_BAND = 2.0
+#: Parametry-mnozniki, ktore `around` rozszerza wedlug pasma.
+MULTIPLIERS = ("kp", "damping", "armature", "frictionloss")
+
 
 @dataclass
 class Dynamics:
@@ -50,16 +60,26 @@ class Dynamics:
     #: Parametry, ktore identyfikacja NAPRAWDE dopasowala (reszta zostala z modelu).
     #: Puste = nic nie mierzono (Menagerie albo dynamika sprzed tego pola).
     fitted: tuple[str, ...] = ()
+    #: Niepewnosc dopasowanych parametrow z identyfikacji (`sysid.FitResult.band`): mnozniki
+    #: wzglednie (0,1 = +-10 %), opoznienie w TAKTACH polityki (jak `delay`); inf = pomiar
+    #: nic o parametrze nie mowi. Puste = brak pomiaru (Menagerie albo stara dynamika).
+    #: Trzymane tu, bo `Randomization.around` rozszerza wedlug niego zakresy treningu -
+    #: wczesniej pasmo zylo tylko w opisie `source`, a srodek z pasmem +-inf dostawal
+    #: zwykle +-25 % (armatura x0,45 -> swiaty 0,34-0,59 przy prawdzie 1,0).
+    band: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["fitted"] = list(self.fitted)                 # JSON workspace'u nie ma krotek
+        # inf jako "inf": json.dumps pisze Infinity, ktorego scisly JSON (przegladarka) nie czyta.
+        out["band"] = {k: (float(v) if np.isfinite(v) else "inf") for k, v in self.band.items()}
         return out
 
     @staticmethod
     def from_dict(data: dict[str, Any] | None) -> Dynamics:
         data = dict(data or {})
         data["fitted"] = tuple(data.get("fitted") or ())
+        data["band"] = {str(k): float(v) for k, v in (data.get("band") or {}).items()}
         return Dynamics(**data)
 
     def is_fitted(self, name: str) -> bool:
@@ -123,11 +143,24 @@ class Randomization:
         Po identyfikacji (`dyn.fitted` niepuste) parametry, ktorych NIE dopasowala (kp,
         tarcie suche), dostaja szerokie `UNFITTED_RANGES` zamiast domyslnych: ich 1,0 to
         model, a nie pomiar, a reszta wyniku jest dobra tylko razem z ich prawdziwa wartoscia.
+
+        Dopasowane parametry z pasmem (`dyn.band`) dostaja zakres co najmniej (1 - b, 1 + b)
+        wokol srodka (b najwyzej `MAX_BAND`), opoznienie - do `delay + b` taktow (najwyzej
+        `MAX_DELAY_BAND` wiecej). Stale +-25 % nie pokrywalo pasma +-35 % tlumienia, ktore
+        identyfikacja sama zglaszala (s17 weryfikatora), a pasma +-inf nie widzialo wcale.
+        `spread` skaluje zakres PO rozszerzeniu, wiec `spread = 0` dalej znaczy "bez rozrzutu".
         """
         base = Randomization()
         spread = max(0.0, float(spread))
         if dyn.fitted:
             base = replace(base, **{k: r for k, r in UNFITTED_RANGES.items() if k not in dyn.fitted})
+        band = dyn.band or {}
+        for k in MULTIPLIERS:
+            b = band.get(k)
+            if k in dyn.fitted and b is not None and not np.isnan(b):
+                b = min(float(b), MAX_BAND)
+                lo, hi = getattr(base, k)
+                base = replace(base, **{k: (min(lo, 1.0 - b), max(hi, 1.0 + b))})
 
         def widen(r):
             return (1.0 - (1.0 - r[0]) * spread, 1.0 + (r[1] - 1.0) * spread)
@@ -136,7 +169,11 @@ class Randomization:
                       frictionloss=widen(base.frictionloss), cube_mass=widen(base.cube_mass),
                       cube_friction=widen(base.cube_friction), centre=dyn)
         if spread > 0:
-            out.min_delay, out.max_delay = 0, int(np.ceil(dyn.delay)) + 1
+            hi = int(np.ceil(dyn.delay)) + 1
+            b = band.get("delay")
+            if "delay" in dyn.fitted and b is not None and not np.isnan(b):
+                hi = max(hi, int(np.ceil(dyn.delay + spread * min(float(b), MAX_DELAY_BAND))))
+            out.min_delay, out.max_delay = 0, hi
         else:
             out.min_delay = out.max_delay = int(round(dyn.delay))
         return out

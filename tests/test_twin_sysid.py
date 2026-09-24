@@ -12,6 +12,7 @@ dawala armature -13 % i opoznienie +5 ms przy "pasmie" +-5 % i +-5 ms.
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -65,6 +66,10 @@ def test_identification_on_the_panel_excitation_is_as_good_as_it_says(truth, del
         err = abs(getattr(dyn, name) / getattr(truth, name) - 1)
         assert err <= out.band[name] <= 0.4, (name, err, out.band[name])
     assert abs(dyn.delay / 20 - delay) <= out.band["delay"] <= 0.01
+    # Pasmo idzie z dynamika do workspace'u (opoznienie w taktach polityki, jak `dyn.delay`).
+    assert dyn.band == {"damping": out.band["damping"], "armature": out.band["armature"],
+                        "delay": pytest.approx(20 * out.band["delay"])}
+    print("idealne", {k: round(v, 3) for k, v in out.band.items()}, out.reasons)
     # kp i tarcie nie sa wyznaczalne z tego ruchu - zostaja z modelu, wynik i opis to mowia.
     assert dyn.kp == 1.0 and dyn.frictionloss == 1.0
     assert dyn.fitted == IDENTIFIED == ("damping", "armature", "delay")
@@ -89,6 +94,29 @@ def test_dynamics_remember_what_was_fitted():
     old = dyn.to_dict()
     old.pop("fitted")
     assert Dynamics.from_dict(old).fitted == () and Dynamics.from_dict(None).fitted == ()
+
+
+def test_a_fit_that_explains_nothing_is_not_useful():
+    """s6 weryfikatora: blad 0,55 -> 0,51 st., armatura x0,45 z pasmem +-inf - panel proponowal
+    zapis, a trening stawal wokol 0,45 przy prawdzie 1,0. Taki wynik ma sie przyznac, ze nic nie mowi."""
+    from lerobot_mp.twin.rl.sysid import FitResult, assess
+
+    inf = float("inf")
+    bad = Dynamics(damping=1.25, armature=0.45, delay=0.02, fitted=IDENTIFIED, fit_deg=0.51,
+                   band={"damping": 0.6, "armature": inf, "delay": inf})
+    res = FitResult(bad, 0.55, {"damping": 0.6, "armature": inf, "delay": inf})
+    assert not res.useful
+    assert any("armature" in r and "nieskonczona" in r for r in res.reasons)
+    assert any("nic nie wyjasnia" in r for r in res.reasons)
+    good = Dynamics(damping=1.1, armature=0.9, delay=0.6, fitted=IDENTIFIED, fit_deg=0.06,
+                    band={"damping": 0.12, "armature": 0.08, "delay": 0.04})
+    assert assess(good, 0.85) == [] and FitResult(good, 0.85).useful
+    assert assess(good, 0.07) != []                             # 0,07 -> 0,06: nic nie poprawilo
+    wide = Dynamics(**{**good.__dict__, "band": dict(good.band, damping=0.35)})
+    assert any("damping" in r for r in assess(wide, 0.85))      # pasmo 35 % (s17: blad 62 %)
+    assert assess(Dynamics(**{**good.__dict__, "band": dict(good.band, delay=0.5)}), 0.85)
+    assert assess(Dynamics(**{**good.__dict__, "band": {}}), 0.85)     # brak pasma = nie wiadomo
+    assert assess(Dynamics(), None)                                     # nic nie mierzono
 
 
 def test_fit_keeps_the_old_shape():
@@ -135,6 +163,25 @@ def test_batched_replay_matches_a_plain_step_loop():
         assert np.abs(many[0] - many[1]).max() > 0.1
     finally:
         rp.scene.close()
+
+
+def test_rows_from_ticks_pair_each_reading_with_the_command_of_its_tick():
+    """Wiersz = takt petli: pomiar z taktu przed jego wysylka, takt bez wysylki trzyma rozkaz,
+    odczyt z `measured_t` sprzed taktu dostaje wlasny wiersz z rozkazem sprzed taktu."""
+    from lerobot_mp.twin.rl.sysid import _rows_from_ticks
+
+    home = dict(SO101.home)
+    m1 = dict(home, shoulder_pan=1.0)
+    m2 = dict(home, shoulder_pan=2.0)
+    samples = [
+        (10.00, dict(home, shoulder_pan=5.0), [m1[j] for j in JOINTS], 10.00),
+        (10.03, {}, None, 10.00),                                   # lacze wstrzymane - nic nie poszlo
+        (10.07, {"shoulder_pan": 7.0}, [m2[j] for j in JOINTS], 10.065),
+    ]
+    t, cmd, meas = _rows_from_ticks(samples, home)
+    assert np.allclose(t, [0.0, 0.03, 0.065, 0.07])
+    assert list(cmd[:, 0]) == [5.0, 5.0, 5.0, 7.0]
+    assert meas[0, 0] == 1.0 and np.isnan(meas[1]).all() and meas[2, 0] == 2.0 and np.isnan(meas[3]).all()
 
 
 def test_recording_roundtrip(tmp_path):
@@ -282,3 +329,125 @@ def test_record_waits_for_the_start_ramp_instead_of_cutting_it(twin):
     twin.claim = spy_claim
     record(twin, short_plan(), settle=0.2)
     assert states and states[0] != "STARTING"
+
+
+# ------------------------------------------------------------ nagranie z czasem prawdziwego ramienia
+class JitterArm:
+    """Petla ramienia z czasem jak na prawdziwym ramieniu (s17 weryfikatora), w zegarze wirtualnym.
+
+    30 Hz z jitterem 0-8 ms i 3 % przestojow 30 ms, serwa czytane co drugi takt, odczyt
+    odpowiada pozycji 0-4 ms po poczatku taktu, status widac dopiero po koncu taktu.
+    Rozkazy ida za planem pobudzenia jak nadzor (najwyzej 120 st./s) - odpowiedz liczy
+    `Replayer` ze znana dynamika. `record` jedzie na tym przez podmieniony `sysid.time`:
+    `sleep` przesuwa zegar (z narzutem rejestratora 0,5-2 ms) i puszcza takty, ktore minely.
+    """
+
+    def __init__(self, truth: Dynamics, delay: float, listeners: bool, hz: float = 30.0, jit: float = 0.008,
+                 settle: float = 0.5, seed: int = 3):
+        rng = np.random.default_rng(seed)
+        self.rng = rng
+        plan = excitation(SO101.home)
+        span = plan[-1][0] + settle + 1.0
+        tau = [0.0]
+        while tau[-1] < span:
+            tau.append(tau[-1] + 1 / hz + rng.uniform(0, jit) + (0.03 if rng.random() < 0.03 else 0.0))
+        self.tau = np.array(tau)
+        cur, prev, cmd = np.array([SO101.home[j] for j in JOINTS]), 0.0, []
+        for tk in self.tau:
+            want = np.array([plan_target(plan, tk)[j] for j in JOINTS])
+            step = 120 * max(tk - prev, 1e-3)
+            prev = tk
+            cur = cur + np.clip(want - cur, -step, step)
+            cmd.append(cur.copy())
+        cmd = np.array(cmd)
+        tf = np.arange(0, span, 0.001)
+        kf = np.searchsorted(self.tau, tf, side="right") - 1
+        q = Replayer().run(Recording(tf, cmd[kf], np.full((len(tf), 6), np.nan)), truth, delay)
+        lag = rng.uniform(0.0, 0.004, len(self.tau))           # serwo podaje pozycje chwile po starcie taktu
+        meas = np.array([np.interp(self.tau + lag, tf, q[:, j]) for j in range(6)]).T
+        meas += rng.normal(0, 0.05, meas.shape)
+        self.shown = self.tau + lag + 0.001                     # status po koncu taktu
+        self.samples, self.statuses = [], []
+        m_last, mt_last = {}, 0.0
+        for k, tk in enumerate(self.tau):
+            fresh = k % 2 == 0
+            if fresh:
+                m_last, mt_last = dict(zip(JOINTS, map(float, meas[k]))), float(tk)
+            sent = dict(zip(JOINTS, map(float, cmd[k])))
+            self.samples.append(SimpleNamespace(t=float(tk), sent=sent, measured=m_last, measured_t=mt_last,
+                                                fresh=fresh))
+            self.statuses.append(SimpleNamespace(connected=True, error="", backend="jitter", measured=m_last,
+                                                 measured_t=mt_last, command=sent))
+        self.now, self.fired = -0.2, 0
+        self.listeners: dict[int, object] = {}
+        if listeners:
+            self.add_tick_listener = self._add
+            self.remove_tick_listener = self.listeners.pop
+        self.connected, self.loop_hz, self.owner, self.preempt_reason = True, hz, None, ""
+        self.safety_state = SimpleNamespace(value="IDLE")
+        self.time = SimpleNamespace(monotonic=lambda: self.now, sleep=self._sleep, strftime=lambda f: "test")
+
+    def _add(self, fn):
+        self.listeners[id(fn)] = fn
+        return id(fn)
+
+    def _sleep(self, d: float) -> None:
+        self.now += d + self.rng.uniform(0.0005, 0.002)
+        while self.fired < len(self.tau) and self.shown[self.fired] <= self.now:
+            for fn in list(self.listeners.values()):
+                fn(self.samples[self.fired])
+            self.fired += 1
+
+    @property
+    def status(self):
+        k = int(np.searchsorted(self.shown, self.now, side="right")) - 1
+        return self.statuses[k] if k >= 0 else SimpleNamespace(
+            connected=True, error="", backend="jitter", measured={}, measured_t=0.0, command=dict(SO101.home))
+
+    def joints(self):
+        return dict(SO101.home)
+
+    def claim(self, owner, preempt=None):
+        self.owner = owner
+
+    def release(self, owner):
+        self.owner = None
+
+    def move(self, *a, **kw):
+        self._sleep(0.2)
+
+    def set_target(self, joints, owner=None):
+        pass
+
+    def set_engaged(self, on, owner=None):
+        pass
+
+
+@pytest.mark.parametrize("listeners", [True, False], ids=["tick_listener", "status_fallback"])
+def test_record_under_real_arm_timing_keeps_the_documented_accuracy(listeners, monkeypatch):
+    """Petla z jitterem i rzadszym odczytem serw: nagranie przez `record` ma dac te sama dynamike.
+
+    Zmierzone przed poprawka (s17 weryfikatora, ta sama prawda): `record` stemplowal wiersze
+    zegarem rejestratora - tlumienie +62 % (pasmo 35 %), armatura -11 %, opoznienie -7,5 ms,
+    blad 0,35 st. Nagranie w taktach petli: tlumienie i armatura w kilku procentach.
+    """
+    from lerobot_mp.twin.rl import sysid
+
+    truth, delay = Dynamics(kp=0.85, damping=1.1, armature=0.9, frictionloss=1.2), 0.03
+    arm = JitterArm(truth, delay, listeners)
+    monkeypatch.setattr(sysid, "time", arm.time)
+    rec = record(arm, excitation(SO101.home), settle=0.5)
+    assert rec.meta["stamps"] == ("tick" if listeners else "measured_t")
+    assert not arm.listeners                                   # sluchacz zdjety po nagraniu
+    out = identify(rec)
+    dyn = out.dyn
+    errs = {"damping": dyn.damping / truth.damping - 1, "armature": dyn.armature / truth.armature - 1,
+            "delay_ms": 1000 * (dyn.delay / 20 - delay)}
+    print("jitter", "listener" if listeners else "fallback", {k: round(v, 3) for k, v in errs.items()},
+          {k: round(v, 3) for k, v in out.band.items()}, round(dyn.fit_deg, 3), round(out.base, 3))
+    assert dyn.fit_deg < 0.2 * out.base and dyn.fit_deg < 0.2
+    assert abs(errs["damping"]) <= 0.15 and abs(errs["armature"]) <= 0.12 and abs(errs["delay_ms"]) <= 3.0
+    for name in ("damping", "armature"):
+        assert abs(errs[name]) <= out.band[name], (name, errs[name], out.band[name])
+    assert abs(errs["delay_ms"]) / 1000 <= out.band["delay"]
+    assert out.useful, out.reasons

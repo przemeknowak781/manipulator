@@ -29,6 +29,16 @@ a randomizacja treningu daje im szerokie zakresy (`UNFITTED_RANGES`).
 Niepewnosc kazdego dopasowanego parametru (`FitResult.band`) liczy sie
 z tym, ze kp i tarcie sa nieznane - w tych 13 przypadkach blad zawsze miescil
 sie w pasmie (tlumienie 5-37 %, armatura 6-15 %, opoznienie 2-5 ms).
+To liczby z IDEALNEGO nagrania (rowne 50 Hz, rozkaz i pomiar w tej samej chwili).
+Z czasem jak na prawdziwym ramieniu (petla 30 Hz z jitterem 0-8 ms i 3 % przestojow
+30 ms, serwa czytane co drugi takt, pozycja 0-4 ms po starcie taktu - `JitterArm`
+w testach, 3 prawdy) przez `record` w taktach petli: tlumienie do 5 %, armatura do
+8 % (raz na samej granicy pasma 8 %), opoznienie do 1,3 ms, blad dopasowania 0,12-0,13 st.; zapasem ze statusu (bez
+sluchacza taktow): tlumienie do 7 %, armatura do 6 %, opoznienie do 2,5 ms, blad
+0,12-0,14 st. `record` sprzed tej zmiany (zegar rejestratora) na tych samych
+danych: tlumienie +19..+38 %, armatura -13 %, opoznienie -4,4 ms, blad 0,39-0,44 st.
+Wynik, ktory nic nie wyjasnia albo ma za szerokie pasmo, `FitResult.useful` /
+`assess` oznaczaja jako nieprzydatny - nie powinien trafic do workspace'u.
 Wczesniejsze wersje: dopasowywaly wszystko i oddawaly kp 0,72 przy prawdzie
 1,0; potem na pelnym pobudzeniu stawaly w lokalnym minimum (armatura -13 %,
 opoznienie +5 ms) przy "pasmie" +-5 % z samej krzywizny.
@@ -165,6 +175,16 @@ def record(twin, plan: list[tuple[float, dict[str, float]]], settle: float = 1.0
     RuntimeError, gdy ramie odebrano (Dom, STOP, inny wlasciciel), `should_stop()`
     zwrocilo True, petla ramienia padla albo przez `stale_after` s nie przyszedl
     zaden nowy odczyt serw.
+
+    Wiersze nagrania to TAKTY PETLI ramienia, nie probki rejestratora: chwila taktu, rozkaz,
+    ktory w tym takcie naprawde poszedl do serw, i odczyt z tego taktu z jego `measured_t`
+    (`Twin.add_tick_listener`). Wczesniej `record` czytal `twin.status` co 1/loop_hz
+    wlasnym zegarem i stemplowal wiersz SWOIM czasem - rozkaz i odpowiedz z wczesniejszego
+    taktu dostawaly czas przesuniety o do jednego okresu. Zmierzone (s17 weryfikatora: 30 Hz
+    z jitterem 0-8 ms i 3 % przestojow 30 ms, odczyt serw co drugi takt): tlumienie +62 %,
+    armatura -11 %, opoznienie -7,5 ms, blad 0,35 st. przy pasmie, ktore tego nie obejmowalo.
+    Bez `add_tick_listener` (starszy `Twin`) - `_StatusLog`: wiersz z pomiarem dostaje
+    `measured_t`, a rozkaz jest ten, ktory byl w statusie tego samego taktu.
     """
     if not twin.connected:
         raise RuntimeError("ramie nie jest polaczone")
@@ -188,7 +208,9 @@ def record(twin, plan: list[tuple[float, dict[str, float]]], settle: float = 1.0
         # Bez `claim`: panel wzial ramie i ktos mu je odebral - nie bierzemy go z powrotem.
         reason = getattr(twin, "preempt_reason", "") or f"ramie ma: {twin.owner or 'nikt'}"
         raise RuntimeError(f"identyfikacja przerwana - ramie odebrane ({reason})")
-    ts, cmds, meas = [], [], []
+    add = getattr(twin, "add_tick_listener", None)
+    log = _TickLog() if callable(add) else _StatusLog()
+    handle = None
     try:
         if stop():
             raise RuntimeError("identyfikacja przerwana")
@@ -200,10 +222,15 @@ def record(twin, plan: list[tuple[float, dict[str, float]]], settle: float = 1.0
         duration = plan[-1][0] + settle
         # Sprzeglo zostawil wlaczone `move` (razem z wlasnoscia) - osobne `set_engaged(True)`
         # tutaj wlaczaloby je z powrotem, gdyby STOP odebral ramie miedzy dojazdem a nagraniem.
-        last_t, last_meas = None, None
+        log.start_cmd = dict(twin.status.command or {})
+        if callable(add):
+            handle = add(log)
         t0 = time.monotonic()
-        last_fresh = t0
+        last_fresh, seen = t0, 0
         period = 1.0 / twin.loop_hz
+        # Bez sluchacza taktow status czytamy czesciej niz petla, zeby nie gubic taktow
+        # (kazdy takt zmienia rozkaz); ze sluchaczem petla sama podaje kazdy takt.
+        nap = period if callable(add) else period / 8
         while True:
             now = time.monotonic()
             t = now - t0
@@ -219,34 +246,159 @@ def record(twin, plan: list[tuple[float, dict[str, float]]], settle: float = 1.0
             if twin.safety_state is not None and twin.safety_state.value == "ESTOP":
                 raise RuntimeError("stop awaryjny w trakcie identyfikacji")
             twin.set_target(plan_target(plan, t), owner=OWNER)
-            m = [st.measured.get(j, np.nan) for j in JOINTS]
-            # Prawdziwe serwa czytamy rzadziej niz petla - powtorzony odczyt to NIE nowy pomiar.
-            # Chwila odczytu z petli (`measured_t`), a nie porownanie list: lista z NaN
-            # porownywala sie jako "rowna" i martwa petla dawala same NaN bez bledu.
-            mt = getattr(st, "measured_t", None)
-            fresh = (mt != last_t) if mt is not None else (last_meas is None or m != last_meas)
-            fresh = fresh and bool(np.isfinite(m).all())
-            last_t, last_meas = mt, m
-            if fresh:
-                last_fresh = now
+            if isinstance(log, _StatusLog):
+                log.poll(st, now - nap / 2)
+            # Prawdziwe serwa czytamy rzadziej niz petla - powtorzony odczyt to NIE nowy pomiar
+            # (licznik taktow ze swiezym, skonczonym odczytem; martwa petla dawala same NaN bez bledu).
+            if log.fresh != seen:
+                seen, last_fresh = log.fresh, now
             elif now - last_fresh > stale_after:
                 raise RuntimeError(f"brak nowych odczytow serw od {1000 * (now - last_fresh):.0f} ms")
-            ts.append(t)
-            cmds.append([st.command.get(j, np.nan) for j in JOINTS])
-            meas.append(m if fresh else [np.nan] * len(JOINTS))
             if on_tick:
                 on_tick(t / duration)
-            time.sleep(period)
+            time.sleep(nap)
     finally:
+        if handle is not None:
+            twin.remove_tick_listener(handle)
         # Sprawdzenie wlasciciela i sprzeglo razem, w `Twin` (pod blokada wlasnosci): osobne
         # `if twin.owner == OWNER` wylaczalo sprzeglo panelu, gdy STOP i panel weszly miedzy nie.
         twin.set_engaged(False, owner=OWNER)
         twin.release(OWNER)
-    rec = Recording(np.array(ts), np.array(cmds, float), np.array(meas, float),
-                    {"backend": twin.status.backend, "loop_hz": twin.loop_hz,
-                     "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    ts, cmds, meas = log.rows()
+    # Niepewnosc chwil wierszy [s]: takty ze sluchacza - zadna; zapas ze statusu - takty bez
+    # odczytu stemplowane z dokladnoscia okresu odpytywania; zegar rejestratora - caly okres.
+    # `identify` dolicza ja do pasma opoznienia: na zapasie (30 Hz z jitterem) opoznienie
+    # wychodzilo +2,5 ms przy pasmie 2 ms z samej krzywizny bledu.
+    stamp_err = {"tick": 0.0, "measured_t": nap}.get(log.stamps, period)
+    rec = Recording(ts, cmds, meas,
+                    {"backend": twin.status.backend, "loop_hz": twin.loop_hz, "stamps": log.stamps,
+                     "stamp_err": float(stamp_err), "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
     check_recording(rec)
     return rec
+
+
+def _measurement(meas) -> list[float] | None:
+    """Katy stawow z odczytu albo None, gdy odczytu nie ma lub nie jest pelny (NaN)."""
+    if not meas:
+        return None
+    m = [float(meas.get(j, np.nan)) for j in JOINTS]
+    return m if np.isfinite(m).all() else None
+
+
+class _TickLog:
+    """Sluchacz taktow petli (`Twin.add_tick_listener`): kazdy takt z jej wlasna chwila.
+
+    Wolany z watku petli - tylko kopiuje dwa male slowniki i dopisuje krotke do listy
+    (`list.append` jest atomowe), zadnego liczenia i zadnych blokad.
+    """
+
+    stamps = "tick"
+
+    def __init__(self):
+        self.samples: list[tuple[float, dict, list[float] | None, float]] = []
+        self.fresh = 0
+        self.start_cmd: dict[str, float] = {}
+
+    def __call__(self, s) -> None:
+        m = _measurement(s.measured) if s.fresh else None
+        mt = s.measured_t if s.measured_t is not None else s.t
+        self.samples.append((float(s.t), dict(s.sent or {}), m, float(mt)))
+        if m is not None:
+            self.fresh += 1
+
+    def rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return _rows_from_ticks(self.samples, self.start_cmd)
+
+
+def _rows_from_ticks(samples, start_cmd: dict[str, float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(t, rozkaz, pomiar) z taktow petli: (chwila taktu, wyslane w nim, odczyt albo None, measured_t).
+
+    Wiersz = takt. Odczyt w takcie idzie PRZED wysylka (`Twin._tick`), wiec w wierszu pomiar
+    nie widzi jeszcze rozkazu z tego samego wiersza - dokladnie tak, jak liczy `Replayer`.
+    Takt bez wysylki (`sent == {}`, np. lacze wstrzymane) - rozkaz trzyma poprzednia wartosc.
+    Odczyt z `measured_t` wczesniejszym niz takt dostaje wlasny wiersz z rozkazem sprzed taktu.
+    """
+    cur = np.array([float(start_cmd.get(j, np.nan)) for j in JOINTS])
+    nan = [np.nan] * len(JOINTS)
+    ts: list[float] = []
+    cs: list[np.ndarray] = []
+    ms: list[list[float]] = []
+    for t, sent, m, mt in samples:
+        if m is not None and mt < t - 1e-9:
+            if not ts or mt > ts[-1]:
+                ts.append(mt)
+                cs.append(cur.copy())
+                ms.append(m)
+            m = None
+        for k, v in sent.items():
+            if k in JOINTS:
+                cur[JOINTS.index(k)] = float(v)
+        if ts and t <= ts[-1]:
+            t = ts[-1] + 1e-6
+        ts.append(t)
+        cs.append(cur.copy())
+        ms.append(m if m is not None else nan)
+    t_arr = np.array(ts, float)
+    return (t_arr - t_arr[0] if len(t_arr) else t_arr, np.array(cs, float).reshape(-1, len(JOINTS)),
+            np.array(ms, float).reshape(-1, len(JOINTS)))
+
+
+class _StatusLog:
+    """Zapas dla `Twin` bez sluchaczy taktow: czyta `twin.status` czesciej niz petla.
+
+    Kazdy nowy obiekt statusu to jeden takt. Wiersz ze swiezym odczytem dostaje chwile
+    odczytu z petli (`measured_t` = chwila taktu, w ktorym czytano), a rozkaz - ten z TEGO
+    statusu, czyli wyslany w tym samym takcie, co odczyt. Takty bez odczytu dostaja chwile,
+    w ktorej je zobaczylismy (minus pol okresu odpytywania - srednie spoznienie obserwacji),
+    cofnieta przed nastepny wiersz (takt zaczal sie wczesniej, niz status sie pojawil).
+    Odpytywanie co 1/4 okresu petli dawalo tym taktom do 10 ms spoznienia: tlumienie -9 %,
+    armatura -10 % (test `test_record_under_real_arm_timing...`), stad 1/8.
+    Petla i rejestrator licza na tym samym `time.monotonic` - gdy `measured_t` jest z innego zegara (`connect(threaded=False)`), zostaje zegar rejestratora.
+    """
+
+    def __init__(self):
+        self.fresh = 0
+        self.start_cmd: dict[str, float] = {}
+        self._rows: list[tuple[float, list[float], list[float] | None]] = []
+        self._last = None
+        self._last_mt = None
+        self._last_meas = None
+        self._loop_clock: bool | None = None
+
+    @property
+    def stamps(self) -> str:
+        return "measured_t" if self._loop_clock else "recorder"
+
+    def poll(self, st, now: float) -> None:
+        if st is self._last:
+            return
+        self._last = st
+        raw = [st.measured.get(j, np.nan) for j in JOINTS]
+        mt = getattr(st, "measured_t", None)
+        new = (mt != self._last_mt) if mt is not None else (self._last_meas is None or raw != self._last_meas)
+        self._last_mt, self._last_meas = mt, raw
+        m = _measurement(st.measured) if new else None
+        if m is not None:
+            self.fresh += 1
+            if self._loop_clock is None and mt is not None:
+                self._loop_clock = abs(now - float(mt)) < 1.0
+        stamp = float(mt) if (m is not None and self._loop_clock) else now
+        self._rows.append((stamp, [st.command.get(j, np.nan) for j in JOINTS], m))
+
+    def rows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rows = self._rows
+        t = np.array([r[0] for r in rows], float)
+        # Wiersz bez pomiaru: nie pozniej niz nastepny (przejscie od konca).
+        for i in range(len(t) - 2, -1, -1):
+            if rows[i][2] is None and t[i] >= t[i + 1]:
+                t[i] = t[i + 1] - 1e-4
+        for i in range(1, len(t)):                   # nadal nie rosnie (odczyty nie w kolejnosci) - rzadkie
+            if t[i] <= t[i - 1]:
+                t[i] = t[i - 1] + 1e-6
+        cmds = np.array([r[1] for r in rows], float).reshape(-1, len(JOINTS))
+        meas = np.array([r[2] if r[2] is not None else [np.nan] * len(JOINTS) for r in rows],
+                        float).reshape(-1, len(JOINTS))
+        return (t - t[0] if len(t) else t), cmds, meas
 
 
 # ------------------------------------------------------------ symulacja
@@ -412,6 +564,46 @@ class FitResult:
     #: Dopasowania przy kp / tarciu na krancach zakresu: (nazwa, wartosc, x, blad [st.]).
     profiles: list[tuple[str, float, np.ndarray, float]] = field(default_factory=list)
 
+    @property
+    def reasons(self) -> list[str]:
+        """Dlaczego wyniku nie warto zapisywac jako dynamiki stanowiska (pusta lista = warto)."""
+        return assess(self.dyn, self.base)
+
+    @property
+    def useful(self) -> bool:
+        """Czy dopasowanie cos wyjasnia i ma skonczone, waskie pasmo (`assess`)."""
+        return not self.reasons
+
+
+#: Dopasowanie musi zmniejszyc blad symulacji nominalnej co najmniej o 20 %. Zmierzone
+#: (s6 weryfikatora, blizniak pod obciazeniem): 0,55 -> 0,51 st. i armatura x0,45 przy
+#: pasmie +-inf - panel proponowal to zapisac, a trening stawal wokol 0,45 przy prawdzie 1,0.
+USEFUL_RATIO = 0.8
+#: Najszersze pasmo dopasowanego parametru, przy ktorym wynik jeszcze cos mowi: mnozniki
+#: wzglednie, opoznienie w taktach polityki (0,3 taktu = 15 ms przy 20 Hz). Na idealnych
+#: nagraniach syntetycznych pasma sa 5-37 % / 2-5 ms; na nagraniu z zegarem rejestratora
+#: (s17) tlumienie mialo pasmo 35 % przy bledzie 62 % - to ma nie przejsc.
+USEFUL_BAND = 0.3
+
+
+def assess(dyn: Dynamics, base: float | None) -> list[str]:
+    """Powody, dla ktorych dynamika z identyfikacji NIE nadaje sie na srodek treningu.
+
+    Dziala na samej `Dynamics` (pasmo w `dyn.band`, blad w `dyn.fit_deg`), wiec panel moze
+    ocenic wynik `fit` (dynamika, blad nominalny) bez `FitResult`.
+    """
+    out = []
+    if dyn.fit_deg is None or base is None or not np.isfinite(dyn.fit_deg):
+        return ["brak bledu dopasowania"]
+    if not dyn.fit_deg <= USEFUL_RATIO * base:
+        out.append(f"blad {base:.2f} -> {dyn.fit_deg:.2f} st. - dopasowanie prawie nic nie wyjasnia")
+    for name in dyn.fitted:
+        b = dyn.band.get(name, np.inf)
+        if not b <= USEFUL_BAND:
+            unit = f"+-{b:.2f} taktu" if name == "delay" else f"+-{100 * b:.0f}%"
+            out.append(f"{name}: niepewnosc {'nieskonczona' if np.isinf(b) else unit}")
+    return out
+
 
 def _coordinate_scan(costs, x0s: list[np.ndarray], spans: np.ndarray, cycles: int = 6, points: int = 7,
                      order=None) -> tuple[list[np.ndarray], list[float]]:
@@ -534,6 +726,8 @@ def identify(rec: Recording, spec: RobotSpec = SO101, control_hz: float = 20.0, 
                     band[PARAMS[i]] = max(band[PARAMS[i]], float(np.expm1(shift) if i < 4 else shift))
     finally:
         rp.scene.close()
+    if "delay" in free:
+        band["delay"] = max(band["delay"], float(rec.meta.get("stamp_err", 0.0) or 0.0))
     dyn, delay = unpack(x)
     dyn.delay = delay * control_hz
     dyn.fitted = tuple(n for n in PARAMS if n in free)
@@ -547,6 +741,9 @@ def identify(rec: Recording, spec: RobotSpec = SO101, control_hz: float = 20.0, 
                   + (f"; z modelu (niewyznaczalne z tego ruchu): {', '.join(fixed)}"
                      + (f", w treningu szeroko ({ranges})" if ranges else "") if fixed else "")).strip()
     dyn.fit_deg = best_c
+    # Pasmo w dynamice (opoznienie w taktach, jak `dyn.delay`) - z niego `Randomization.around`
+    # rozszerza zakresy treningu, a `assess` ocenia, czy wynik w ogole zapisywac.
+    dyn.band = {n: float(band[n] * control_hz if n == "delay" else band[n]) for n in dyn.fitted}
     return FitResult(dyn, base, band, calls[0], profiles)
 
 
