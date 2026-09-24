@@ -376,3 +376,85 @@ def test_lift_from_one_camera_never_feeds_a_lifted_ghost_and_recovers_a_dropped_
         assert truth()[2] - h > pol.task.lift_height
     finally:
         twin.close()
+
+
+# Kamery jak w panelu (`TwinApp._add_sim_camera`: pole widzenia 62 st., K lekko poza srodkiem)
+# i w e2e_panel - dwie kamery z przodu po obu stronach ramienia.
+_F = 240.0 / np.tan(np.radians(31.0))
+K_PANEL = np.array([[_F, 0, 319.5 + 3.0], [0, _F * 0.995, 239.5 - 2.0], [0, 0, 1]])
+PANEL_VIEWS = [sc.CameraView("a", K_PANEL, 640, 480, look_at([0.55, -0.45, 0.45], [0.2, 0, 0])),
+               sc.CameraView("b", K_PANEL, 640, 480, look_at([0.5, 0.5, 0.5], [0.2, 0, 0]))]
+
+
+def _sweep_at_rest(spots, lift=0.0):
+    """Kostka w `spots` [(x, y, obrot)], ramie w pozie domowej (jak po polaczeniu blizniaka)."""
+    from lerobot_mp.twin.ui.watch import arm_mask
+
+    cfg = sc.SceneConfig(SO101, cameras=PANEL_VIEWS,
+                         objects=[sc.Box("cube", (0.015,) * 3, (0.2, 0.0), rgba=(0.85, 0.25, 0.2, 1))])
+    mapper = TableMapper({v.name: (v.K, None, v.T_cam2base) for v in PANEL_VIEWS})
+    out = []
+    with sc.build(cfg) as s:
+        s.set_joints(SO101.home)
+        b = s.model.body("cube").id
+        a = s.model.jnt_qposadr[s.model.body_jntadr[b]]
+        occ = {v.name: arm_mask(s, v.name, dilate=5) for v in PANEL_VIEWS}      # jak w panelu
+        T = s.T_base2world
+        for x, y, yaw in spots:
+            s.data.qpos[a:a + 3] = T[:3, :3] @ np.array([x, y, 0.015 + lift]) + T[:3, 3]
+            qz, qw = np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]), np.zeros(4)
+            mujoco.mju_mat2Quat(qw, T[:3, :3].ravel())
+            mujoco.mju_mulQuat(qw, qw.copy(), qz)
+            s.data.qpos[a + 3:a + 7] = qw
+            mujoco.mj_forward(s.model, s.data)
+            frames = {v.name: s.render(v.name) for v in PANEL_VIEWS}
+            out.append(CubeDetector().detect_frames(frames, mapper, occ))
+    return out
+
+
+def _edges_of_lift_region():
+    """Brzegi obszaru treningu `lift` (promien 0,15-0,25 m, kierunek +-0,8 rad) i srodek promienia."""
+    from lerobot_mp.twin.rl import task as tk
+
+    task = tk.make_task("lift")
+    spots = []
+    for r in (task.cube_radius[0], 0.19, task.cube_radius[1]):
+        for bearing in (task.cube_bearing[0], np.radians(-40), np.radians(40), task.cube_bearing[1]):
+            spots += [(r * np.cos(bearing), r * np.sin(bearing), np.radians(yaw)) for yaw in range(0, 90, 10)]
+    # Dwa polozenia z przegladu (e2e_lift_post, proby 8 i 14 - "kamery jej nie widza").
+    spots += [(0.136, -0.134, np.radians(yaw)) for yaw in range(0, 90, 10)]
+    spots += [(0.148, -0.123, np.radians(yaw)) for yaw in range(0, 90, 10)]
+    return spots
+
+
+@pytest.mark.render
+def test_resting_cube_is_found_at_every_yaw_on_the_edges_of_the_lift_region():
+    """Kostka lezy nieruchomo, ramie w spoczynku zaslania ja jednej z dwoch kamer prawie cala.
+
+    Przed poprawka 59 z 360 polozen/obrotow (siatka co 5 st.) bez detekcji, z tego 14 z 18
+    obrotow na r = 0,19 m, -45 st.: skrawek kostki widziany przez zasloniona kamere wchodzil
+    do sredniej IoU z pelna waga. Dopasowanie stawalo 12 mm obok (IoU 0,70), a przy dobrym
+    polozeniu szum krawedzi skrawka ciagnal srednia pod prog. Runner lift z kamer stawal
+    wtedy w 2 z 20 prob panelu na "kamery jej nie widza".
+    """
+    spots = _edges_of_lift_region()
+    dets = _sweep_at_rest(spots)
+    missed = [(round(x, 3), round(y, 3), round(float(np.degrees(yaw))))
+              for (x, y, yaw), d in zip(spots, dets)
+              if d is None or np.hypot(d.pos[0] - x, d.pos[1] - y) > 0.006]
+    assert not missed, f"{len(missed)} z {len(spots)} bez detekcji albo > 6 mm od prawdy: {missed}"
+
+
+@pytest.mark.render
+def test_lifted_cube_on_the_edges_is_never_a_two_camera_detection():
+    """Ta sama siatka, kostka 2 i 4 cm nad blatem: bramka dwoch swiadkow dalej odrzuca ducha.
+
+    Poprawka waz glos kamery tym, ile kostki widzi - dwie kamery widzace wiekszosc sylwetki
+    glosuja jak wczesniej, wiec podniesiona kostka nie moze przejsc jako `n_cameras >= 2`.
+    """
+    spots = _edges_of_lift_region()[::3]
+    for lift in (0.02, 0.04):
+        dets = _sweep_at_rest(spots, lift=lift)
+        passed = [(round(x, 3), round(y, 3), round(d.confidence, 2))
+                  for (x, y, _), d in zip(spots, dets) if d is not None and d.n_cameras >= 2]
+        assert not passed, f"podniesiona o {lift * 100:.0f} cm przeszla jako dwie kamery: {passed}"
