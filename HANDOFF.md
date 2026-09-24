@@ -26,10 +26,11 @@ tą samą ścieżką kodu, którą pójdzie sprzęt:
   z zatrzymaniem przy rozjeździe i po wykonaniu zadania; `lift-v3` z kostką
   **wyłącznie z kamer** podnosi ją na bliźniaku 8/8 (`lift-v1`, uczona na
   prawdzie: 1/8);
-- **polityki bazowe** w `assets/policies/` (`reach-v2`, `lift-v3`) — start do
+- **polityki bazowe** w `assets/policies/` (`reach-v3`, `lift-v3`) — start do
   douczania na zmierzonej dynamice;
 - **przegląd przed sprzętem**: 53 potwierdzone błędy (z czego 13 poważnych)
-  poprawione i sprawdzone ponownie — sekcja 2a.
+  poprawione, sprawdzone przez niezależnych weryfikatorów, luki i nowe
+  problemy z weryfikacji poprawione w drugiej rundzie — sekcja 2a.
 
 ---
 
@@ -57,8 +58,8 @@ czas renderu — zmierzony; PyTorch z CUDA — działa; MJX/Warp — Warp dział
 | `twin/rl/task.py` | obserwacja/akcja/nagroda — numpy i torch, te same wzory | test równości numpy/torch |
 | `twin/rl/env.py` | Gymnasium CPU, `check_env` | ekspert IK rozwiązuje `reach` 10/10 |
 | `twin/rl/batch.py` | MuJoCo Warp, randomizacja per świat + `set_const` | zgodność z CPU 1e-7 → 4e-3 po 60 krokach losowych |
-| `twin/rl/ppo.py`, `policy.py`, `evaluate.py` | PPO (także douczanie `--init`), plik polityki z zadaniem i wynikami, ewaluacja na CPU | `reach-v2`, `lift-v3` w `assets/policies` |
-| `twin/rl/sysid.py` | nagranie ruchu przez nadzór, dopasowanie tłumienia/armatury/opóźnienia (kp i tarcie suche z tego ruchu niewyznaczalne — zostają z modelu) | prawdy spoza siatki startowej: tłumienie i armatura ~2%, opóźnienie 0–1,3 ms, dopasowanie na poziomie szumu |
+| `twin/rl/ppo.py`, `policy.py`, `evaluate.py` | PPO (także douczanie `--init` z zapisanym krytykiem), plik polityki z zadaniem, krytykiem i wynikami, ewaluacja na CPU | `reach-v3`, `lift-v3` w `assets/policies`; `tests/test_twin_policies.py` |
+| `twin/rl/sysid.py` | nagranie ruchu przez nadzór, dopasowanie tłumienia/armatury/opóźnienia (kp i tarcie suche z tego ruchu niewyznaczalne — zostają z modelu, trening losuje je szerzej) | ruch z panelu, 13 ramion spoza siatki startowej: tłumienie ≤ 10,5%, armatura ≤ 8,2%, opóźnienie ≤ 1,9 ms; przedział niepewności zawsze obejmował prawdziwy błąd |
 | `twin/rl/runner.py` | polityka na `Twin`, stop przy rozjeździe > 25° (w zmierzonej pozie), stop po wykonaniu zadania, czekanie na kostkę | test na bliźniaku; pełny łańcuch z kamerami w czasie symulowanym (`test_twin_lift_from_cameras`) |
 | `twin/ui/*` | panel (viser), zadania w tle, most sceny, strażnik kamer | test startu panelu + scenariusz w przeglądarce |
 | `twin/runtime.py` | pętla ramienia: jeden właściciel ruchu, STOP/Dom w zmierzonej pozie, reakcja na błędy serw i utratę łącza, render bez blokady pętli | `tests/test_twin_runtime.py` (czas symulowany) |
@@ -91,8 +92,17 @@ niezależnych weryfikatorów. Najważniejsze:
 | TCP i kostka w obserwacji o krok fizyki za kątami stawów | kinematyka liczona po fizyce (CPU i GPU) |
 | render trzymał blokadę pętli ramienia | render na kopii stanu |
 
+Druga runda (po weryfikacji: 46 z 53 potwierdzone, 7 częściowo, kilkanaście
+nowych problemów z samych poprawek) domknęła m.in.: krótkie przerwy łącza bez
+skoku po powrocie, strażnika rozjazdu, chwyt przy STOP i przeciążeniu
+chwytaka, sukces `lift` tylko ze świeżej pozy kostki, identyfikację, która nie
+bierze ramienia z powrotem, błędy serw i limity na backendzie `lerobot`,
+jednego świadka kostki przy dłoni, skalę w strażniku kamer (10–20 ms na
+kamerę zamiast do 300 ms), pozę kamery oceniania względem K użytego w fali,
+znacznik `render` dla maszyn bez GPU.
+
 Polityki uczone przed poprawkami (inny chwytak, inne obserwacje, epizod `lift`
-bez końca) zastąpione douczonymi `reach-v2` (CPU 100% / 98%, 1,5 mm) i
+bez końca) zastąpione douczonymi `reach-v3` (CPU 100% / 100%, 1,2 mm, nadgarstek bez obrotów do limitu) i
 `lift-v3` (CPU 100% / 100%, z kamer 8/8, kostka ~11 cm zamiast 17). Przy tym
 wyszedł błąd douczania — krytyk od zera psuł dobrą politykę; pliki polityk
 niosą teraz krytyka, a stare dostają rozgrzewkę (TWIN.md, *Polityki bazowe*).
@@ -128,9 +138,15 @@ niosą teraz krytyka, a stare dostają rozgrzewkę (TWIN.md, *Polityki bazowe*).
 - **Jeden właściciel ruchu ramienia** (`panel`, `polityka`, `kalibracja`,
   `identyfikacja`) zamiast wielu wątków piszących cel na zmianę. STOP, Dom,
   Połącz i Rozłącz odbierają ramię każdemu przez `Twin.preempt`.
-- **Błąd serwa = STOP.** Także przeciążenie chwytaka; jeśli na sprzęcie zwykły
-  mocny chwyt będzie je wyzwalał, trzeba rozdzielić chwytak od reszty (decyzja
-  po teście, nie na zapas).
+- **Błąd serwa ramienia = STOP, błąd samego chwytaka = mniejszy docisk.**
+  Weryfikacja pokazała, że STOP po przeciążeniu chwytaka puszczał chwyt i
+  kostka spadała; teraz docisk maleje do ~5° ciaśniej niż zmierzona szczęka,
+  STOP dopiero po 2 s błędu. STOP i Dom nie puszczają ściskającego chwytaka.
+- **Strażnik rozjazdu dla każdego właściciela** (25° przez 0,5 s) — serwo,
+  które zwiotczało bez bitu błędu, kończyło `move` „normalnie” 63° od celu.
+- **Do bliźniaka backend `feetech`** — `lerobot` liczy kąty od środka swojego
+  zakresu kalibracji (przesunięcie 2–35°) i ma inne tiki chwytaka; wykrywane
+  i zgłaszane, ale nie przeliczane (backend ma zostać zgodny z LeRobotem).
 - **Koniec epizodu po sukcesie liczony jak limit czasu** — PPO dalej
   bootstrapuje wartość stanu; zero na końcu uczyło polityki wisieć tuż pod
   progiem sukcesu.

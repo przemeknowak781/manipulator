@@ -73,16 +73,34 @@ w 3D, z polityki, z fali kalibracyjnej, z identyfikacji — idzie przez
 fala kalibracyjna albo identyfikacja. Drugi nie ruszy, dopóki pierwszy nie
 skończy — panel mówi, kto ma ramię. **STOP**, **Dom**, **Połącz** i **Rozłącz**
 odbierają ramię każdemu, a ramię zostaje w **zmierzonej** pozie: nie dociska
-do przeszkody i nie wraca skokiem do starego celu. Każde uruchomienie na
-prawdziwym ramieniu wymaga świeżego potwierdzenia.
+do przeszkody, nie wraca skokiem do starego celu i nie cofa się (przy szybkim
+ruchu staje między zmierzoną pozą a ostatnim rozkazem). **Chwytak, który
+ściska, dalej ściska** — STOP ani Dom nie upuszczają trzymanej kostki; otwiera
+się go ręcznie suwakiem. Każde uruchomienie na prawdziwym ramieniu wymaga
+świeżego potwierdzenia.
 
-Pętla sama zatrzymuje ramię (STOP awaryjny, powód w pasku stanu), gdy serwo
-zgłosi błąd (przeciążenie, przegrzanie, napięcie, czujnik kąta), gdy serwa nie
-odpowiadają przez 5 odczytów z rzędu (wtedy też nic do nich nie wysyła — po
-powrocie łącza nie ma zaległej serii skoków) i gdy pętla stanie na ponad 0,5 s.
-Ramię stojące po włączeniu poza limitami zostaje, gdzie jest; po włączeniu
-sprzęgła wraca w zakres 15°/s. Limity z konfiguracji są zawężane do limitów
-zapisanych w EEPROM serw.
+Pętla sama zatrzymuje ramię (STOP awaryjny, powód w pasku stanu), gdy:
+- serwo ramienia zgłosi błąd (przeciążenie, przegrzanie, napięcie, czujnik kąta);
+- staw ramienia jest ponad 25° od rozkazu dłużej niż 0,5 s — serwo, które
+  zwiotczało bez bitu błędu (każdy właściciel ruchu, nie tylko polityka);
+  jeśli prawdziwe serwa pod obciążeniem nie nadążą, podnieś
+  `Twin.track_err_deg` / `track_err_s`;
+- serwa nie odpowiadają przez 5 odczytów z rzędu, albo pętla stanie na > 0,5 s.
+
+Krótsza przerwa łącza nie jest błędem: nadzór stoi, nic nie idzie do serw, a
+po pierwszym świeżym odczycie rusza od zmierzonej pozy (po 0,9 s przerwy
+największy krok celu 4,2° — wcześniej 16,7°). **Przeciążenie samego chwytaka**
+(mocny chwyt) nie zatrzymuje ramienia: docisk jest zmniejszany do 8 jednostek
+(~5°) ciaśniej niż zmierzona szczęka, w pasku stanu pojawia się ostrzeżenie;
+STOP dopiero, gdy błąd chwytaka trwa 2 s.
+
+Połączenie potrzebuje dwóch zgodnych odczytów (±2 jednostki) — przekłamana
+ramka nie zostaje pierwszym rozkazem. Ramię stojące po włączeniu poza limitami
+zostaje, gdzie jest; po włączeniu sprzęgła wraca w zakres (najwyżej 90°/s).
+Limity z konfiguracji są zawężane do limitów zapisanych w EEPROM serw.
+Niefatalne zastrzeżenia (inne tiki chwytaka w backendzie, zero stawów w
+kalibracji LeRobota, zmniejszony docisk) panel pokazuje jako **Uwaga** w pasku
+stanu.
 
 | zakładka | co robi |
 |---|---|
@@ -114,6 +132,14 @@ miejsce dookoła, zasilacz podłączony, ręka przy STOP.
 W zakładce Ramię: `feetech`, port, **Połącz** (bez jazdy do domu). Suwaki mają
 pokazywać to, co ramię. Sprzęgło + mały ruch jednym suwakiem.
 
+**Do bliźniaka używaj backendu `feetech`.** Backend `lerobot` liczy kąty od
+środka zakresu swojej kalibracji, a nie od tiku 2048 jak model — na typowej
+kalibracji SO-101 to −2° na `shoulder_pan` i −6,4° na `elbow_flex`, przy
+jednostronnym zakresie nawet ~35°; jego chwytak 0..100 to tiki 2031…3524
+zamiast 1986…2670. Panel pokazuje oba rozjazdy jako ostrzeżenie. Błędy serw
+i limity z EEPROM działają na obu backendach (`lerobot`: rejestr stanu co 3.
+odczyt).
+
 **1. Kamery.** Przepuść kamery USB w kliencie Shadow, w panelu *Szukaj kamer
 USB* → *Dodaj*. Kamera, która się otwiera, ale nie daje klatek, to prawie
 zawsze brak przepuszczenia (patrz README).
@@ -141,13 +167,18 @@ mają leżeć na krawędziach ramienia i stołu. Mediana > 3 px = coś jest źle
 (~20 s ruchu po 12°; do pozy startowej ramię jedzie 30°/s) → *Zapisz jako
 dynamikę stanowiska*. Od teraz trening randomizuje wokół zmierzonego ramienia,
 nie katalogu. Z tego ruchu wyznaczalne są **tłumienie, armatura i opóźnienie**
-(na syntetycznych danych: ~2% i 0–1,3 ms); wzmocnienia serw i tarcia suchego
-ten ruch nie rozróżnia (kp 0,63 dopasowuje się tak samo dobrze jak 1,0), więc
-zostają z modelu, a randomizacja je pokrywa. Nagranie z martwą pętlą albo
-nieświeżymi odczytami jest odrzucane.
+— na ruchu z panelu (5 stawów, 20 s), dla 13 syntetycznych ramion spoza siatki
+startowej i szumu 0,05°: tłumienie do 10,5%, armatura do 8,2%, opóźnienie do
+1,9 ms; podawany przedział niepewności zawsze obejmował prawdziwy błąd.
+Wzmocnienia serw i tarcia suchego ten ruch nie rozróżnia (kp 0,63 dopasowuje
+się tak samo dobrze jak 1,0) — zostają z modelu, panel pisze przy nich
+„z modelu”, a trening po identyfikacji losuje je szerzej: kp ×0,6–1,5, tarcie
+×0,5–2,0. Dopasowanie trwa 7–11 s; STOP, *Połącz* i *Rozłącz* przerywają tylko
+nagrywanie — gotowe nagranie dopasowuje się do końca. Nagranie z martwą pętlą
+albo nieświeżymi odczytami jest odrzucane.
 
 **6. Trening.** Najszybciej: **douczanie** gotowych polityk na zmierzonej
-dynamice — zakładka Trening, *Start z polityki* `reach-v2` / `lift-v3`,
+dynamice — zakładka Trening, *Start z polityki* `reach-v3` / `lift-v3`,
 100–300 iteracji (`lerobot-twin train --init …`). Od zera: `reach` 160
 iteracji (~2,5 min), `lift` 600 (~30 min). Po treningu polityka sama przechodzi
 ewaluację na CPU.
@@ -162,7 +193,8 @@ brzeg (kulka wraca na rzut).
 zakładka Mapa ma ją pokazywać. Polityka `lift-v3` (albo jej douczona wersja),
 źródło kostki **kamery**, *Uruchom*. Gdy szczęki zasłonią kostkę, śledzenie
 przejmuje ją „w dłoni”. Polityka kończy sama („zadanie wykonane”), gdy kostka
-jest 6 cm nad blatem przez 10 taktów.
+jest 6 cm nad blatem przez 10 taktów — liczonych tylko ze świeżej pozy (kamery
+albo „w dłoni”), nigdy z ostatnio widzianej.
 
 **Chwytak.** 0..100 w panelu to te same tiki serwa co w backendzie `feetech`
 (`gripper_closed_ticks` … `gripper_open_ticks`, zero w `center_ticks`); w
@@ -188,7 +220,7 @@ i trzeba to poprawić w konfiguracji, zanim zaufa się `lift`.
 
 ```bash
 pytest -q                                          # całość, z renderem i GPU
-pytest -q -k "not renders and not full_session"    # maszyna bez GPU
+pytest -q -m "not render"                          # maszyna bez GPU (testy CUDA pomijają się same)
 ```
 
 ---
@@ -247,8 +279,10 @@ Po zapisaniu kalibracji panel zapamiętuje kadr odniesienia każdej kamery
 i co 2 s porównuje z nim bieżący — korelacją fazową, z **ramieniem wyciętym
 maską z bliźniaka** (ruch ramienia daje 0,4 px „przesunięcia”, obrót kamery
 o 1° — 9,8 px). Oprócz przesunięcia łapie **obrót wokół osi kamery i zmianę
-skali** (dopasowanie ECC, skala z martwą strefą 1,5%); miarą jest największe
-przesunięcie narożnika kadru. Powyżej 3 px piramida robi się czerwona i panel
+skali** (dopasowanie podobieństwa na piramidzie ¼–½ kadru); miarą jest
+największe przesunięcie narożnika kadru. Ruch ramienia daje najwyżej 0,76 px,
+przybliżenie o 1% — 3,7–4,4 px (prawda 4), obrót o 1° — 6,8–7,5 px (prawda 7).
+Sprawdzenie kosztuje 10–20 ms na kamerę. Powyżej 3 px piramida robi się czerwona i panel
 proponuje szybką relokalizację (krótka fala tylko dla tej kamery). Klatka
 starsza niż 1 s nie jest kadrem — zamrożony albo martwy strumień panel pokazuje
 jako błąd kamery i otwiera go na nowo.
@@ -292,7 +326,13 @@ Kostka (`perception.CubeDetector.detect_frames`):
 5. **jedna kamera przy dłoni to za mało** — wykrycie potwierdzone przez jedną
    kamerę (`n_cameras`) blisko chwytaka albo przy kostce w dłoni jest pomijane:
    jedna kamera potrafi „położyć” na blacie kostkę uniesioną w szczękach.
-   Wykrycie ma czas kadru (`t`); stare i powtórzone nie przedłużają życia kostki.
+   `n_cameras = -1` (z mapy) i `0` (ramię zasłania kostkę wszystkim) też są
+   jednym świadkiem. Jeden świadek przy dłoni jest przyjmowany tylko przy
+   pustej szczęce, gdy 3 wykrycia zgadzają się co do 1 cm, a TCP przesunął się
+   o ≥ 1,5 cm (kostka potrącona). Kostka, która wypadła z dłoni, opada na blat
+   („upuszczona”). Wykrycie ma czas kadru (`t`); stare i powtórzone nie
+   przedłużają życia kostki. Zamknięta pętla z `lift-v3`: sama kamera `a` —
+   17/17 ułożeń, kamery `a`+`b` — 14/14.
 
 Na blacie w symulacji: **1–3 mm, ~1°**. `CubeTracker` przejmuje kostkę, gdy
 kamery jej nie widzą: szczęka **zablokowana** (nie dojeżdża do rozkazu i stoi)
@@ -325,7 +365,7 @@ i w `lerobot-twin policies` obok własnych ze stanowiska:
 
 | | zadanie | CPU bez / z randomizacją |
 |---|---|---|
-| `reach-v2` | dojazd TCP do punktu | 100% / 98%, 1,5 mm od celu |
+| `reach-v3` | dojazd TCP do punktu, nadgarstek blisko pozy domowej | 100% / 100%, 1,2 mm od celu |
 | `lift-v3` | chwyt i podniesienie kostki z kamer | 100% / 100% |
 
 Obie uczone wokół modelu Menagerie — po identyfikacji dynamiki na swoim ramieniu
@@ -339,7 +379,11 @@ doliczaną na końcu epizodu — rośnie razem z krytykiem, o jakości mówi *su
 
 `lift-v3` pod limitem stawu bywa tylko tam, gdzie zadanie tego wymaga (kostka
 blisko podstawy — łokieć zgięty do +92°): 10 taktów na 20 epizodów, `lift-v2`
-26 i wymachy po chwycie.
+26 i wymachy po chwycie. `reach-v2` kręciła nadgarstkiem do +150° w każdym
+epizodzie (obrót nie zmienia TCP, więc nagroda go nie widziała); `reach-v3`
+uczona z karą za obrót od pozy domowej (`roll_penalty`): mediana 13°, najwyżej
+48°, zero taktów przy limicie. Pilnuje tego `tests/test_twin_policies.py` —
+zachowanie **dostarczanych** plików polityk, nie tylko środowiska.
 
 ---
 
