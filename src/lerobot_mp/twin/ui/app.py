@@ -1794,7 +1794,10 @@ class TwinApp:
                 provider = self._vision_cube
         self._release_panel()
         self.policy = pol
-        self.runner = PolicyRunner(self.twin, pol, cube_provider=provider)
+        # Sukces lift na ramieniu liczy sie tylko ze swiezej pozy kostki (kamery / w dloni),
+        # nigdy z "ostatnio widzianej" - runner pyta tracker o zrodlo co takt.
+        source = (lambda: self.cube_tracker.source) if provider == self._vision_cube else None
+        self.runner = PolicyRunner(self.twin, pol, cube_provider=provider, cube_source=source)
         if pol.task.name == "reach":
             p = (inverse(self.T_b2w) @ np.r_[self.goal_gizmo.position, 1.0])[:3]
             if not self.goal_node.visible:

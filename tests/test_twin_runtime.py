@@ -630,6 +630,19 @@ def test_gripper_tick_mismatch_is_a_warning(twin, monkeypatch, ticks, warn):
     assert twin.safety_state.value != "ESTOP"
 
 
+def test_backend_calibration_warnings_reach_the_status(twin, monkeypatch):
+    """Backend `lerobot` liczy katy od srodka zakresu kalibracji - panel ma o tym wiedziec."""
+    arm = FakeArm()
+    arm.calibration_warnings = lambda: ["zero stawow w kalibracji LeRobota nie jest zerem blizniaka"]
+    connect_fake(twin, monkeypatch, arm)
+    run(twin, 0.1)
+    assert any("zero stawow" in w for w in twin.status.warnings)
+    arm2 = FakeArm()
+    arm2.calibration_warnings = lambda: 1 / 0                  # diagnostyka nie blokuje polaczenia
+    connect_fake(twin, monkeypatch, arm2)
+    assert twin.status.connected
+
+
 # ------------------------------------------------------------ wlasnosc: sprzeglo i odmowy
 def test_set_engaged_with_an_owner_only_touches_its_own_clutch(twin, monkeypatch):
     connect_fake(twin, monkeypatch, FakeArm())

@@ -338,8 +338,10 @@ def run_sysid(job: Job, twin) -> Any:
     job.message = "ruch pobudzajacy (ramie sie rusza)"
     home = dict(twin.workspace.spec().home)
     try:
+        # take=False: ramie wzial panel przed startem zadania; odebrane w tym czasie
+        # (Dom, STOP, Polacz) nie jest brane z powrotem.
         rec = record(twin, excitation(home), on_tick=lambda p: setattr(job, "progress", 0.4 * p),
-                     should_stop=job.cancel.is_set)
+                     should_stop=job.cancel.is_set, take=False)
     finally:
         if twin.owner == SYSID_OWNER:
             twin.set_engaged(False)
@@ -351,7 +353,7 @@ def run_sysid(job: Job, twin) -> Any:
     job.message = "dopasowanie symulacji do nagrania (ramie juz wolne)"
 
     def prog(n, c):
-        job.progress = min(0.99, 0.4 + 0.6 * n / 700)
+        job.progress = min(0.99, 0.4 + 0.6 * n / 610)          # identify: ok. 609 symulacji
         job.message = f"dopasowanie: {n} symulacji, blad {c:.3f} st."
     dyn, base = fit(rec, on_progress=prog)
     job.data["base"] = base

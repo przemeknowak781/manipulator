@@ -542,6 +542,16 @@ class Twin:
         if grip:
             logger.warning(grip)
             self._warnings["grip_ticks"] = grip
+        # Backend `lerobot` liczy katy od srodka zakresu kalibracji, nie od tiku 2048 jak
+        # blizniak: na typowej kalibracji -2 st. na shoulder_pan i -6,4 st. na elbow_flex,
+        # przy jednostronnym zakresie (stary wrist_flex ramienia nr 1) ok. 35 st.
+        try:
+            calib = list(getattr(b, "calibration_warnings", lambda: [])() or [])
+        except Exception:
+            calib = []
+        for i, w in enumerate(calib):
+            logger.warning(w)
+            self._warnings[f"calib_{i}"] = str(w)
         ws.backend, ws.port = backend, port
         self.status = RobotStatus(connected=True, backend=backend, simulated=b.info.simulated,
                                   state=self._supervisor.state.value, measured=measured,
