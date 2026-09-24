@@ -52,6 +52,16 @@ class RobotBackend(ABC):
     def is_connected(self) -> bool:
         ...
 
+    @property
+    def link_silent(self) -> bool:
+        """Ostatni `read_joints` nie dostal ZADNEJ swiezej odpowiedzi - oddal stare pozycje.
+
+        Blizniak nie liczy wtedy takiego odczytu jako pomiaru i wstrzymuje nadzor.
+        Backend bez lacza (symulator) - zawsze False. Domyslnie czyta `_link_silent`,
+        ktore ustawiaja `feetech` i `lerobot` (i atrapy w testach).
+        """
+        return bool(getattr(self, "_link_silent", False))
+
     def faults(self) -> list[str]:
         """Usterki sprzetu widziane w ostatnich odpowiedziach - czytelne zdania po polsku.
 

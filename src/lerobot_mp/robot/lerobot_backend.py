@@ -12,11 +12,13 @@ import dataclasses
 import importlib
 import inspect
 import logging
+import math
+import time
 from typing import Any
 
 from ..config import AppConfig, GRIPPER, JOINT_NAMES
 from .base import RobotBackend, RobotInfo
-from .feetech import describe_servo_error
+from .feetech import LINK_LOSS_CYCLES, describe_servo_error
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +110,7 @@ class LeRobotArm(RobotBackend):
             "port": rc.port,
             "id": rc.robot_id,
             "use_degrees": rc.use_degrees,
-            "max_relative_target": rc.max_relative_target,
+            "max_relative_target": self._max_relative_target(rc.max_relative_target),
             # LeRobot domyslnie zdejmuje moment przy rozlaczeniu - ramie opada pod
             # wlasnym ciezarem. U nas decyduje o tym ta sama opcja co w `feetech`.
             "disable_torque_on_disconnect": rc.torque_off_on_exit,
@@ -128,6 +130,35 @@ class LeRobotArm(RobotBackend):
                 skipped,
             )
         return config_cls(**kwargs)
+
+    @staticmethod
+    def _max_relative_target(value: Any) -> float | dict[str, float] | None:
+        """`robot.max_relative_target` w postaci, ktora LeRobot przyjmie: None, float albo {staw: float}.
+
+        `ensure_safe_goal_position` LeRobota 0.6.1 sprawdza `isinstance(..., float)` - `12`
+        wpisane w YAML bez kropki (int) dawalo `TypeError: 12` przy PIERWSZYM rozkazie
+        i petla blizniaka konczyla sie rozlaczeniem. Zly wpis odrzucamy przed portem.
+        None (tez "null"/"none"/"" z linii polecen) = LeRobot nie przycina celu - tego
+        chce blizniak: jego nadzor sam ogranicza predkosc, a przyciecie o 12 st. od pomiaru
+        chowalo kolizje przed straznikiem rozjazdu (25 st.) i ramie pchalo w przeszkode bez konca.
+        """
+        def one(v: Any) -> float:
+            if isinstance(v, bool):
+                raise ValueError(v)
+            out = float(v)
+            if not math.isfinite(out) or out <= 0:
+                raise ValueError(v)
+            return out
+
+        if value is None or (isinstance(value, str) and value.strip().lower() in ("", "none", "null")):
+            return None
+        try:
+            if isinstance(value, dict):
+                return {str(k): one(v) for k, v in value.items()}
+            return one(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"robot.max_relative_target: {value!r} - podaj dodatnia liczbe stopni "
+                             "albo null (bez limitu)") from None
 
     # ------------------------------------------------------------ polaczenie
     def connect(self) -> None:
@@ -178,9 +209,15 @@ class LeRobotArm(RobotBackend):
     def _connect_without_calibration(self, robot: Any) -> None:
         """Laczy tak, zeby LeRobot nigdy nie zdjal momentu ani nie zapytal o nic w konsoli."""
         bus = getattr(robot, "bus", None)
-        if bus is not None and hasattr(bus, "connect") and hasattr(bus, "is_calibrated"):
-            bus.connect()
+        # `getattr_static`, nie `hasattr`: `is_calibrated` magistrali LeRobota to wlasciwosc,
+        # ktora CZYTA serwa, a na niepolaczonej rzuca DeviceNotConnectedError (ConnectionError,
+        # nie AttributeError). `hasattr` wywolywal ja przed `bus.connect()` i LeRobot 0.6.1
+        # z plikiem kalibracji nie laczyl sie NIGDY (odtworzone na emulatorze magistrali).
+        missing = object()
+        if (bus is not None and callable(getattr(bus, "connect", None))
+                and inspect.getattr_static(bus, "is_calibrated", missing) is not missing):
             try:
+                bus.connect()
                 calibrated = bool(bus.is_calibrated)
                 holding = calibrated and self._torque_on(bus)
             except Exception:
@@ -258,19 +295,55 @@ class LeRobotArm(RobotBackend):
 
     # ------------------------------------------------------------- wymiana IO
     def read_joints(self) -> dict[str, float]:
+        """Pozycje stawow; nieudany odczyt oddaje poprzednie i ustawia `link_silent` (jak `feetech`).
+
+        LeRobot rzuca ConnectionError, gdy SYNC READ Present_Position nie dostal odpowiedzi
+        w `num_read_retries + 1` probach - krotka seria zaklocen przy ruchu kilku stawow.
+        Wyjatek konczyl petle blizniaka (rozlaczenie, ponowne laczenie w panelu), a `feetech`
+        przezywa to samo bez mrugniecia. Kolejne nieudane cykle ida do `faults()`
+        ("brak odpowiedzi serw ..."), ktore blizniak traktuje jak zerwane lacze.
+        """
         if self._robot is None:
             raise RuntimeError("Robot nie jest polaczony")
-        observation = self._robot.get_observation()
+        try:
+            observation = self._robot.get_observation()
+        except ConnectionError as exc:
+            if not self._positions or not self._robot_connected():
+                raise                               # nie ma czego oddac albo robot naprawde rozlaczony
+            self._link_silent, self._stale = True, list(self._positions)
+            self._failed_cycles += 1
+            self._link_error = f"{type(exc).__name__}: {exc}"
+            if self._failed_cycles == LINK_LOSS_CYCLES:
+                logger.warning("Serwa nie odpowiadaja od %d cykli odczytu: %s", self._failed_cycles, self._link_error)
+            else:
+                logger.debug("Nieudany odczyt pozycji serw: %s", self._link_error)
+            return dict(self._positions)
         self._poll_status()
-        return {
+        positions = {
             key.removesuffix(".pos"): float(value)
             for key, value in observation.items()
             if key.endswith(".pos")
         }
+        self._positions.update(positions)
+        self._link_silent, self._stale = False, []
+        self._failed_cycles, self._link_error = 0, ""
+        self._last_full_read = time.monotonic()
+        return dict(positions)
+
+    def _robot_connected(self) -> bool:
+        """`DeviceNotConnectedError` to tez ConnectionError - rozlaczony robot nie jest czkawka lacza."""
+        try:
+            return bool(getattr(self._robot, "is_connected", True))
+        except Exception:  # pragma: no cover - zalezne od wersji LeRobot
+            return False
 
     def send_joints(self, targets: dict[str, float]) -> dict[str, float]:
         if self._robot is None:
             raise RuntimeError("Robot nie jest polaczony")
+        if self._link_silent:
+            # Jak `feetech`: ostatni odczyt nie dostal odpowiedzi - nic nie wysylamy, dopoki
+            # odczyt nie potwierdzi, ze serwa slysza i gdzie ramie naprawde jest.
+            return {}
         known = set(self.motor_names())
         # W stopniach LeRobot nie przycina celu (przycina tylko skale -100..100 i 0..100),
         # a serwo robi to po cichu do Min/Max_Position_Limit z EEPROM. Przycinamy tutaj,
@@ -285,7 +358,15 @@ class LeRobotArm(RobotBackend):
             if name in limits:
                 value = min(max(value, limits[name][0]), limits[name][1])
             action[f"{name}.pos"] = value
-        sent = self._robot.send_action(action)
+        try:
+            sent = self._robot.send_action(action)
+        except ConnectionError:
+            # Z `max_relative_target` LeRobot czyta Present_Position PRZED zapisem celu - ten
+            # odczyt tez gubi ramki. Nic nie poszlo; wolajacy zostaje przy poprzednim rozkazie.
+            if not self._robot_connected():
+                raise
+            logger.debug("Nieudany odczyt pozycji przed wyslaniem celu - nic nie wyslano", exc_info=True)
+            return {}
         return {
             key.removesuffix(".pos"): float(value)
             for key, value in (sent or action).items()
@@ -301,6 +382,15 @@ class LeRobotArm(RobotBackend):
         #: KOLEJNE nieudane odczyty Status i ostatni blad (do komunikatu).
         self._status_failures = 0
         self._status_error = ""
+        #: Ostatnie dobre pozycje - oddawane, gdy odczyt nie dostal odpowiedzi.
+        self._positions: dict[str, float] = {}
+        #: Ostatni odczyt pozycji bez odpowiedzi (`link_silent`) i stawy bez swiezej wartosci.
+        self._link_silent = False
+        self._stale: list[str] = []
+        #: KOLEJNE nieudane odczyty pozycji, ostatni blad i czas ostatniego dobrego odczytu.
+        self._failed_cycles = 0
+        self._link_error = ""
+        self._last_full_read = time.monotonic()
 
     def _poll_status(self) -> None:
         """Czyta rejestr Status wszystkich serw co `STATUS_EVERY_READS` odczytow pozycji. Nigdy nie rzuca.
@@ -341,6 +431,10 @@ class LeRobotArm(RobotBackend):
             if self._connected and self._status_failures >= STATUS_FAIL_LIMIT:
                 out.append(f"stan serw nieznany - {self._status_failures} nieudanych odczytow rejestru "
                            f"Status z rzedu, ochrona serw niewidoczna ({self._status_error})")
+            if self._connected and self._failed_cycles >= LINK_LOSS_CYCLES:
+                # To samo zdanie co `feetech` - blizniak rozpoznaje po nim zerwane lacze.
+                ms = (time.monotonic() - self._last_full_read) * 1000.0
+                out.append(f"brak odpowiedzi serw od {ms:.0f} ms ({self._link_error})")
             return out
         except Exception as exc:  # pragma: no cover - wolane co cykl petli, nie moze jej wysypac
             logger.exception("Nie udalo sie sprawdzic stanu serw")
@@ -451,21 +545,42 @@ class LeRobotArm(RobotBackend):
                 out[str(name)] = (mid - center) * 360.0 / (self._resolution(name) - 1)
         return out
 
+    def non_degree_joints(self) -> list[str]:
+        """Stawy ramienia (bez chwytaka), ktorych LeRobot NIE podaje w stopniach.
+
+        `robot.use_degrees: false` przestawia je na -100..100 procent zakresu z kalibracji,
+        a kinematyka, polityki i IK traktuja kazda liczbe jak stopnie - 100 "stopni" to wtedy
+        koniec zakresu stawu. Wczesniej nic w panelu o tym nie mowilo.
+        """
+        return [str(name) for name in self._motors()
+                if name != GRIPPER and self._norm_mode(str(name)) != "DEGREES"]
+
     def calibration_warnings(self) -> list[str]:
         """Niefatalne zastrzezenia do kalibracji tego ramienia - zdania dla panelu. Nigdy nie rzuca."""
         try:
+            out: list[str] = []
+            wrong_units = self.non_degree_joints()
+            if wrong_units:
+                out.append(f"UWAGA: stawy {', '.join(wrong_units)} ida z LeRobota w procentach zakresu "
+                           f"(-100..100), a nie w stopniach (robot.use_degrees = {self.cfg.robot.use_degrees}) "
+                           "- kinematyka i polityki blizniaka licza w stopniach, wiec kazdy ruch pojedzie "
+                           "w zle miejsce. Ustaw robot.use_degrees: true albo uzyj backendu `feetech`.")
             off = self.joint_zero_offsets()
-            if not off:
-                return []
-            shifts = ", ".join(f"{name} {deg:+.1f} st." for name, deg in off.items())
-            return [f"zero stawow w kalibracji LeRobota (srodek zakresu) nie jest zerem blizniaka "
-                    f"(tik {int(self.cfg.robot.center_ticks)}) - katy z backendu `lerobot` sa przesuniete "
-                    f"wzgledem modelu ({shifts}) - do pracy z blizniakiem uzyj backendu `feetech`."]
+            if off:
+                shifts = ", ".join(f"{name} {deg:+.1f} st." for name, deg in off.items())
+                out.append(f"zero stawow w kalibracji LeRobota (srodek zakresu) nie jest zerem blizniaka "
+                           f"(tik {int(self.cfg.robot.center_ticks)}) - katy z backendu `lerobot` sa "
+                           f"przesuniete wzgledem modelu ({shifts}) - do pracy z blizniakiem uzyj backendu "
+                           "`feetech`.")
+            return out
         except Exception as exc:  # pragma: no cover - sama diagnostyka nie moze zablokowac polaczenia
             logger.debug("Nie udalo sie porownac zera stawow z kalibracja LeRobota", exc_info=True)
             return [f"nie udalo sie sprawdzic kalibracji LeRobota: {exc}"]
 
     def _warn_about_joint_zero(self) -> None:
         for text in self.calibration_warnings():
-            logger.warning(text)
+            if text.startswith("UWAGA"):
+                logger.error(text)
+            else:
+                logger.warning(text)
 
