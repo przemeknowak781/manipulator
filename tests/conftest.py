@@ -101,6 +101,15 @@ def make_hand(
     return HandSample(points, world, handedness, 0.95)
 
 
+@pytest.fixture(autouse=True)
+def _no_config_from_env(monkeypatch):
+    """Testy licza na wartosciach domyslnych - plik z LEROBOT_MP_CONFIG w powloce by je zmienil."""
+    # setenv zapamietuje stan sprzed testu, wiec to, co ustawi `lerobot-twin --config`
+    # w os.environ, zniknie po tescie (samo delenv nieistniejacej zmiennej niczego nie zapamietuje).
+    monkeypatch.setenv("LEROBOT_MP_CONFIG", "")
+    monkeypatch.delenv("LEROBOT_MP_CONFIG")
+
+
 @pytest.fixture
 def cfg() -> AppConfig:
     return load_config()

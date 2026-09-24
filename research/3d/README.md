@@ -10,6 +10,8 @@ badawcze, nie kod aplikacji — działają na scenie bliźniaka z `lerobot_mp.tw
 | `jaw_geometry.py` | położenie czubków obu szczęk względem TCP przy różnym otwarciu |
 | `*_out.json` | wyniki z laptopa (i5-7200U, Intel HD 620) |
 
+Zależności: bliźniak plus `trimesh` (otoczki wypukłe) — `pip install -e ".[twin,research]" -c constraints.txt`.
+
 Skrypty zapisują wyniki i rendery w **bieżącym katalogu** — uruchamiaj je
 z katalogu tymczasowego, a nie z korzenia repozytorium:
 

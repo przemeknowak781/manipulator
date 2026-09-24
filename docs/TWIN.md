@@ -33,30 +33,72 @@ Szczegóły, decyzje i pułapki: **[HANDOFF.md](../HANDOFF.md)**.
 
 ---
 
-## Instalacja (Windows, maszyna Shadow)
+## Instalacja
 
-Shadow to Windows x86-64 z **RTX A4500 (20 GB)**. WSL2 nie ruszy — wirtualka
-nie udostępnia zagnieżdżonej wirtualizacji — ale nie jest potrzebne: MuJoCo
-Warp i PyTorch z CUDA działają natywnie.
+Skrót dla każdej platformy jest w README, „Szybki start na nowym komputerze”.
+Najważniejsze zasady:
+
+- **Torch z CUDA instaluj NAJPIERW, z indeksu PyTorcha**, a dopiero potem
+  projekt. Torch z PyPI na Windows jest bez CUDA (`torch.version.cuda == None`),
+  a na Linuksie wymaga CUDA 13 (sterownik ≥ 580). Gdy torch z PyPI trafi do
+  środowiska pierwszy, `pip install torch --index-url …` odpowie „already
+  satisfied” i CPU-owy torch zostanie — wtedy `pip uninstall torch` i od nowa.
+- Wersje sprawdzone razem są w `constraints.txt` (`-c constraints.txt`);
+  `mujoco` i `mujoco-warp` muszą mieć tę samą wersję (extra je wiążą).
+- Trening potrzebuje karty NVIDIA z CUDA. Bez niej instaluj bez `train`
+  (torch z indeksu `cpu`): panel, kalibracja, percepcja, identyfikacja
+  dynamiki i ewaluacja polityk na CPU działają.
 
 ```bash
-python -m venv .venv
+# Windows + NVIDIA (PowerShell); Linux: python3.12 i source .venv/bin/activate
+py -3.12 -m venv .venv
 .venv\Scripts\activate
-pip install -e ".[twin,feetech,dev]"
-pip install mujoco-warp
-pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
+python -m pip install --upgrade pip
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126   # bez NVIDIA: .../whl/cpu
+pip install -e ".[twin,train,feetech,dev]" -c constraints.txt                 # bez NVIDIA: ".[twin,feetech,dev]"
 lerobot-twin check
+lerobot-twin demo    # przykładowe stanowisko w symulacji -> workspace/twin.json
 ```
 
-- **Torch z PyPI na Windows jest bez CUDA** (`torch.version.cuda == None`) —
-  koło z CUDA tylko z indeksu PyTorcha. `cu126` działa ze sterownikiem Shadow
-  565.90 (CUDA 12.7). Te same wersje co w lerobocie, więc nic się nie rozjeżdża.
-- Na `C:` Shadow zostaje niewiele miejsca; duże pakiety instaluj z `TMP`
-  ustawionym na `D:` (`set TMP=D:\tmp`) albo z `--no-cache-dir`.
-- Po instalacji lerobota sprawdź, czy `cv2` ma GUI (lerobot potrafi podmienić
-  OpenCV na wersję bez okien).
+`lerobot-twin check` wypisuje osobno gotowość do treningu: wersję torcha, jego
+kompilację CUDA, `cuda.is_available()` i kartę, oraz `warp` (czy widzi GPU)
+i `mujoco_warp`.
+
+- Linux bez ekranu: `export MUJOCO_GL=egl` (NVIDIA) albo `osmesa` (CPU,
+  `sudo apt install libosmesa6`). Port szeregowy: `sudo usermod -aG dialout $USER`.
+- Po instalacji LeRobota (`.[robot]`) sprawdź, czy `cv2` ma GUI — LeRobot
+  podmienia OpenCV na wersję bez okien; naprawa w README („Naprawa OpenCV po
+  LeRobocie”). Do bliźniaka LeRobot nie jest potrzebny (backend `feetech`).
 - Pierwsza kompilacja kerneli MuJoCo Warp trwa ~100 s; potem są w cache
-  (`%LOCALAPPDATA%\NVIDIA\warp\Cache`).
+  (Windows `%LOCALAPPDATA%\NVIDIA\warp\Cache`, Linux `~/.cache/warp`).
+
+**Pliki stanowiska.** `workspace/twin.json` (kamery, kalibracja, port, stół,
+dynamika) i `workspace/policies/` są lokalne, poza repozytorium. Z klonu ich
+domyślne ścieżki liczą się od katalogu repozytorium, niezależnie od katalogu
+uruchomienia; inny plik: `--workspace <plik>`. Bez pliku bliźniak startuje
+z pustym stanowiskiem (ramię `sim`, bez kamer). `lerobot-twin demo` kopiuje
+`examples/twin.sim.json` — dwie kamery symulowane, których kalibracja to ich
+prawdziwa poza w scenie (zaufane), więc „kostka z kamer” działa od razu.
+Istniejącego stanowiska nie nadpisze (`--force`, albo `--path <plik>`).
+
+**Konfiguracja ramienia.** Bliźniak czyta plik konfiguracji tylko wtedy, gdy
+się go wskaże: `lerobot-twin --config configs/local.yaml ui` (także `train`,
+`eval`; opcja ustawia zmienną `LEROBOT_MP_CONFIG`, którą dziedziczy proces
+treningu uruchamiany z panelu). Klucze sekcji `robot:` ważne dla bliźniaka
+i backendu `feetech` (opisane w `configs/default.yaml`): `center_ticks` (tik
+zera stawu, 2048), `gripper_closed_ticks` / `gripper_open_ticks` (szczęka 0
+i 100 w skali aplikacji; domyślne 1986 / 2670 to ramię autora), `baudrate`
+(1 000 000).
+
+### Na Shadow (maszyna autora)
+
+Shadow to Windows x86-64 z **RTX A4500 (20 GB)**, sterownik 565.90 (CUDA 12.7)
+— `cu126` na nim działa. WSL2 nie ruszy (wirtualka nie udostępnia
+zagnieżdżonej wirtualizacji), ale nie jest potrzebne: MuJoCo Warp i PyTorch
+z CUDA działają natywnie. Na `C:` zostaje niewiele miejsca — duże pakiety
+instaluj z `TMP` i `PIP_CACHE_DIR` na `D:` (`set TMP=D:\tmp`) albo
+z `--no-cache-dir`. Czasy w tym dokumencie bez innego opisu są zmierzone
+na Shadow.
 
 ## Panel
 
@@ -116,7 +158,7 @@ stanu.
 
 | zakładka | co robi |
 |---|---|
-| **Ramię** | połączenie: `sim` (bliźniak jest ramieniem), `feetech` (port `COM12` albo `socket://adres:5555` przez most), `lerobot`; wykrywanie przejściówki CH343; sprzęgło; suwaki stawów; uchwyt końcówki w 3D (IK) |
+| **Ramię** | połączenie: `sim` (bliźniak jest ramieniem), `feetech` (port `COMx` / `/dev/ttyACM0` albo `socket://adres:5555` przez most), `lerobot`; wykrywanie przejściówki CH343; sprzęgło; suwaki stawów; uchwyt końcówki w 3D (IK) |
 | **Kamery** | kamery USB i **symulowane** — symulowaną stawiasz w dowolnym miejscu widoku 3D i przeciągasz uchwytem; piramidy z obrazem na żywo (zielona = zaufana, pomarańczowa = niezaufana, czerwona = **przestawiona**); podgląd; błąd kalibracji względem prawdy dla symulowanych |
 | **Kalibracja** | arkusze do druku (tablica ChArUco, karta z tagami); **1.** intrynsyki — tablica w ręku, kadry zapisują się same, gdy wnoszą nowe ujęcie; **2.** położenie wszystkich kamer naraz — fala z kartą w chwytaku; **szybka relokalizacja** jednej przestawionej kamery |
 | **Mapa** | kadry wszystkich zaufanych kamer zszyte w mapę blatu (także na stole w 3D), wykrywanie kostki (kolor do wyboru) |
@@ -132,14 +174,22 @@ Wszystko poniżej jest przećwiczone na bliźniaku (`sim`) — ta sama ścieżka
 te same przyciski. Przed każdym krokiem na sprzęcie: ramię na stole, wolne
 miejsce dookoła, zasilacz podłączony, ręka przy STOP.
 
-**0. Ramię do Shadow.** Dwie drogi:
-- *przepuszczenie USB w kliencie Shadow* (CH343 pojawia się jako `COMx`), albo
-- *most*: na komputerze przy ramieniu `lerobot-mp-bridge --port COM12 --listen 0.0.0.0:5555 --allow <adres Shadow>`,
-  w panelu port `socket://<adres komputera>:5555`. Odczyt ramienia idzie jednym
-  pakietem SYNC READ — przez sieć jeden przebieg na odczyt zamiast sześciu.
-  Shadow stoi w centrum danych, więc musi **widzieć** komputer przy ramieniu:
-  sieć prywatna (Tailscale, ZeroTier) albo przekierowany port. Most działa
-  dobrze do ~20 ms RTT; `--stats` pokazuje, ile faktycznie schodzi.
+**0. Ramię do komputera z bliźniakiem.** Zależnie od tego, gdzie działa bliźniak:
+- *lokalnie* — ramię wpięte do tego komputera: port `COMx` (Windows) albo
+  `/dev/ttyACM0` (Linux, użytkownik w grupie `dialout`); pokaże go
+  `lerobot-twin check` albo „Wykryj porty” w panelu;
+- *maszyna wirtualna albo zdalna* (np. Shadow) — *przepuszczenie USB w kliencie*
+  (przejściówka pojawia się jako `COMx`), albo
+- *most*: na komputerze przy ramieniu `lerobot-mp-bridge --port COMx --listen 0.0.0.0:5555 --allow <adres maszyny z bliźniakiem>`,
+  w panelu port `socket://<adres komputera przy ramieniu>:5555`. Odczyt ramienia
+  idzie jednym pakietem SYNC READ — przez sieć jeden przebieg na odczyt zamiast
+  sześciu. Maszyna zdalna (Shadow stoi w centrum danych) musi **widzieć**
+  komputer przy ramieniu: sieć prywatna (Tailscale, ZeroTier) albo przekierowany
+  port. Most działa dobrze do ~20 ms RTT; `--stats` pokazuje, ile faktycznie schodzi.
+
+Przed pierwszym połączeniem sprawdź tiki chwytaka swojego ramienia (akapit
+**Chwytak** niżej) i wpisz je w `configs/local.yaml`; panel uruchamiaj wtedy
+z `--config configs/local.yaml`.
 
 W zakładce Ramię: `feetech`, port, **Połącz** (bez jazdy do domu). Suwaki mają
 pokazywać to, co ramię. Sprzęgło + mały ruch jednym suwakiem.
@@ -152,8 +202,8 @@ zamiast 1986…2670. Panel pokazuje oba rozjazdy jako ostrzeżenie. Błędy serw
 i limity z EEPROM działają na obu backendach (`lerobot`: rejestr stanu co 3.
 odczyt).
 
-**1. Kamery.** Przepuść kamery USB w kliencie Shadow, w panelu *Szukaj kamer
-USB* → *Dodaj*. Kamera, która się otwiera, ale nie daje klatek, to prawie
+**1. Kamery.** Na maszynie wirtualnej/zdalnej (np. Shadow) najpierw przepuść
+kamery USB w kliencie. W panelu *Szukaj kamer USB* → *Dodaj*. Kamera, która się otwiera, ale nie daje klatek, to prawie
 zawsze brak przepuszczenia (patrz README).
 
 **2. Intrynsyki każdej kamery.** *Pobierz arkusz tablicy*, wydrukuj w skali
@@ -210,9 +260,15 @@ albo „w dłoni”), nigdy z ostatnio widzianej.
 
 **Chwytak.** 0..100 w panelu to te same tiki serwa co w backendzie `feetech`
 (`gripper_closed_ticks` … `gripper_open_ticks`, zero w `center_ticks`); w
-bliźniaku 0 = −5,4°, 100 = 54,7° kąta szczęki. Sprawdź na ramieniu, że przy 0
+bliźniaku 0 = −5,4°, 100 = 54,7° kąta szczęki. Domyślne 1986 … 2670 to ramię
+autora (z EEPROM-u jego serwa chwytaka). Sprawdź na ramieniu, że przy 0
 szczęki się stykają — jeśli nie, zero szczęki w MJCF nie leży w `center_ticks`
-i trzeba to poprawić w konfiguracji, zanim zaufa się `lift`.
+i trzeba to poprawić w konfiguracji, zanim zaufa się `lift`: skopiuj
+`configs/default.yaml` do `configs/local.yaml` (jest w `.gitignore`), popraw
+w sekcji `robot:` klucze `center_ticks`, `gripper_closed_ticks`,
+`gripper_open_ticks` (i ewentualnie `baudrate`), a panel uruchamiaj przez
+`lerobot-twin --config configs/local.yaml ui`. Wystarczy sama sekcja `robot:`
+z tymi kluczami — reszta bierze wartości domyślne.
 
 ---
 
@@ -220,24 +276,26 @@ i trzeba to poprawić w konfiguracji, zanim zaufa się `lift`.
 
 | | |
 |---|---|
-| `lerobot-twin check` | czy środowisko jest gotowe (bez renderu) |
+| `lerobot-twin check` | czy środowisko jest gotowe (bez renderu); osobno gotowość GPU do treningu |
+| `lerobot-twin demo` | przykładowe stanowisko w symulacji → `workspace/twin.json` (`--force`, `--path`) |
 | `lerobot-twin ui` | panel w przeglądarce |
+| `lerobot-twin --config configs/local.yaml <polecenie>` | konfiguracja ramienia z pliku (tiki chwytaka, baudrate) |
 | `lerobot-twin card --tag-mm 50` | arkusz karty kalibracyjnej (PNG, A4) |
 | `lerobot-twin board --square-mm 28` | tablica ChArUco do intrynsyk (PNG, A4) |
 | `lerobot-twin calib-sim --n 5 --cameras 2` | kalibracja w symulacji, oceniana względem prawdy |
-| `lerobot-twin train --task reach --iters 160` | PPO na GPU + ewaluacja na CPU; `--no-rand`, `--spread`, `--init <policy.pt>` (douczanie) |
+| `lerobot-twin train --task reach --iters 160` | PPO na GPU + ewaluacja na CPU; `--no-rand`, `--spread`, `--init <policy.pt>` (douczanie, np. `--init assets/policies/reach-v3/policy.pt --iters 150`) |
 | `lerobot-twin eval <policy.pt> --rand` | ewaluacja polityki w zwykłym MuJoCo |
 | `lerobot-twin policies` | zapisane polityki i ich wyniki |
 | `lerobot-twin workspace` | co wiadomo o stanowisku |
 
 ```bash
 pytest -q                                          # całość, z renderem i GPU
-pytest -q -m "not render"                          # maszyna bez GPU (testy CUDA pomijają się same)
+pytest -q -m "not render"                          # maszyna bez OpenGL/GPU (testy CUDA pomijają się same, także bez mujoco_warp)
 ```
 
 ---
 
-## Liczby z Shadow (RTX A4500, EPYC 4 rdzenie)
+## Liczby zmierzone na Shadow (RTX A4500, EPYC 4 rdzenie)
 
 | | Shadow | laptop (Intel HD 620) |
 |---|---|---|

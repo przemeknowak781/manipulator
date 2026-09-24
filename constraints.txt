@@ -1,0 +1,35 @@
+# Wersje sprawdzone razem na maszynie autora (Shadow: Windows 11, Python 3.12.10,
+# NVIDIA RTX A4500, sterownik 565.90), wrzesien 2026. Tylko pakiety, ktorych
+# potrzebuje ten projekt - reszta zaleznosci dobiera sie sama.
+#
+# Uzycie (torch NAJPIERW z indeksu PyTorcha, patrz README "Szybki start na nowym komputerze"):
+#   pip install -e ".[twin,train,feetech,dev]" -c constraints.txt
+#
+# torch/torchvision bez lokalnego znacznika (+cu126 / +cpu): wg PEP 440 "==2.11.0"
+# pasuje tez do 2.11.0+cu126 i 2.11.0+cpu, wiec kolo zainstalowane wczesniej
+# z indeksu PyTorcha zostaje, a pip nie podmienia go na wersje z PyPI.
+
+numpy==2.2.6
+PyYAML==6.0.3
+# mediapipe 1.0.1 nie ma kola dla Maca z Intelem - tam pip wezmie 0.10.x (backend legacy).
+mediapipe==1.0.1; sys_platform != "darwin" or platform_machine == "arm64"
+opencv-contrib-python==5.0.0.93
+
+# blizniak [twin] i trening [train] - mujoco i mujoco-warp zawsze w tej samej wersji
+mujoco==3.14.0
+mujoco-warp==3.14.0
+warp-lang==1.17.0
+gymnasium==1.3.0
+viser==1.1.1
+websockets==16.1.1
+torch==2.11.0
+torchvision==0.26.0
+
+# prawdziwe ramie: [feetech] / [bridge], opcjonalnie [robot] (LeRobot, tylko Python 3.12)
+pyserial==3.5
+lerobot==0.6.1
+feetech-servo-sdk==1.0.0
+
+# [research], [dev]
+trimesh==5.1.0
+pytest==9.1.1

@@ -1,0 +1,28 @@
+lerobot-mp - sterowanie ramieniem SO-101 gestami dłoni i cyfrowy bliźniak stanowiska
+Licencja projektu: Apache-2.0 (pyproject.toml).
+
+Repozytorium zawiera pliki osób trzecich, rozpowszechniane na ich licencjach:
+
+1. assets/robots/so101/  (so101.xml, siatki STL w assets/)
+   Model SO-101 z MuJoCo Menagerie (Google DeepMind),
+   https://github.com/google-deepmind/mujoco_menagerie/tree/ac6b2b09983786f3036cab1000221017fa2193b4/robotstudio_so101
+   commit ac6b2b0, skopiowany bez zmian. Licencja Apache-2.0: assets/robots/so101/LICENSE.
+   Menagerie wywodzi model z TheRobotStudio/SO-ARM100 (Apache-2.0).
+
+2. assets/so101_preview.npz
+   Siatka podglądu 3D aplikacji lerobot-mp, odtworzona z geometrii producenta
+   SO-101: TheRobotStudio/SO-ARM100, https://github.com/TheRobotStudio/SO-ARM100
+   (Apache-2.0), przez projekt articulus (przemeknowak781/articulus ->
+   vendor/lerobot-so101; skrypt scripts/import_articulus_model.py).
+   Plik jest przetworzeniem (uproszczona siatka + łańcuch kinematyczny).
+
+3. models/hand_landmarker.task, models/pose_landmarker_lite.task
+   Modele Google MediaPipe (Hand Landmarker, Pose Landmarker lite),
+   https://storage.googleapis.com/mediapipe-models/ ; licencja Apache-2.0
+   według kart modeli MediaPipe. Skopiowane bez zmian; źródła i sumy SHA-256
+   w models/README.md.
+
+Polityki assets/policies/*/policy.pt zostały wytrenowane w tym projekcie
+(lerobot-twin train) i są objęte licencją projektu.
+
+Pełny tekst licencji Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0

@@ -6,6 +6,11 @@
 # bledem, a nie cichym zignorowaniem.
 #
 # Uruchomienie:  lerobot-mp --config configs/default.yaml
+# Blizniak:      lerobot-twin --config configs/local.yaml ui   (albo train/eval)
+#                - ustawia zmienna LEROBOT_MP_CONFIG, ktora widzi tez proces
+#                treningu uruchomiony z panelu. Mozna ja tez ustawic samemu.
+# Wlasne wartosci trzymaj w kopii: configs/local.yaml (jest w .gitignore) -
+# wystarczy w niej sekcja, ktora zmieniasz, np. tylko `robot:`.
 
 # Czestotliwosc petli sterowania [Hz]. Wizja moze chodzic wolniej - petla
 # tyka niezaleznie, wiec ograniczenia predkosci i watchdog dzialaja tak samo.
@@ -106,7 +111,7 @@ safety:
     gripper: 35.0
 
 robot:
-  backend: sim         # sim | lerobot | auto
+  backend: sim         # sim | lerobot | feetech | auto
   port: null           # np. /dev/ttyACM0, /dev/tty.usbmodem58FA0958121, COM5
   robot_id: so101_follower
   kind: so101          # so101 | so100
@@ -114,6 +119,17 @@ robot:
   max_relative_target: 12.0   # sprzetowy limit skoku (null = wylaczony)
   calibration_dir: null
   read_state_hz: 10.0
+  # --- tylko backend `feetech` (lerobot-mp) i blizniak (lerobot-twin) --------
+  # Blizniak przelicza chwytak 0..100 na kat szczeki przez te same tiki, wiec
+  # przy innym ramieniu niz autora trzeba je poprawic TUTAJ (w kopii pliku),
+  # inaczej `lift` sciska za mocno albo nie domyka.
+  baudrate: 1000000          # predkosc portu; STS3215 w SO-101 fabrycznie 1 Mbaud
+  center_ticks: 2048         # tik zera stawu (4096 tikow na obrot, montaz wysrodkowany)
+  gripper_closed_ticks: 1986 # szczeka zamknieta = 0 w skali aplikacji
+  gripper_open_ticks: 2670   # szczeka otwarta = 100; wartosci z EEPROM ramienia autora (nr 1)
+  # Sprawdz swoje: rozewrzyj/zamknij szczeke reka i odczytaj Present_Position
+  # serwa chwytaka (np. programem Feetech FD) albo jego limity Min/Max_Position_Limit z EEPROM-u.
+  torque_off_on_exit: false  # wiotkie ramie opada - wlacz tylko, gdy jest podparte
 
 ui:
   show: true

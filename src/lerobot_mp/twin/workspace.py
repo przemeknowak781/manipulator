@@ -6,8 +6,10 @@ podstawy i wynikiem kalibracji. Z tego jednego opisu powstaje scena MuJoCo,
 srodowisko RL i widok w UI - wiec kamera skalibrowana na biurku trafia do
 symulacji dokladnie tam, gdzie stoi, bez przepisywania liczb recznie.
 
-Domyslnie `workspace/twin.json` wzgledem katalogu uruchomienia; katalog jest
-w `.gitignore`, bo stanowisko jest per biurko, nie per repozytorium.
+Domyslnie `workspace/twin.json` wzgledem korzenia klonu repozytorium (poza
+klonem: wzgledem katalogu uruchomienia, patrz `lerobot_mp.paths`); katalog jest
+w `.gitignore`, bo stanowisko jest per biurko, nie per repozytorium. Przyklad
+w symulacji: `examples/twin.sim.json` (`lerobot-twin demo`).
 """
 
 from __future__ import annotations
@@ -20,11 +22,21 @@ from typing import Any
 
 import numpy as np
 
+from ..paths import data_path
 from .calib.card import Card
 from .robots import RobotSpec, get_spec
 from .scene import CameraView, SceneConfig, Table
 
-DEFAULT_PATH = Path("workspace") / "twin.json"
+#: Domyslny plik stanowiska. W klonie repozytorium liczony od jego korzenia,
+#: zeby panel odpalony z innego katalogu nie zaczynal od pustego stanowiska.
+DEFAULT_REL = Path("workspace") / "twin.json"
+DEFAULT_PATH = data_path(DEFAULT_REL)
+
+
+def default_path() -> Path:
+    """Domyslny plik stanowiska liczony w chwili uzycia (katalog biezacy moze sie zmienic)."""
+    return data_path(DEFAULT_REL)
+
 #: Poziome pole widzenia typowej kamerki internetowej - tylko do nominalnych
 #: intrynsyk, zanim kamera zobaczy szachownice.
 NOMINAL_HFOV_DEG = 65.0
@@ -265,7 +277,7 @@ class Workspace:
         return data
 
     def save(self, path: str | Path | None = None) -> Path:
-        target = Path(path) if path else (self.path or DEFAULT_PATH)
+        target = Path(path) if path else (self.path or default_path())
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(".tmp")
         # Najpierw do pliku obok, potem podmiana - przerwany zapis nie zniszczy
@@ -278,7 +290,7 @@ class Workspace:
     @classmethod
     def load(cls, path: str | Path | None = None) -> Workspace:
         """Wczytuje stanowisko; brak pliku to nowe, puste stanowisko (nie blad)."""
-        target = Path(path) if path else DEFAULT_PATH
+        target = Path(path) if path else default_path()
         if not target.is_file():
             ws = cls()
             ws.path = target

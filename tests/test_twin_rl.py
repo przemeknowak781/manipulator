@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import numpy as np
 import pytest
 
@@ -15,7 +17,13 @@ from lerobot_mp.twin.rl.env import TwinEnv  # noqa: E402
 from lerobot_mp.twin.rl.policy import Policy, PolicyMeta  # noqa: E402
 from lerobot_mp.twin.rl.randomize import Dynamics, Randomization  # noqa: E402
 
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="MuJoCo Warp potrzebuje GPU z CUDA")
+_no_warp = importlib.util.find_spec("mujoco_warp") is None or importlib.util.find_spec("warp") is None
+
+
+def cuda(fn):
+    """Test na GPU: potrzebuje CUDA w torchu ORAZ MuJoCo Warp (extra [train]) - bez nich pominiety."""
+    fn = pytest.mark.skipif(_no_warp, reason="brak mujoco_warp/warp - pip install -e \".[train]\"")(fn)
+    return pytest.mark.skipif(not torch.cuda.is_available(), reason="MuJoCo Warp potrzebuje GPU z CUDA")(fn)
 
 
 @pytest.mark.parametrize("name", ["LeRobotMP/TwinReach-v0", "LeRobotMP/TwinLift-v0"])
