@@ -65,11 +65,16 @@ lerobot-twin ui                  # http://localhost:8080
 lerobot-twin ui --host 0.0.0.0   # także z sieci — panel nie ma hasła, tylko w zaufanej sieci
 ```
 
-Stały **STOP** i pasek stanu nad zakładkami, pod nimi **Przewodnik**: lista
-kroków pierwszego testu (niżej, 0–8) liczona z bieżącego stanu — ramię,
-kamery, K, pozy, Sim-Real, dynamika, polityki — i jedno **Teraz:** z zakładką
-i przyciskiem, plus blokady (aktywny STOP, kto ma ramię, ostrzeżenia). W
-symulacji prowadzi przez te same kroki z kamerami symulowanymi. Każda
+Stały **STOP** i pasek stanu nad zakładkami, pod nimi **Przewodnik**: zawsze
+widoczne jedno **Teraz:** („Krok N/8 (tytuł): zakładka > **przycisk**”, albo co
+właśnie jedzie i jak to przerwać; aktywny STOP z przyczyną) i uwagi, których
+Teraz nie mówi (ostrzeżenia, kamera bez kadru dłużej niż 3 s, przestawiona
+kamera), a pod nimi zwinięta lista **Kroki 0–8** (niżej) liczona z bieżącego
+stanu — ramię, kamery, K, pozy, Sim-Real, dynamika, polityki. Na prawdziwym
+ramieniu dynamika zmierzona w sim i same polityki bazowe nie zaliczają kroków
+5 i 6; kroki 7–8 to sprawdzenie w bieżącej sesji panelu (liczy się polityka,
+która ruszyła na tym backendzie). W symulacji prowadzi przez te same kroki z
+kamerami symulowanymi. Każda
 kontrolka ma podpowiedź po najechaniu (co robi, czy rusza ramieniem, jednostki),
 a każda zakładka zwiniętą notkę **Jak używać**. Logika przewodnika:
 `ui/guide.py` (bez visera, `tests/test_twin_guide.py`). Każdy ruch — z suwaków, z uchwytu

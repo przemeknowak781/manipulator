@@ -55,6 +55,9 @@ GIZMO_MAX_STEP_DEG = 15.0
 GIZMO_IDLE_S = 0.5
 #: Kadr starszy niz tyle [s] nie jest kadrem "na zywo" (zamrozony strumien).
 FRAME_MAX_AGE = 1.0
+#: Przewodnik mowi "kamera nie daje kadru" dopiero po takiej przerwie [s] - przestoje USB
+#: na Shadow ponad `FRAME_MAX_AGE` przelaczaly uwage i krok 1 co chwile.
+GUIDE_FRAME_LOST = 3.0
 #: Detekcja kostki starsza niz tyle [s] nie trafia do polityki jako nowa.
 CUBE_MAX_AGE = 0.5
 #: Niepewnosc chwili kadru [s] wzgledem jego znacznika czasu (opoznienie kamery i USB).
@@ -106,10 +109,12 @@ TAB_HELP = {
         "1. **Dodaj kamere**: USB (**Szukaj kamer USB**, **Dodaj kamere USB**) albo symulowana "
         "(przed ramieniem / w miejscu widoku 3D).\n"
         "2. Tabela: zrodlo, K i poza. Piramidy w 3D: zielona = zaufana, pomaranczowa = niezaufana, "
-        "czerwona = przestawiona.\n"
+        "czerwona = przestawiona, niebieska / szara = nieskalibrowana (symulowana / USB); cienka szara obok "
+        "symulowanej = jej poza z kalibracji.\n"
         "3. **Wybrana kamera**: podglad, wlacz/wylacz, przesuwanie symulowanej w 3D, usuwanie.\n"
         "4. Dalej: zakladka **Kalibracja**."),
     "Kalibracja": (
+        "Kamera symulowana zna swoje K - tylko punkt 2.\n"
         "1. Kazda prawdziwa kamera - **Intrynsyki**: arkusz tablicy, zmierzony bok kwadratu, **Zbieraj kadry**, "
         "**Oblicz i zapisz K**.\n"
         "2. Wszystkie kamery naraz - **Polozenie**: arkusz karty, zmierzony bok taga, karta w szczekach, "
@@ -273,11 +278,15 @@ class TwinApp:
         self._tick_errors: set[str] = set()
         self.estimates: dict[str, Any] = {}
         self._dirty_save = 0.0                          # przeciaganie kamery: zapis po chwili spokoju
-        # Przewodnik: ostatnia mediana Sim-Real kazdej kamery, co juz jechalo na danym
-        # backendzie ("reach", "lift-kamery") i lista polityk z ostatniego odswiezenia
-        # (bez czytania dysku w kazdym takcie).
+        # Przewodnik: najlepsza mediana Sim-Real kazdej kamery od ostatniej zmiany pozy/stolu/K
+        # (zatrzask - krok 4 nie migocze z szumem), co juz jechalo na danym backendzie
+        # ("reach", "lift-kamery"), backend, na ktorym ruszyl biezacy `runner`, ostatni kadr
+        # kazdej kamery (kamera "bez kadru" dopiero po GUIDE_FRAME_LOST s) i lista polityk
+        # z ostatniego odswiezenia (bez czytania dysku w kazdym takcie).
         self._simreal_px: dict[str, float] = {}
         self._ran: dict[str, set[str]] = {}
+        self._runner_backend = ""
+        self._frame_seen: dict[str, float] = {}
         self._policy_list: list[dict] = []
         t_start = time.monotonic()
 
@@ -381,8 +390,12 @@ class TwinApp:
                                  "dalej sciska. Ruszyc dalej: Ramie > Skasuj STOP.")
         # Przewodnik zawsze nad zakladkami: gdzie operator jest w procedurze (docs/TWIN.md,
         # kroki 0-8) i jedna nastepna akcja. Logika w `guide.py`, tu tylko wyswietlanie.
+        # Widoczne zawsze tylko "Teraz" i uwagi; lista krokow zwinieta - inaczej zabierala
+        # ok. 190 px nad kazda zakladka (Polacz ladowal na dole ekranu 1366x768).
         with g.add_folder("Przewodnik", expand_by_default=True):
             self.guide_md = g.add_markdown("")
+            with g.add_folder("Kroki 0-8", expand_by_default=False):
+                self.guide_steps_md = g.add_markdown("")
 
         @stop.on_click
         async def _(event):
@@ -501,39 +514,51 @@ class TwinApp:
         simulated = bool(st.simulated) if connected else backend == "sim"
         safety = self.twin.safety_state
         estop = safety is not None and getattr(safety, "value", safety) == "ESTOP"
+        now = time.monotonic()
         with self.frame_lock:
             live = set(self.frames)
         cams = []
         for c in self.ws.cameras:
             problem = c.intrinsics_problem()
+            # "Bez kadru" dopiero po GUIDE_FRAME_LOST s bez kadru (nowa kamera liczy od pojawienia sie).
+            seen = self._frame_seen.setdefault(c.name, now)
+            if c.name in live:
+                self._frame_seen[c.name] = seen = now
             cams.append(gd.CameraSnap(
-                c.name, c.simulated, c.enabled, has_frame=c.name in live, intrinsics_ok=not problem,
+                c.name, c.simulated, c.enabled, has_frame=now - seen < GUIDE_FRAME_LOST, intrinsics_ok=not problem,
                 intrinsics_problem=problem, calibrated=c.calibrated, trusted=c.trusted,
                 reason=str(c.calibration.get("reason", "") or ""), moved=self.watch.moved(c.name),
                 simreal_px=self._simreal_px.get(c.name)))
         runner = self.runner
         running = runner is not None and runner.status.running
         vision = runner is not None and runner.cube_provider == self._vision_cube
-        if runner is not None and runner.status.success and connected:
-            # Krok 7/8 zrobiony, gdy polityka na TYM backendzie choc raz doszla do celu.
-            self._ran.setdefault(backend, set()).add(runner.task.name + ("-kamery" if vision else ""))
+        if runner is not None and runner.status.success and self._runner_backend:
+            # Krok 7/8: polityka choc raz doszla do celu - zapisane pod backendem, na ktorym
+            # RUSZYLA (`_start_policy`), nie pod obecnym: stary runner z sukcesem w sim po
+            # Polacz feetech zaliczal "lift z kamer" prawdziwemu ramieniu, ktore nie drgnelo.
+            self._ran.setdefault(self._runner_backend, set()).add(runner.task.name + ("-kamery" if vision else ""))
         jobs_on = (("fala kalibracyjna", self.calib_job.running), ("intrynsyki", self.intr_job.running),
                    ("identyfikacja", self.sysid_job.running), ("trening", self.train.running),
                    ("ewaluacja", self.eval_job.running))
         dyn = self.ws.dynamics
+        dyn_src = str(dyn.get("source") or "zmierzona") if dyn else ""
         return gd.GuideSnapshot(
             connected=connected, backend=backend, simulated=simulated, arm_error=str(st.error or ""), estop=estop,
             owner=self._busy(PANEL_OWNER), warnings=tuple(str(w) for w in (getattr(st, "warnings", None) or [])),
-            cameras=tuple(cams), dynamics=str(dyn.get("source") or "zmierzona") if dyn else "",
+            cameras=tuple(cams), dynamics=dyn_src, dynamics_backend=gd.dynamics_backend(dyn_src),
             policies=tuple((p["name"], p["task"], bool(p.get("bundled"))) for p in self._policy_list),
             jobs=tuple(n for n, on in jobs_on if on), policy_running=runner.task.name if running else "",
             policy_from_cameras=running and vision, calib_result_pending=bool(self.calib_apply.visible),
-            dyn_result_pending=bool(self.dyn_keep.visible), ran=frozenset(self._ran.get(backend, ())),
+            dyn_result_pending=bool(self.dyn_keep.visible),
+            calib_progress=float(self.calib_job.progress) if self.calib_job.running else None,
+            ran=frozenset(self._ran.get(backend, ()) if connected else ()),
             intr_camera=str(self.intr_job.data.get("camera", "")) if self.intr_job.running else "")
 
     def _tick_guide(self) -> None:
         # Przypisanie tej samej tresci nic nie wysyla (`_skip_unchanged_markdown`).
-        self.guide_md.content = gd.render(gd.build(self._guide_snapshot()))
+        guide = gd.build(self._guide_snapshot())
+        self.guide_md.content = gd.render_head(guide)
+        self.guide_steps_md.content = gd.render_steps(guide)
 
     # ================================================================== ramie
     def _build_arm(self) -> None:
@@ -600,7 +625,8 @@ class TwinApp:
                                                   "i Polacz je gasza. Bez sprzegla suwaki tylko pokazuja katy.")
             home = g.add_button("Pozycja domowa", icon=viser.Icon.HOME,
                                 hint="Odbiera ramie kazdemu (panel, polityka, fala, identyfikacja) i jedzie rampa "
-                                     "do domu - RUSZA ramieniem. Sciskajacy chwytak zostaje zamkniety.")
+                                     "do domu - RUSZA ramieniem. Sciskajacy chwytak zostaje zamkniety. Przy "
+                                     "aktywnym STOP-ie nie rusza - najpierw Skasuj STOP.")
             clear = g.add_button("Skasuj STOP", icon=viser.Icon.RESTORE,
                                  hint="Kasuje STOP awaryjny (takze od bledu serwa). Najpierw usun przyczyne; ramie "
                                       "samo nie rusza, ale nastepne polecenia juz przejda.")
@@ -622,10 +648,12 @@ class TwinApp:
                     hi = float(np.floor(np.degrees(kin.hi[k]) * 2) / 2)
                 if name == spec.gripper:
                     tip = ("Chwytak 0..100: 0 = szczeki zamkniete, 100 = otwarte (tiki serwa jak w feetech). Ze "
-                           "sprzeglem ustawia cel - tak otwierasz chwytak, ktory po STOP-ie dalej sciska.")
+                           "sprzeglem ustawia cel. Chwytak, ktory po STOP-ie dalej sciska: Skasuj STOP, "
+                           "sprzeglo, potem ten suwak (przy STOP-ie cele sa pomijane).")
                 else:
-                    tip = (f"Kat stawu [st.], zakres {lo:g}..{hi:g}. Ze sprzeglem ustawia cel (ramie jedzie przez "
-                           f"nadzor); bez sprzegla pokazuje zmierzony kat.")
+                    tip = (f"Kat stawu [st.], suwak {lo:g}..{hi:g} (zakres modelu). Ze sprzeglem ustawia cel - "
+                           f"nadzor przycina go do limitow z konfiguracji i EEPROM serwa, wiec ostatnie stopnie "
+                           f"suwaka moga nic nie dawac; bez sprzegla pokazuje zmierzony kat.")
                 s = g.add_slider(name, lo, hi, 0.5, float(np.clip(spec.home.get(name, 0.0), lo, hi)), hint=tip)
                 self.sliders[name] = s
                 self.slider_range[name] = (lo, hi)
@@ -724,6 +752,7 @@ class TwinApp:
             self.ws.table.update(size=list(self.tab_size.value), base_xy=list(self.tab_base.value),
                                  base_yaw=float(np.radians(self.tab_yaw.value)), height=float(self.tab_h.value))
             self._save()
+            self._simreal_px.clear()                    # inny stol - Sim-Real do sprawdzenia od nowa
             self.twin.rebuild()
             T_new = self.twin.scene.T_base2world
             self.base_frame.position, self.base_frame.wxyz = T_new[:3, 3], mat_to_wxyz(T_new[:3, :3])
@@ -1248,13 +1277,11 @@ class TwinApp:
     # ============================================================= kalibracja
     def _build_calibration(self) -> None:
         g = self.server.gui
-        self._tab_help("Kalibracja")
-        g.add_markdown("Kolejnosc dla nowej kamery: **1** intrynsyki (tablica w reku), **2** polozenie "
-                       "(karta w chwytaku, ramie macha). Kamera symulowana ma znane K - wystarczy krok 2.")
+        self._tab_help("Kalibracja")               # kolejnosc 1 (tablica w reku) / 2 (karta, fala) jest w notce
         with g.add_folder("1. Intrynsyki - tablica ChArUco"):
             self.board_mm = g.add_number("Zmierzony bok kwadratu [mm]", 28.0, min=5.0, max=100.0, step=0.1,
                                          hint="Bok kwadratu tablicy zmierzony linijka na wydruku [mm] "
-                                              "(nominalnie 28). Zly bok = zla skala K.")
+                                              "(nominalnie 28) - ustala skale ukladu tablicy.")
             sheet = g.add_button("Pobierz arkusz tablicy (A4, PNG)", icon=viser.Icon.DOWNLOAD,
                                  hint="PNG tablicy ChArUco z bokiem jak wyzej. Drukuj w skali 100%.")
             self.intr_cam = g.add_dropdown("Kamera", ("-",), initial_value="-",
@@ -1471,6 +1498,7 @@ class TwinApp:
                 return
             rec.K, rec.dist = res.K.tolist(), res.dist.tolist()
             rec.intrinsics_from = "szachownica"
+            self._simreal_px.pop(name, None)            # nowe K - Sim-Real do sprawdzenia od nowa
             rec.intrinsics_info = {"rms_px": res.rms_px, "n_views": res.n_views, "coverage": res.coverage,
                                    "trusted": res.trusted, "reason": res.reason,
                                    "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -1804,7 +1832,7 @@ class TwinApp:
         self.pol_md = g.add_markdown("")
         ev = g.add_button("Ewaluuj na CPU (zwykle MuJoCo, 50 epizodow)", icon=viser.Icon.CHART_BAR,
                           hint="Epizody w zwyklym MuJoCo na CPU, bez randomizacji i z nia; wynik zapisuje w "
-                               "polityce. Ramieniem nie rusza.")
+                               "polityce (bazowych z repozytorium nie nadpisuje). Ramieniem nie rusza.")
         self.pol_eval_md = g.add_markdown("")
         with g.add_folder("Uruchom na blizniaku"):
             self.pol_cube_src = g.add_dropdown("lift: skad polozenie kostki", ("symulacja", "kamery"),
@@ -2040,6 +2068,7 @@ class TwinApp:
         # nigdy z "ostatnio widzianej" - runner pyta tracker o zrodlo co takt.
         source = (lambda: self.cube_tracker.source) if provider == self._vision_cube else None
         self.runner = PolicyRunner(self.twin, pol, cube_provider=provider, cube_source=source)
+        self._runner_backend = str(self.twin.status.backend)  # przewodnik: sukces liczy sie TEMU backendowi
         if pol.task.name == "reach":
             p = (inverse(self.T_b2w) @ np.r_[self.goal_gizmo.position, 1.0])[:3]
             if not self.goal_node.visible:
@@ -2131,7 +2160,15 @@ class TwinApp:
             e_real = cv2.Canny(cv2.cvtColor(real, cv2.COLOR_RGB2GRAY), 60, 160)
             dt = cv2.distanceTransform(255 - e_real, cv2.DIST_L2, 3)
             score = float(np.median(dt[e_sim])) if e_sim.any() else float("nan")
-            self._simreal_px[name] = score                # przewodnik: krok 4 sprawdzony (albo nie)
+            # Przewodnik, krok 4: najlepsza mediana od ostatniej zmiany pozy/stolu/K (zatrzask -
+            # jedna dobra klatka zalicza, szum wokol 3 px nie przelacza kroku). NaN (render bez
+            # krawedzi) tylko, gdy nie ma zadnej liczby.
+            prev = self._simreal_px.get(name)
+            if np.isfinite(score):
+                if prev is None or not np.isfinite(prev) or score < prev:
+                    self._simreal_px[name] = score
+            elif prev is None:
+                self._simreal_px[name] = score
             self.sr_md.content = f"mediana odleglosci krawedzi symulacji od krawedzi kadru: **{score:.1f} px**"
         else:
             out = cv2.addWeighted(real, 1 - a, sim, a, 0)

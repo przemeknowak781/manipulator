@@ -30,7 +30,7 @@ def test_fresh_sim_starts_at_connecting_and_skips_what_sim_cameras_do_not_need()
     g = gd.build(GuideSnapshot(backend="sim", simulated=True, policies=BUNDLED))
     st = _status(g)
     assert st[0] == CURRENT and g.current.number == 0
-    assert "Ramie = sim, Polacz" in g.now
+    assert "Ramie = sim, **Polacz**" in g.now and g.now.startswith("Krok 0/8")
     assert st[2] == SKIP and st[4] == SKIP                 # K znane, Sim-Real zastepuje prawda symulacji
     assert st[6] == DONE                                   # polityki bazowe sa od razu
     assert [s.number for s in g.steps] == list(range(9))
@@ -90,21 +90,30 @@ def test_estop_blocks_everything_and_says_where_to_clear_it():
     cams = (_real_cam(),)
     g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, estop=True, cameras=cams,
                                arm_error="STOP: serwo elbow_flex przeciazone", policies=BUNDLED))
-    assert "Skasuj STOP" in g.now
-    assert any("aktywny STOP" in b and "zakladce Ramie" in b for b in g.blockers)
+    # STOP raz, w "Teraz", z przyczyna - bez drugiej takiej samej uwagi pod spodem
+    assert "Skasuj STOP" in g.now and "aktywny STOP" in g.now and "elbow_flex przeciazone" in g.now
+    assert not any("STOP" in b for b in g.blockers)
+    # przy STOP-ie "Teraz" nie mowi, kto ma ramie - wtedy uwaga; jadacej polityki Uruchom nie odrzuca
+    g = gd.build(GuideSnapshot(connected=True, backend="sim", estop=True, owner="polityka", policies=BUNDLED))
+    b = next(b for b in g.blockers if b.startswith("ramie ma: polityka"))
+    assert "Uruchom zastapi" in b and "i polityka sa odrzucane" not in b
 
 
 def test_job_running_with_another_owner_is_named_with_how_to_stop_it():
     cams = (_real_cam(calibrated=False, trusted=False),)
     g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, owner="kalibracja",
                                jobs=("fala kalibracyjna",), cameras=cams, policies=BUNDLED))
-    assert any(b.startswith("ramie ma: kalibracja") and "Przerwij" in b for b in g.blockers)
-    assert "Fala kalibracyjna jedzie" in g.now
+    # zadanie uruchomione przez operatora: raz, w "Teraz" (z tym, jak je przerwac), bez alarmu "Uwaga"
+    assert "Fala kalibracyjna jedzie" in g.now and "Przerwij" in g.now
+    assert not any(b.startswith("ramie ma") for b in g.blockers) and not g.background
+    g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, owner="kalibracja",
+                               jobs=("fala kalibracyjna",), cameras=cams, policies=BUNDLED, calib_progress=0.43))
+    assert "Fala kalibracyjna jedzie (40%)" in g.now      # postep co 10% - tekst zmienia sie rzadko
     g = gd.build(GuideSnapshot(connected=True, backend="sim", owner="polityka", policy_running="lift",
                                policy_from_cameras=True, policies=BUNDLED))
-    assert any(b.startswith("ramie ma: polityka") and "Polityki > Zatrzymaj" in b for b in g.blockers)
-    assert "lift (kostka z kamer)" in g.now and "w tle" not in g.now
-    assert "polityka lift (kostka z kamer)" in g.background
+    assert "lift (kostka z kamer)" in g.now and "Zatrzymaj" in g.now
+    assert not any(b.startswith("ramie ma") for b in g.blockers)
+    assert not g.background                              # "w tle: polityka" powtarzalo "Teraz"
     g = gd.build(GuideSnapshot(connected=True, backend="sim", owner="identyfikacja dynamiki",
                                jobs=("identyfikacja",), policies=BUNDLED))
     assert "Identyfikacja nagrywa" in g.now
@@ -127,10 +136,21 @@ def test_moved_camera_and_bad_sim_real_are_flagged():
     assert any("przestawiona" in b for b in g.blockers)
     cams = (_real_cam(simreal_px=5.4),)
     g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=cams, policies=BUNDLED))
-    assert g.current.number == 4 and "5.4 px" in g.current.detail and "Krawedzie symulacji" in g.now
+    assert g.current.number == 4 and "5.5 px" in g.current.detail and "Krawedzie symulacji" in g.now
+    # dziesiate czesci piksela nie zmieniaja tekstu (panel wysylalby przewodnik co pomiar)
+    a = gd.render(gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, policies=BUNDLED,
+                                         cameras=(_real_cam(simreal_px=5.4),))))
+    b = gd.render(gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, policies=BUNDLED,
+                                         cameras=(_real_cam(simreal_px=5.6),))))
+    assert a == b
     cams = (_real_cam(simreal_px=float("nan")),)
-    assert gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=cams,
-                                  policies=BUNDLED)).current.number == 4
+    g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=cams, policies=BUNDLED))
+    assert g.current.number == 4
+    assert "nie sprawdzone" in g.current.detail and "nan" not in g.current.detail
+    # zaliczony Sim-Real: bez liczb w liscie
+    cams = (_real_cam(simreal_px=2.4),)
+    g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=cams, policies=BUNDLED))
+    assert _status(g)[4] == DONE and "px" not in g.steps[4].detail
 
 
 def test_warnings_and_lerobot_backend_are_shown():
@@ -142,7 +162,8 @@ def test_warnings_and_lerobot_backend_are_shown():
 
 def test_all_done_on_the_real_arm():
     s = GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=(_real_cam(simreal_px=1.2),),
-                      dynamics="zmierzona", policies=BUNDLED + (("lift-stanowisko", "lift", False),),
+                      dynamics="identyfikacja 2026-09-20 (feetech); niepewnosc: kp +-5%",
+                      dynamics_backend="feetech", policies=BUNDLED + (("lift-stanowisko", "lift", False),),
                       ran=frozenset({"reach", "lift-kamery"}))
     g = gd.build(s)
     assert all(st.status == DONE for st in g.steps), [(st.number, st.status) for st in g.steps]
@@ -156,7 +177,51 @@ def test_render_is_stable_and_marks_the_current_step():
     assert a == b                                           # ten sam stan = ta sama tresc = nic nie leci
     assert "**Teraz:**" in a and "`[>]` **1. Kamery**" in a and "`[x]` 0." in a
     c = gd.render(gd.build(GuideSnapshot(connected=True, backend="sim", policies=BUNDLED, estop=True)))
-    assert c != a and "**Uwaga:** aktywny STOP" in c
+    assert c != a and c.startswith("**Teraz:** **aktywny STOP**")
+    head, steps = gd.render_head(gd.build(s)), gd.render_steps(gd.build(s))
+    assert a == head + "\n\n" + steps and "`[" not in head and "Teraz" not in steps
+
+
+def test_dynamics_identified_in_sim_does_not_count_on_the_real_arm():
+    src = "identyfikacja 2026-09-24T10:00:00 (sim); niepewnosc: kp +-4%"
+    assert gd.dynamics_backend(src) == "sim"
+    assert gd.dynamics_backend("identyfikacja 2026-09-24 (feetech); niepewnosc: x") == "feetech"
+    assert gd.dynamics_backend("zmierzona") == ""
+    base = dict(connected=True, cameras=(_real_cam(simreal_px=1.0),), policies=BUNDLED, dynamics=src,
+                dynamics_backend="sim")
+    g = gd.build(GuideSnapshot(backend="feetech", simulated=False, **base))
+    assert g.current.number == 5 and "zmierzona na sim" in g.current.detail and "Identyfikuj" in g.now
+    g = gd.build(GuideSnapshot(backend="sim", simulated=True, **base))
+    assert _status(g)[5] == DONE                           # proba procedury w sim - wystarcza
+
+
+def test_real_arm_with_bundled_policies_only_asks_for_fine_tuning():
+    s = dict(connected=True, backend="feetech", simulated=False, cameras=(_real_cam(simreal_px=1.0),),
+             dynamics="identyfikacja t (feetech); x", dynamics_backend="feetech", policies=BUNDLED)
+    g = gd.build(GuideSnapshot(**s))
+    assert g.current.number == 6
+    assert "Start z polityki = reach-v3" in g.now and "**Ucz**" in g.now
+    assert _status(gd.build(GuideSnapshot(**{**s, "simulated": True, "backend": "sim",
+                                             "cameras": ()})))[6] == DONE
+
+
+def test_trusted_pose_with_nominal_K_is_not_a_trusted_camera():
+    # stara kalibracja bez zapisanego K: CameraRecord.trusted == True przy nominalnym K
+    cams = (_real_cam(intrinsics_ok=False, intrinsics_problem="intrynsyki nominalne", simreal_px=1.0),)
+    g = gd.build(GuideSnapshot(connected=True, backend="feetech", simulated=False, cameras=cams, policies=BUNDLED))
+    st = _status(g)
+    assert st[2] == CURRENT and st[3] == TODO and st[4] == TODO
+    assert "niezaufanego K" in g.steps[3].detail
+
+
+def test_policy_steps_are_per_session_checks():
+    s = GuideSnapshot(connected=True, backend="sim", cameras=(CameraSnap("sym1", True, trusted=True,
+                                                                          calibrated=True, intrinsics_ok=True),),
+                      policies=BUNDLED, dynamics="identyfikacja t (sim); x", dynamics_backend="sim",
+                      ran=frozenset({"reach"}))
+    g = gd.build(s)
+    assert g.current.number == 8 and "w tej sesji" in g.steps[7].detail
+    assert "**lift (sim): poloz kostke losowo**" in g.now and "kamery" in g.now
 
 
 # ------------------------------------------------------------------ na zywym panelu
@@ -194,14 +259,63 @@ def test_guide_changes_when_the_sim_arm_connects(panel):
     panel.arm_backend.value = "sim"
     panel._tick_slow()
     before = panel.guide_md.content
-    assert "Ramie = sim, Polacz" in before and "`[>]` **0." in before
+    assert "Ramie = sim, **Polacz**" in before and "`[>]` **0." in panel.guide_steps_md.content
     try:
         panel.twin.connect("sim")
         panel._tick_slow()
         after = panel.guide_md.content
         assert after != before
-        assert "`[x]` 0." in after and "polaczone: sim" in after
+        steps = panel.guide_steps_md.content
+        assert "`[x]` 0." in steps and "polaczone: sim" in steps
+        assert "`[x]` 0." not in after                      # lista krokow tylko w zwinietym folderze
     finally:
         panel.twin.disconnect()
     panel._tick_slow()
     assert panel.guide_md.content == before
+
+
+def test_runner_success_counts_only_for_the_backend_it_started_on(panel):
+    """Stary runner z sukcesem (lift z kamer w sim) nie zalicza kroku 8 ramieniu po nowym Polacz."""
+    from types import SimpleNamespace as NS
+    saved = panel.runner, panel._runner_backend, {k: set(v) for k, v in panel._ran.items()}
+    try:
+        panel.twin.connect("sim")
+        panel._ran.clear()
+        panel.runner = NS(status=NS(running=False, success=True), task=NS(name="lift"),
+                          cube_provider=panel._vision_cube, stop=lambda *a, **k: None)
+        panel._runner_backend = "feetech"                  # sukces z poprzedniego polaczenia, innego ramienia
+        assert panel._guide_snapshot().ran == frozenset()
+        assert "sim" not in panel._ran
+        panel._runner_backend = "sim"                      # ruszyl na tym polaczeniu
+        assert panel._guide_snapshot().ran == frozenset({"lift-kamery"})
+    finally:
+        panel.runner, panel._runner_backend = saved[0], saved[1]
+        panel._ran.clear()
+        panel._ran.update(saved[2])
+        panel.twin.disconnect()
+
+
+def test_camera_without_frame_is_flagged_only_after_a_few_seconds(panel, monkeypatch):
+    import time
+
+    from lerobot_mp.twin.ui.app import GUIDE_FRAME_LOST
+    from lerobot_mp.twin.workspace import CameraRecord
+
+    rec = CameraRecord(name="usb_przewodnik", source="7")
+    monkeypatch.setattr(panel.ws, "cameras", [rec])
+    with panel.frame_lock:
+        frames = panel.frames
+        panel.frames = {"usb_przewodnik": object()}
+    try:
+        assert panel._guide_snapshot().cameras[0].has_frame
+        with panel.frame_lock:
+            panel.frames = {}
+        # przestoj USB krotszy niz prog: bez uwagi i bez przelaczania kroku 1
+        panel._frame_seen["usb_przewodnik"] = time.monotonic() - (GUIDE_FRAME_LOST - 0.5)
+        assert panel._guide_snapshot().cameras[0].has_frame
+        panel._frame_seen["usb_przewodnik"] = time.monotonic() - (GUIDE_FRAME_LOST + 0.5)
+        assert not panel._guide_snapshot().cameras[0].has_frame
+    finally:
+        with panel.frame_lock:
+            panel.frames = frames
+        panel._frame_seen.pop("usb_przewodnik", None)
