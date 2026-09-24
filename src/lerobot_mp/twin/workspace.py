@@ -35,6 +35,18 @@ def nominal_K(width: int, height: int, hfov_deg: float = NOMINAL_HFOV_DEG) -> np
     return np.array([[f, 0.0, (width - 1) / 2], [0.0, f, (height - 1) / 2], [0.0, 0.0, 1.0]])
 
 
+def same_intrinsics(a: tuple[Any, Any], b: tuple[Any, Any]) -> bool:
+    """Te same intrynsyki (K, dist)? Brak dystorsji (None) = same zera; JSON gubi tylko ostatnie bity."""
+    Ka, Kb = np.asarray(a[0], float), np.asarray(b[0], float)
+    if Ka.shape != Kb.shape or not np.allclose(Ka, Kb, rtol=1e-9, atol=1e-6):
+        return False
+    da = np.zeros(0) if a[1] is None else np.asarray(a[1], float).ravel()
+    db = np.zeros(0) if b[1] is None else np.asarray(b[1], float).ravel()
+    n = max(len(da), len(db))
+    da, db = np.pad(da, (0, n - len(da))), np.pad(db, (0, n - len(db)))
+    return bool(np.allclose(da, db, rtol=1e-9, atol=1e-9))
+
+
 @dataclass
 class CameraRecord:
     name: str
@@ -73,7 +85,16 @@ class CameraRecord:
 
     @property
     def trusted(self) -> bool:
-        return bool(self.calibration.get("trusted", False))
+        """Poza zaufana - i wciaz liczona z TYM K, ktore kamera ma teraz.
+
+        Zapisany werdykt nie wystarcza: K zmienione po zapisie pozy (reczna edycja
+        pliku, inna sciezka niz krok 1 w panelu) zostawialo poze z nominalnego K
+        jako zaufana. Poza bez zapisanego K (sprzed zapisu K przy pozie) - werdykt jak byl.
+        """
+        if not self.calibration.get("trusted", False):
+            return False
+        used = self.calibration.get("K")
+        return used is None or same_intrinsics((used, self.calibration.get("dist")), self.intrinsics())
 
     def intrinsics(self) -> tuple[np.ndarray, np.ndarray | None]:
         K = np.asarray(self.K, float) if self.K is not None else nominal_K(self.width, self.height)
@@ -93,6 +114,24 @@ class CameraRecord:
             why = self.intrinsics_info.get("reason", "")
             return "intrynsyki z niezaufanej sesji ChArUco" + (f" ({why})" if why else "") + " - powtorz krok 1"
         return ""
+
+    def fit_problem(self, used: tuple[Any, Any] | None) -> str:
+        """Dlaczego poze liczona z intrynsykami `used` = (K, dist) nie mozna uznac za zaufana.
+
+        "" = mozna. Ocena dotyczy K, z ktorym LICZONO poze, a nie K w rekordzie w chwili
+        zapisu: fala z nominalnym K (fx 502), potem krok 1 zapisal zaufane K z ChArUco
+        (fx 552, k1 -0,2) i "Zapisz" oznaczalo poze z nominalnego K jako zaufana.
+        Gdy `used` rozni sie od obecnego K, werdykt "intrynsyki zmienione od fali";
+        gdy jest takie samo - opis obecnego K (`intrinsics_problem`) opisuje wlasnie je.
+        `used` None = nie wiadomo, z jakim K liczono - ocena obecnego K (stare wywolania).
+        """
+        if used is not None and not same_intrinsics(used, self.intrinsics()):
+            K_used = np.asarray(used[0], float)
+            K_now, _ = self.intrinsics()
+            what = (f"fx {K_used[0, 0]:.0f} -> {K_now[0, 0]:.0f}" if abs(K_used[0, 0] - K_now[0, 0]) > 0.5
+                    else "K albo dystorsja")
+            return f"intrynsyki zmienione od fali ({what}) - uruchom fale ponownie"
+        return self.intrinsics_problem()
 
     def view(self) -> CameraView | None:
         """Kamera jako czesc sceny - tylko, gdy wiadomo, gdzie stoi.
@@ -180,7 +219,9 @@ class Workspace:
         starcie); bez niego wpisywany byl bok z pola w panelu w chwili zapisu,
         a ten mogl juz byc inny niz ten, z ktorym policzono poze.
         `intrinsics` - {kamera: (K, dist)}, z ktorymi liczono; trafiaja do
-        `calibration`, zeby pozniejsza zmiana K byla widoczna jako niezgodnosc.
+        `calibration`, zeby pozniejsza zmiana K byla widoczna jako niezgodnosc
+        (`CameraRecord.trusted`). K inne niz obecne w kamerze (krok 1 zrobiony
+        w trakcie fali albo po niej) = poza niezaufana (`CameraRecord.fit_problem`).
 
         Prawdziwa kamera jest zaufana TYLKO z K z szachownicy, ktora sama byla
         zaufana. Z nominalnym K (65 st. pola widzenia) albo z niezaufanej
@@ -197,7 +238,13 @@ class Workspace:
             except KeyError:
                 continue
             trusted, reason = bool(cam_fit.trusted), cam_fit.reason
-            k_problem = rec.intrinsics_problem()
+            if intrinsics is None:
+                k_problem = rec.intrinsics_problem()
+            elif name not in intrinsics:
+                # Nie wiadomo, z jakim K liczono - niezaufana, a nie ocena obecnego K.
+                k_problem = "brak intrynsyk z fali - uruchom fale ponownie"
+            else:
+                k_problem = rec.fit_problem(intrinsics[name])
             if trusted and k_problem:
                 trusted, reason = False, k_problem
             rec.T_cam2base = np.asarray(cam_fit.T_cam2base, float).tolist()
