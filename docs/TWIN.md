@@ -1,74 +1,140 @@
 # Cyfrowy bliźniak stanowiska SO-101
 
 Symulacja MuJoCo, która wie o biurku to samo, co prawdziwe stanowisko: gdzie
-stoi ramię, gdzie stoją kamery, jaką mają ogniskową. Kamera skalibrowana na
-biurku trafia do symulacji **dokładnie w swojej pozie i ze swoją macierzą K** —
-i to jest cały most sim-2-real: polityka uczona w symulacji widzi ten sam kadr,
-który zobaczy na prawdziwym stole.
+stoi ramię, gdzie stoją kamery, jaką mają ogniskową i jak naprawdę odpowiadają
+serwa. Kamera skalibrowana na biurku trafia do symulacji **dokładnie w swojej
+pozie i ze swoją macierzą K**, polityka uczy się na tysiącach światów na GPU
+wokół **zmierzonej** dynamiki ramienia, a potem jedzie na prawdziwym ramieniu
+tą samą ścieżką — przez nadzór bezpieczeństwa — i widzi kostkę tą samą
+percepcją, którą widziała w symulacji.
 
 ```
-  prawdziwe stanowisko                     bliźniak (MuJoCo)
- ┌──────────────────────┐   kalibracja   ┌──────────────────────────┐
- │ SO-101 na COM12      │ ─────────────► │ ramię z MuJoCo Menagerie │
- │ kamery USB dookoła   │  karta w dłoni │ kamery w tych samych     │
- │ biurko               │                │ pozach, z tym samym K    │
- └──────────────────────┘                └────────────┬─────────────┘
-            ▲                                         │
-            │  te same kąty stawów                    ▼
-            └──────────────────────────── środowisko RL (Gymnasium)
-                                          mapa stołu z wielu kamer
+  prawdziwe stanowisko                        bliźniak (MuJoCo)
+ ┌──────────────────────┐   kalibracja      ┌──────────────────────────┐
+ │ SO-101 (COM/socket)  │ ────────────────► │ ramię z MuJoCo Menagerie │
+ │ kamery USB dookoła   │  karta w dłoni,   │ kamery w tych samych     │
+ │ biurko, kostka       │  ChArUco, sysid   │ pozach, z tym samym K,   │
+ └──────────▲───────────┘                   │ serwa jak zmierzone      │
+            │                               └────────────┬─────────────┘
+            │  polityka przez nadzór                     │  4096 światów MuJoCo Warp
+            │  (te same wzory obserwacji)                ▼  PPO na GPU (A4500)
+            └────────────────────────────────── polityka reach / lift
 ```
 
-## Stan
+## Stan (2026-09-24)
 
 | | |
 |---|---|
-| **Gotowe i przetestowane** | model ramienia, kinematyka prosta i odwrotna, scena z kamerami o pełnym K, sprawdzanie kolizji, **kalibracja wielu kamer z karty w chwytaku** (sprawdzona w symulacji względem prawdy), mapa stołu z wielu kamer, zapis stanowiska, pętla sterowania ramieniem (symulowanym i prawdziwym) |
-| **W budowie** | środowisko Gymnasium, panel webowy (viser), kalibracja na prawdziwym ramieniu z prawdziwymi kamerami |
-| **Rozpoznanie** | rekonstrukcja 3D przedmiotów z biurka i dobór chwytu — patrz [HANDOFF.md](../HANDOFF.md) |
+| **Gotowe i przetestowane w symulacji** | model, kinematyka, scena z kamerami o pełnym K, kolizje, **kalibracja wielu kamer z karty w chwytaku**, **intrynsyki z ChArUco**, mapa stołu na żywo, **wykrywanie kostki z kamer**, **wykrywanie przestawionej kamery**, **środowiska RL CPU i GPU**, **PPO na GPU**, **identyfikacja dynamiki serw**, **runner polityk przez nadzór**, **panel webowy** |
+| **Do sprawdzenia na sprzęcie** | wszystko, co dotyka prawdziwego ramienia i prawdziwych kamer — procedura krok po kroku niżej |
+| **Rozpoznanie** | rekonstrukcja 3D przedmiotów z biurka — [RESEARCH_3D.md](RESEARCH_3D.md) |
 
-Szczegóły, decyzje i następne kroki: **[HANDOFF.md](../HANDOFF.md)**.
+Szczegóły, decyzje i pułapki: **[HANDOFF.md](../HANDOFF.md)**.
 
 ---
 
-## Instalacja
+## Instalacja (Windows, maszyna Shadow)
 
-### Windows (laptop przy ramieniu)
+Shadow to Windows x86-64 z **RTX A4500 (20 GB)**. WSL2 nie ruszy — wirtualka
+nie udostępnia zagnieżdżonej wirtualizacji — ale nie jest potrzebne: MuJoCo
+Warp i PyTorch z CUDA działają natywnie.
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e ".[twin]"
+pip install -e ".[twin,feetech,dev]"
+pip install mujoco-warp
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 lerobot-twin check
 ```
 
-### Linux / NVIDIA DGX Spark
+- **Torch z PyPI na Windows jest bez CUDA** (`torch.version.cuda == None`) —
+  koło z CUDA tylko z indeksu PyTorcha. `cu126` działa ze sterownikiem Shadow
+  565.90 (CUDA 12.7). Te same wersje co w lerobocie, więc nic się nie rozjeżdża.
+- Na `C:` Shadow zostaje niewiele miejsca; duże pakiety instaluj z `TMP`
+  ustawionym na `D:` (`set TMP=D:\tmp`) albo z `--no-cache-dir`.
+- Po instalacji lerobota sprawdź, czy `cv2` ma GUI (lerobot potrafi podmienić
+  OpenCV na wersję bez okien).
+- Pierwsza kompilacja kerneli MuJoCo Warp trwa ~100 s; potem są w cache
+  (`%LOCALAPPDATA%\NVIDIA\warp\Cache`).
 
-Spark to ARM64 (aarch64). Wszystkie zależności bliźniaka mają gotowe koła dla
-Linux aarch64 albo są czystym Pythonem — sprawdzone na PyPI we wrześniu 2026:
-MuJoCo 3.14 (cp312–cp315), OpenCV 5.0, NumPy 2.5, msgspec; viser, Gymnasium
-i pyserial to czysty Python.
+## Panel
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[twin]"
-export MUJOCO_GL=egl          # render bez ekranu, na GPU
-lerobot-twin check
+lerobot-twin ui          # http://localhost:8080 ; zdalnie: http://<adres>:8080
 ```
 
-`MUJOCO_GL=egl` jest potrzebne, gdy nie ma okna (SSH, kontener). Na pulpicie
-działa też domyślne `glfw`.
+Stały **STOP** i pasek stanu nad zakładkami. Każdy ruch — z suwaków, z uchwytu
+w 3D, z polityki, z fali kalibracyjnej, z identyfikacji — idzie przez
+`runtime.Twin` i jego `SafetySupervisor`.
 
-`lerobot-twin check` niczego nie renderuje — sprawdza pakiety, wczytuje model
-ramienia, porównuje jego kinematykę z niezależnym modelem Articulusa i wypisuje
-przejściówki USB-serial:
+| zakładka | co robi |
+|---|---|
+| **Ramię** | połączenie: `sim` (bliźniak jest ramieniem), `feetech` (port `COM12` albo `socket://adres:5555` przez most), `lerobot`; wykrywanie przejściówki CH343; sprzęgło; suwaki stawów; uchwyt końcówki w 3D (IK) |
+| **Kamery** | kamery USB i **symulowane** — symulowaną stawiasz w dowolnym miejscu widoku 3D i przeciągasz uchwytem; piramidy z obrazem na żywo (zielona = zaufana, pomarańczowa = niezaufana, czerwona = **przestawiona**); podgląd; błąd kalibracji względem prawdy dla symulowanych |
+| **Kalibracja** | arkusze do druku (tablica ChArUco, karta z tagami); **1.** intrynsyki — tablica w ręku, kadry zapisują się same, gdy wnoszą nowe ujęcie; **2.** położenie wszystkich kamer naraz — fala z kartą w chwytaku; **szybka relokalizacja** jednej przestawionej kamery |
+| **Mapa** | kadry wszystkich zaufanych kamer zszyte w mapę blatu (także na stole w 3D), wykrywanie kostki (kolor do wyboru) |
+| **Trening** | PPO na GPU w osobnym procesie, z wykresem sukcesu; **identyfikacja dynamiki serw** na połączonym ramieniu i zapis jako środka randomizacji |
+| **Polityki** | lista z wynikami (GPU, CPU z randomizacją i bez), ewaluacja na CPU, **uruchomienie na bliźniaku** — sim albo prawdziwe ramię; `reach`: cel przeciągany w 3D; `lift`: kostka z symulacji albo **z kamer** |
+| **Sim-Real** | kadr prawdziwej kamery z nałożonymi krawędziami renderu bliźniaka z tej samej pozy i K, mediana rozjazdu w pikselach |
 
-```
-  OK   mujoco                       3.14.0
-  OK   model SO-101 (menagerie)     9 cial, 348164 trojkatow
-  OK   zgodnosc z Articulusem       2.3 um (musi byc < 10 um)
-  OK   porty USB-serial             COM12 (USB-Enhanced-SERIAL CH343 (COM12))
-```
+---
+
+## Pierwszy test na prawdziwym stanowisku — krok po kroku
+
+Wszystko poniżej jest przećwiczone na bliźniaku (`sim`) — ta sama ścieżka,
+te same przyciski. Przed każdym krokiem na sprzęcie: ramię na stole, wolne
+miejsce dookoła, zasilacz podłączony, ręka przy STOP.
+
+**0. Ramię do Shadow.** Dwie drogi:
+- *przepuszczenie USB w kliencie Shadow* (CH343 pojawia się jako `COMx`), albo
+- *most*: na komputerze przy ramieniu `lerobot-mp-bridge --port COM12 --listen 0.0.0.0:5555 --allow <adres Shadow>`,
+  w panelu port `socket://<adres komputera>:5555`. Odczyt ramienia idzie jednym
+  pakietem SYNC READ — przez sieć jeden przebieg na odczyt zamiast sześciu.
+  Shadow stoi w centrum danych, więc musi **widzieć** komputer przy ramieniu:
+  sieć prywatna (Tailscale, ZeroTier) albo przekierowany port. Most działa
+  dobrze do ~20 ms RTT; `--stats` pokazuje, ile faktycznie schodzi.
+
+W zakładce Ramię: `feetech`, port, **Połącz** (bez jazdy do domu). Suwaki mają
+pokazywać to, co ramię. Sprzęgło + mały ruch jednym suwakiem.
+
+**1. Kamery.** Przepuść kamery USB w kliencie Shadow, w panelu *Szukaj kamer
+USB* → *Dodaj*. Kamera, która się otwiera, ale nie daje klatek, to prawie
+zawsze brak przepuszczenia (patrz README).
+
+**2. Intrynsyki każdej kamery.** *Pobierz arkusz tablicy*, wydrukuj w skali
+100%, **zmierz bok kwadratu linijką**, wpisz. *Zbieraj kadry* i pokazuj tablicę
+w rogach kadru, bliżej i dalej, pochyloną — 12+ kadrów, pokrycie 55%+.
+*Oblicz i zapisz K*. Residuum ≤ 0,6 px.
+
+**3. Położenie kamer.** *Pobierz arkusz karty*, wydrukuj, zmierz bok taga,
+zegnij kartę, włóż wolny koniec w szczęki (ok. 70 mm ma wystawać). Zaznacz
+potwierdzenie, *Start fali*. Ramię zbiera ~20 póz; kamera, której fala się nie
+udała, wraca jako niezaufana z powodem. *Zapisz wynik kalibracji*. Wyjmij kartę.
+
+**4. Sprawdzenie Sim-Real.** Zakładka Sim-Real, każda kamera: krawędzie renderu
+mają leżeć na krawędziach ramienia i stołu. Mediana > 3 px = coś jest źle
+(zmierzony tag? stół w bliźniaku nie na wysokości podstawy?).
+
+**5. Dynamika serw.** Zakładka Trening → *Identyfikuj na połączonym ramieniu*
+(~20 s ruchu po 12°) → *Zapisz jako dynamikę stanowiska*. Od teraz trening
+randomizuje wokół zmierzonego ramienia, nie katalogu.
+
+**6. Trening.** Najszybciej: **douczanie** gotowych polityk na zmierzonej
+dynamice — zakładka Trening, *Start z polityki* `reach-v1` / `lift-v2`,
+100–300 iteracji (`lerobot-twin train --init …`). Od zera: `reach` 160
+iteracji (~2,5 min), `lift` 600 (~30 min). Po treningu polityka sama przechodzi
+ewaluację na CPU.
+
+**7. `reach` na ramieniu.** Zakładka Polityki, polityka `reach`, potwierdzenie,
+*Uruchom*. Przeciągaj żółtą kulkę celu w 3D — ramię za nią jedzie. Polityka
+staje sama, gdy ramię nie nadąża za celem o więcej niż 25° (kolizja, blokada).
+
+**8. `lift` z kamerami.** Kostka 3 cm w kolorze z listy na blacie przed ramieniem,
+zakładka Mapa ma ją pokazywać. Polityka `lift-v2` (albo jej douczona wersja),
+źródło kostki **kamery**, *Uruchom*. Gdy szczęki zasłonią kostkę, śledzenie
+przejmuje ją „w dłoni”. Nie używaj `lift-v1` z kamerami — uczona na prawdziwej
+pozycji kostki, nie znosi opóźnienia percepcji.
 
 ---
 
@@ -77,106 +143,160 @@ przejściówki USB-serial:
 | | |
 |---|---|
 | `lerobot-twin check` | czy środowisko jest gotowe (bez renderu) |
-| `lerobot-twin card --tag-mm 50` | arkusz karty kalibracyjnej do druku (PNG, A4 w poziomie) |
-| `lerobot-twin calib-sim --n 5 --cameras 2` | kalibracja w symulacji, oceniana względem prawdy (**renderuje**) |
-| `lerobot-twin workspace` | co wiadomo o stanowisku: kamery, ich kalibracja, karta |
-
-Testy:
+| `lerobot-twin ui` | panel w przeglądarce |
+| `lerobot-twin card --tag-mm 50` | arkusz karty kalibracyjnej (PNG, A4) |
+| `lerobot-twin board --square-mm 28` | tablica ChArUco do intrynsyk (PNG, A4) |
+| `lerobot-twin calib-sim --n 5 --cameras 2` | kalibracja w symulacji, oceniana względem prawdy |
+| `lerobot-twin train --task reach --iters 160` | PPO na GPU + ewaluacja na CPU; `--no-rand`, `--spread`, `--init <policy.pt>` (douczanie) |
+| `lerobot-twin eval <policy.pt> --rand` | ewaluacja polityki w zwykłym MuJoCo |
+| `lerobot-twin policies` | zapisane polityki i ich wyniki |
+| `lerobot-twin workspace` | co wiadomo o stanowisku |
 
 ```bash
-pytest -q                                   # wszystko, łącznie z renderem
-pytest -q -k "not renders and not full_session"   # bez renderu (np. na maszynie bez GPU)
+pytest -q                                          # całość, z renderem i GPU
+pytest -q -k "not renders and not full_session"    # maszyna bez GPU
 ```
+
+---
+
+## Liczby z Shadow (RTX A4500, EPYC 4 rdzenie)
+
+| | Shadow | laptop (Intel HD 620) |
+|---|---|---|
+| budowa sceny | 111 ms | 293 ms |
+| 1 s fizyki (CPU) | 2,6 ms | 6,9 ms |
+| render 640×480 (cienie, MSAA) | **2,1 ms** | 164 ms |
+| render 640×480 bez cieni i MSAA | 1,25 ms | 70 ms |
+| render 224×224 / 128×128 | 0,8 / 0,7 ms | – |
+| pętla sterowania | 48–50 Hz | 28 Hz |
+| MuJoCo Warp, 8192 światy | **1,1 mln kroków fizyki/s** | – |
+| środowisko GPU `reach` / `lift`, 4096 światów | 190 / 129 tys. kroków polityki/s | – |
+| trening `reach` (15 mln kroków) | **2 min** → CPU 100%, 1,5 mm od celu | – |
+| trening `lift` (59 mln kroków) | **28 min** → CPU 100% (96% z randomizacją) | – |
+| douczanie `lift` z modelem percepcji (29 mln kroków) | 16 min → CPU 98% z randomizacją, z kamer 8/8 | – |
+
+MuJoCo Warp zgadza się z MuJoCo na CPU: stawy po 2 s fizyki różnią się o
+0,001°, obserwacje środowisk GPU i CPU po 30 krokach o 6·10⁻⁵.
 
 ---
 
 ## Kalibracja kamer
 
-Metoda pochodzi z [galaxeo-manipulators](https://github.com/machinekind/galaxeo-manipulators/pull/3):
+Metoda z [galaxeo-manipulators](https://github.com/machinekind/galaxeo-manipulators/pull/3):
 **jedna karta z dwoma AprilTagami, ściśnięta w chwytaku**. Ramię nią macha,
 kamery patrzą, a solver wyznacza *jednocześnie* pozę każdej kamery względem
 podstawy i pozę karty w dłoni — więc nie trzeba wiedzieć, jak krzywo ktoś ją
-włożył. Przy wielu kamerach karta jest wspólna dla wszystkich, więc kamera,
-która widzi ją dobrze, pomaga tej, która widzi ją gorzej.
+włożył. Karta jest wspólna dla wszystkich kamer.
 
-### Wynik w symulacji
+Przed kalibracją położenia każda prawdziwa kamera dostaje **intrynsyki z
+tablicy ChArUco** (`calib/intrinsics.py`) — inaczej poza jest dopasowywana do
+nominalnego K z 65° pola widzenia i wychodzi pewna siebie i przesunięta.
+Tablica to ArUco 5×5, inny słownik niż tagi karty (36h11).
 
-Losowe stanowiska, kamery 45–75 cm od stołu, karta przekrzywiona w dłoni do
-12 mm i 10°. Sesja widzi tylko to, co widziałaby na biurku: kadry, zmierzone
-kąty stawów, K kamer i *nominalną* pozę karty.
+### Wynik w symulacji (`lerobot-twin calib-sim --n 5 --cameras 2`)
 
-| | 1 kamera (3 stanowiska) | 2 kamery (3 stanowiska) |
+| | przed poprawką półpiksela | **po** |
 |---|---|---|
-| zaufane kamery | 3/3 | 6/6 |
-| błąd położenia kamery | mediana 0,20 mm | mediana **0,15 mm**, najgorzej 0,25 mm |
-| błąd obrotu kamery | 0,115°¹ | mediana **0,055°**, najgorzej 0,068° |
-| residuum | 0,17 px | 0,16 px |
-| poz na sesję | ok. 15 | ok. 19 dla obu kamer razem |
+| zaufane kamery | 10/10 | 10/10 |
+| błąd położenia kamery (mediana) | 0,345 mm | **0,161 mm** |
+| błąd obrotu kamery (mediana) | 0,053° | **0,013°** |
+| residuum (mediana) | 0,22 px | 0,21 px |
 
-¹ przed poprawką konwencji rogów tagów — patrz niżej. Galaxeo dla porównania:
-0,21 mm i 0,06° na jednej kamerze i ramieniu z sześcioma osiami.
+Z panelu, na żywym bliźniaku, dwie kamery: 0,19 mm / 0,009° i 0,31 mm / 0,005°
+względem prawdy. Intrynsyki z symulowanej tablicy: ogniskowe z dokładnością
+~0,1–1 px, residuum 0,1 px.
 
-```bash
-lerobot-twin calib-sim --n 5 --cameras 2
-```
+### Przestawiona kamera
 
-### Na prawdziwym ramieniu
-
-1. **Wydrukuj kartę** w skali 100%:
-   ```bash
-   lerobot-twin card --tag-mm 50 --out karta.png
-   ```
-2. **Zmierz linijką** bok czarnego kwadratu na wydruku. Drukarki skalują, a ta
-   liczba ustala skalę całej kalibracji — to jedyna rzecz, której symulacja
-   nie sprawdzi za Ciebie.
-3. Wytnij pasek, zegnij po linii przerywanej tagami na zewnątrz, wklej w środek
-   sztywną tekturę. **Zgięcie to koniec karty** — dzięki temu drugi tag po
-   złożeniu leży dokładnie za pierwszym.
-4. Ściśnij wolny koniec w szczękach, ok. 70 mm ma wystawać. Dokładna poza nie
-   ma znaczenia — kalibracja ją wyznacza.
-5. Postaw kamery tak, żeby widziały przestrzeń nad stołem przed ramieniem.
-6. Uruchom sesję *(polecenie na prawdziwe ramię jest w budowie — przepis
-   w [HANDOFF.md](../HANDOFF.md))*.
-7. Wyjmij kartę. Nic innego na stanowisku nie ma znacznika.
-
-Kamera, której fala się nie udała, wraca jako **niezaufana z podanym powodem**
-(za duże residuum, za mały rozrzut obrotów, za mało obserwacji), zamiast
-z pewną siebie złą pozą.
+Po zapisaniu kalibracji panel zapamiętuje kadr odniesienia każdej kamery
+i co 2 s porównuje z nim bieżący — korelacją fazową, z **ramieniem wyciętym
+maską z bliźniaka** (ruch ramienia daje 0,4 px „przesunięcia”, obrót kamery
+o 1° — 9,8 px). Powyżej 3 px piramida robi się czerwona i panel proponuje
+szybką relokalizację (krótka fala tylko dla tej kamery).
 
 ---
 
 ## Dokładność symulowanej kamery
 
 Symulowana kamera dostaje pełną macierz K — ogniskowe w pikselach i punkt
-główny — a nie samo pole widzenia. Test renderuje kulki w znanych punktach
-stołu i porównuje środki plam z rzutem przez K, dla trzech różnych K (w tym
-z punktem głównym przesuniętym i fx ≠ fy): **przesunięcie systematyczne
-poniżej 0,15 px, pojedyncze błędy poniżej 0,4 px**.
-
-Po drodze wyszły trzy rzeczy, które cicho psułyby sim-2-real. Wszystkie są
-teraz pilnowane testami:
+główny. Test renderuje kulki w znanych punktach stołu i porównuje środki ich
+**masek segmentacji** z rzutem przez K: przesunięcie systematyczne poniżej
+0,15 px, dla trzech różnych K.
 
 | | objaw | poprawka |
 |---|---|---|
-| znak punktu głównego w MuJoCo | cały kadr przesunięty o 62 px w poziomie | przesunięcie liczone jako „środek minus K” w obu osiach |
-| półpiksel w pionie w MuJoCo | render stale 0,5 px wyżej niż rzut K, dla każdego K | kompensacja w `scene.py` |
-| półpiksel w detektorze AprilTag | rogi o 0,5 px dalej niż w konwencji `projectPoints` | korekta w `tags.detect`; **błąd obrotu kamery spadł o połowę** |
+| znak punktu głównego w MuJoCo | cały kadr przesunięty o 62 px | „środek minus K” w obu osiach |
+| ~~półpiksel w pionie~~ | render 0,5 px **niżej** niż rzut K | dawna „kompensacja” była błędem pomiaru: środki czerwonych plam podnosił cień dolnej połowy kulki; maski segmentacji (czysta geometria) pokazały, że to ona przesuwała kadr. Po usunięciu błąd obrotu w kalibracji spadł 4× |
+| półpiksel w detektorze AprilTag | rogi o 0,5 px dalej niż w konwencji `projectPoints` | korekta w `tags.detect` |
 
-Ostatnia dotyczy też galaxeo, z którego pochodzi detektor: `CORNER_REFINE_APRILTAG`
-oddaje rogi w konwencji narożników pikseli, a model otworkowy OpenCV liczy
-w konwencji środków.
+Renderer MuJoCo Warp (wsadowy, na GPU) liczy promienie przez środki pikseli
+z tych samych intrynsyk i zgadza się z OpenGL co do 0,05 px na maskach.
 
 ---
 
-## Mapa stołu z wielu kamer
+## Mapa stołu i kostka
 
-Każdy kadr przerysowany na płaszczyznę blatu, mapy zszyte z wagami (kamera
-patrząca z góry liczy się bardziej niż ta z boku). Przedmiot na stole ląduje
-na mapie w swoim prawdziwym (x, y), niezależnie od tego, skąd patrzy kamera —
-galaxeo zmierzyło, że właśnie ta zmiana dała pierwsze udane nalania w zamkniętej
-pętli. W teście podstawa kostki trafia **0,3 px** od swojego miejsca z każdej
-z dwóch kamer, a dwie kamery pokrywają 99% blatu. W odróżnieniu od oryginału
-rzut liczony jest przez `projectPoints`, więc uwzględnia dystorsję obiektywu.
+Każdy kadr przerysowany na płaszczyznę blatu, mapy zszyte z wagami — do
+oglądania stanowiska (także na blacie w 3D).
+
+Kostka (`perception.CubeDetector.detect_frames`):
+
+1. **start** — część wspólna masek koloru z kamer na wysokości górnej ściany
+   (ściana leży w tym samym miejscu dla każdej kamery, boki rozjeżdżają się);
+2. **dopasowanie sylwetki** — (x, y, obrót), przy których rzut bryły kostki
+   najlepiej pokrywa maski wszystkich kamer; działa z jedną kamerą i z wieloma,
+   liczone w wycinku kadru (~17 ms);
+3. **ramię to „nie wiem”** — piksele zasłonięte ramieniem (segmentacja z
+   bliźniaka, w pozie z serw) nie głosują;
+4. **bramka IoU ≥ 0,75** — model zakłada kostkę leżącą; kostkę w powietrzu da
+   się „wcisnąć” w jakąś pozę na blacie z IoU 0,36–0,64 i błędem do 1 m.
+
+Na blacie w symulacji: **1–3 mm, ~1°**. `CubeTracker` przejmuje kostkę, gdy
+kamery jej nie widzą: szczęka **zablokowana** (nie dojeżdża do rozkazu i stoi)
+→ kostka jedzie z TCP w pozie zapisanej w chwili chwytu.
+
+### Percepcja w treningu
+
+Polityka `lift` uczona na **prawdziwej** pozycji kostki podnosiła ją 20/20
+razy — i tylko **7/20**, gdy pozycja przychodziła jak z kamer: co 100 ms,
+150 ms spóźniona. Podczas podnoszenia widziała kostkę „pod sobą” i wracała po
+nią. Dlatego trening widzi kostkę tak, jak ją da percepcja
+(`Randomization.cube_*`): opóźnienie 0–3 takty, odświeżanie co 1–3 takty,
+szum 2 mm, obrót złożony do ±45° — a nagroda liczy się z prawdy.
+
+| pełny łańcuch z kamerami na bliźniaku (8 ułożeń kostki) | podniesione |
+|---|---|
+| `lift-v1` — uczona na prawdziwej pozycji kostki | 1/8 |
+| `lift-v2` — `lift-v1` douczona z modelem percepcji (300 iteracji, 16 min) | **8/8** |
+
+Od zera z modelem percepcji uczenie szło bardzo wolno (0% po 220 iteracjach) —
+douczanie z polityki, która już umie chwytać, doszło do 98% w 300.
+Pilnuje tego `tests/test_twin_lift_from_cameras.py`.
+
+## Polityki bazowe
+
+W repozytorium są dwie gotowe polityki (`assets/policies/`), widoczne w panelu
+i w `lerobot-twin policies` obok własnych ze stanowiska:
+
+| | zadanie | CPU bez / z randomizacją |
+|---|---|---|
+| `reach-v1` | dojazd TCP do punktu | 100% / 100%, 2,7 mm od celu |
+| `lift-v2` | chwyt i podniesienie kostki z kamer | 96% / 98% |
+
+Obie uczone wokół modelu Menagerie — po identyfikacji dynamiki na swoim ramieniu
+douczyć je (`--init`, 100–300 iteracji), zamiast uczyć od zera.
+
+---
+
+## Uczenie ze wzmocnieniem
+
+| | |
+|---|---|
+| zadania | `reach` — TCP do punktu (sukces < 2 cm); `lift` — chwyt i podniesienie kostki 3 cm o 6 cm |
+| akcja | 6 liczb w [−1, 1]: przyrost celu stawów ramienia (≤ 0,05 rad na takt, 20 Hz), cel chwytaka bezwzględnie, ograniczony jak w nadzorze |
+| obserwacja | stawy i cele stawów (znormalizowane), TCP, cel albo kostka (położenie, obrót 6D), poprzednia akcja — **jedna definicja** (`rl/task.py`) dla CPU, GPU i ramienia |
+| randomizacja | wzmocnienie, tłumienie, armatura i tarcie serw, masa i tarcie kostki, opóźnienie akcji, szum kątów — wokół `Workspace.dynamics` (identyfikacja); **percepcja kostki** jak z kamer (opóźnienie, odświeżanie, szum, symetria) |
+| środowiska | `LeRobotMP/TwinReach-v0`, `LeRobotMP/TwinLift-v0` (Gymnasium, CPU); `rl.batch.BatchEnv` (MuJoCo Warp, GPU) |
 
 ---
 
@@ -184,26 +304,38 @@ rzut liczony jest przez `projectPoints`, więc uwzględnia dystorsję obiektywu.
 
 ```
 src/lerobot_mp/twin/
-├── robots.py        opis ramienia: MJCF, stawy, TCP, osie chwytaka, zakresy fali
+├── robots.py        opis ramienia: MJCF, stawy, TCP, osie chwytaka, szczęki, zakresy fali
 ├── kinematics.py    FK/IK przez MuJoCo; IK z priorytetem pozycji (5 osi SO-101)
-├── scene.py         scena z MjSpec: stół, ramię, kamery z pełnym K, karta, obiekty
-├── collision.py     kolizje pozy i drogi do niej, na scenie bliźniaka
-├── workspace.py     stanowisko w JSON: ramię, port, stół, karta, kamery + kalibracja
+├── scene.py         scena z MjSpec: stół, ramię, kamery z pełnym K, karta, obiekty, panele, czujniki chwytu
+├── collision.py     kolizje pozy i drogi do niej
+├── workspace.py     stanowisko w JSON: ramię, port, stół, karta, kamery (+ prawda symulowanych), dynamika
 ├── cameras.py       wykrywanie kamer, strumienie bez lustra, kamery symulowane
-├── runtime.py       pętla sterowania w wątku: nadzór bezpieczeństwa, sim albo sprzęt
+├── runtime.py       pętla sterowania w wątku, nadzór, wątek renderujący
+├── perception.py    mapa stołu na żywo, kostka z kamer, śledzenie kostki w dłoni
 ├── cli.py           lerobot-twin
-└── calib/
-    ├── tags.py      AprilTag 36h11 (z galaxeo) + korekta półpiksela, render taga
-    ├── handeye.py   solver wielu kamer ze wspólną kartą (z galaxeo, uogólniony)
-    ├── card.py      geometria karty, poza w szczękach, arkusz do druku
-    ├── session.py   fala: szukanie, celowanie, pilnowanie kadru i rozrzutu, bramki
-    ├── simulate.py  sesja w symulacji oceniana względem prawdy
-    └── topdown.py   mapa stołu z jednej i z wielu kamer (z galaxeo, z dystorsją)
+├── calib/
+│   ├── tags.py        AprilTag 36h11 + korekta półpiksela
+│   ├── handeye.py     solver wielu kamer ze wspólną kartą
+│   ├── card.py        karta: geometria, poza w szczękach, arkusz
+│   ├── intrinsics.py  ChArUco: arkusz, zbieranie ujęć, K i dystorsja, sesja w symulacji
+│   ├── session.py     fala: szukanie, celowanie, kadr, rozrzut, bramki
+│   ├── simulate.py    sesja w symulacji względem prawdy
+│   └── topdown.py     rzut kadru na blat
+├── rl/
+│   ├── task.py        obserwacja, akcja, nagroda, starty - numpy i torch
+│   ├── env.py         Gymnasium na CPU
+│   ├── batch.py       tysiące światów MuJoCo Warp na GPU
+│   ├── ppo.py         PPO
+│   ├── policy.py      plik polityki (sieć + normalizacja + zadanie + wyniki)
+│   ├── evaluate.py    ewaluacja w zwykłym MuJoCo
+│   ├── randomize.py   dynamika zmierzona i zakresy randomizacji
+│   ├── sysid.py       identyfikacja dynamiki serw
+│   └── runner.py      polityka na żywym bliźniaku / ramieniu
+└── ui/
+    ├── app.py         panel (viser)
+    ├── bridge.py      scena MuJoCo w przeglądarce (węzeł na ciało)
+    ├── jobs.py        zadania w tle: trening (proces), kalibracje, identyfikacja
+    └── watch.py       wykrywanie przestawionej kamery
 
 assets/robots/so101/   model z MuJoCo Menagerie (Apache-2.0), commit ac6b2b0
 ```
-
-Model ramienia to MJCF z [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotstudio_so101),
-wyprowadzony z `so101_new_calib.xml` — konwencji nowej kalibracji LeRobota, tej
-samej, w której pracuje backend `feetech`. Zgodność z niezależnym modelem
-Articulusa: **2 µm** w 200 losowych pozach po pełnym zakresie stawów.

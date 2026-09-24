@@ -1,56 +1,46 @@
-# Handoff: cyfrowy bliźniak SO-101 → DGX Spark
+# Handoff: cyfrowy bliźniak SO-101 na Shadow
 
-Stan na 2026-09-23. Praca przenosi się z laptopa z Windows na NVIDIA DGX Spark.
-Instrukcja uruchomienia: **[docs/TWIN.md](docs/TWIN.md)**.
+Stan na 2026-09-24. Plan przeniesienia na NVIDIA DGX Spark zastąpiony
+maszyną **Shadow** (Windows 11, RTX A4500 20 GB, EPYC 4 rdzenie / 8 wątków,
+28 GB RAM). Instrukcja uruchomienia i procedura testu na sprzęcie:
+**[docs/TWIN.md](docs/TWIN.md)**.
 
 ## W skrócie
 
-Aplikacja jest przerabiana na **uniwersalnego cyfrowego bliźniaka**: wiele
-kamer skalibrowanych względem ramienia, scena MuJoCo odtwarzająca stanowisko
-i środowisko do uczenia ze wzmocnieniem, z dobrym UI do zarządzania ramieniem
-i kamerami. Kalibracja pochodzi z [galaxeo-manipulators PR #3](https://github.com/machinekind/galaxeo-manipulators/pull/3).
+System jest gotowy do pierwszego testu na fizycznym stanowisku. Wszystko,
+co da się sprawdzić bez ramienia i kamer, jest sprawdzone na bliźniaku —
+tą samą ścieżką kodu, którą pójdzie sprzęt:
 
-**Fundament jest gotowy i przetestowany** — model, kinematyka, scena z kamerami
-o pełnym K, kolizje, kalibracja wielu kamer (0,15 mm / 0,055° w symulacji),
-mapa stołu, zapis stanowiska, pętla sterowania. **Nie ma jeszcze** środowiska
-Gymnasium, panelu webowego ani kalibracji na prawdziwych kamerach — dla
-wszystkich trzech projekt jest rozpisany niżej, łącznie ze sprawdzonym API.
-
-Ostatnia sesja celowo **nie liczyła nic na GPU** (decyzja użytkownika) —
-optymalizacja renderu i trening czekają na Sparka.
+- **panel webowy** (`lerobot-twin ui`) — ramię, kamery (także symulowane,
+  stawiane i przeciągane w 3D), kalibracja, mapa na żywo, trening, polityki,
+  porównanie sim-real; przećwiczony cały scenariusz w przeglądarce;
+- **kalibracja**: intrynsyki z ChArUco, położenie wielu kamer z karty w
+  chwytaku, szybka relokalizacja, wykrywanie przestawionej kamery;
+- **trening na GPU**: MuJoCo Warp (tysiące światów) + PPO; `reach` w 2 min,
+  `lift` w 28 min; polityki przechodzą na CPU (inny silnik) z 96–100% sukcesu;
+- **kalibracja treningu sim-to-real**: identyfikacja dynamiki serw z nagrania
+  ruchu, randomizacja wokół zmierzonej dynamiki;
+- **percepcja**: kostka z kamer (część wspólna masek na wysokości górnej
+  ściany), śledzenie w dłoni, gdy szczęki ją zasłaniają;
+- **runner**: polityka na bliźniaku albo ramieniu przez `SafetySupervisor`,
+  z zatrzymaniem przy rozjeździe; `lift-v2` z kostką **wyłącznie z kamer**
+  podnosi ją na bliźniaku 8/8 (`lift-v1`, uczona na prawdzie: 1/8);
+- **polityki bazowe** w `assets/policies/` (`reach-v1`, `lift-v2`) — start do
+  douczania na zmierzonej dynamice.
 
 ---
 
-## 1. Pierwsze kroki na Sparku
+## 1. Co się zmieniło względem planu DGX
 
-```bash
-git clone https://github.com/przemeknowak781/manipulator.git && cd manipulator
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[twin,dev]"
-export MUJOCO_GL=egl
-lerobot-twin check                     # bez renderu: pakiety, model, zgodność z Articulusem
-pytest -q                              # PEŁNY zestaw, łącznie z renderem
-lerobot-twin calib-sim --n 5 --cameras 2
-```
+| DGX Spark (plan) | Shadow (jest) |
+|---|---|
+| Linux aarch64, `MUJOCO_GL=egl` | Windows, render przez GLFW/WGL na A4500 — 2 ms za kadr 640×480 |
+| MJX / JAX na GPU | **MuJoCo Warp** — natywnie na Windows, 1,1 mln kroków fizyki/s; JAX z CUDA na Windows nie istnieje, WSL2 nie ruszy (brak zagnieżdżonej wirtualizacji) |
+| PyTorch aarch64 do dobrania | koło `cu126` z indeksu PyTorcha; ze sterownikiem 565.90 (CUDA 12.7) działa |
+| ramię przy laptopie | przepuszczenie USB w kliencie Shadow **albo** most `lerobot-mp-bridge` i port `socket://` (nowe) |
 
-Wszystkie zależności bliźniaka mają koła dla Linux aarch64 (sprawdzone na PyPI).
-
-**Do sprawdzenia na Sparku, bo na laptopie nie było jak:**
-
-- [ ] 4 testy renderujące (`test_sim_camera_renders_where_its_intrinsics_project` ×3,
-      `test_full_session_in_simulation_calibrates_the_camera`) — w ostatnim
-      przebiegu odznaczone na prośbę użytkownika; przechodziły przed zmianą
-      domyślnego położenia stołu, po niej nie były uruchamiane.
-- [ ] Czas renderu z EGL na GB10 (tabela w sekcji 4) — to zdecyduje o tym, jak
-      zbudować obserwacje obrazowe w RL.
-- [ ] PyTorch z CUDA na aarch64 — dobrać właściwe koło/kontener NVIDIA dla Sparka;
-      nie weryfikowane.
-- [ ] Czy MJX / MuJoCo Warp działa na GB10 — to byłaby droga do tysięcy
-      równoległych środowisk; nie weryfikowane.
-
-Stan testów na laptopie: **258 przechodzi, 4 odznaczone (render), 1 pada** —
-`test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`, porażka
-starsza niż bliźniak i z nim niezwiązana (zbyt sztywny próg w samym teście).
+Pozycje z listy „do sprawdzenia na Sparku”: testy renderujące — przechodzą;
+czas renderu — zmierzony; PyTorch z CUDA — działa; MJX/Warp — Warp działa.
 
 ---
 
@@ -58,164 +48,87 @@ starsza niż bliźniak i z nim niezwiązana (zbyt sztywny próg w samym teście)
 
 | moduł | co robi | dowód |
 |---|---|---|
-| `twin/robots.py` | opis ramienia: MJCF, stawy, TCP, osie chwytaka, zakresy fali | test osi na geometrii modelu |
-| `twin/kinematics.py` | FK/IK na MuJoCo; IK z **priorytetem pozycji** (orientacja w przestrzeni zerowej) | zgodność z Articulusem **2 µm**; IK trafia 23+/25 osiągalnych celów |
-| `twin/scene.py` | scena `MjSpec`: stół, ramię, kamery z **pełnym K**, karta z tagami, obiekty | render vs rzut K: **< 0,15 px** systematycznie |
-| `twin/collision.py` | kolizje pozy i **drogi** do niej | stół i samokolizje wykrywane |
-| `twin/calib/handeye.py` | solver **wielu kamer ze wspólną kartą** | 1 i 2 kamery z szumu 0,2 px |
-| `twin/calib/session.py` | fala: szukanie → celowanie → pilnowanie kadru i rozrzutu → bramki | ~15–19 poz na sesję |
-| `twin/calib/simulate.py` | sesja w symulacji oceniana względem prawdy | 6/6 kamer: **0,15 mm, 0,055°** |
-| `twin/calib/topdown.py` | mapa stołu z jednej i wielu kamer, z dystorsją | kostka trafia **0,3 px** od miejsca |
-| `twin/calib/card.py` | karta: geometria, poza w szczękach, arkusz A4 | oba tagi wykrywane z arkusza |
-| `twin/workspace.py` | stanowisko w JSON: ramię, port, stół, karta, kamery + wynik kalibracji | testy zapisu/odczytu |
-| `twin/cameras.py` | wykrywanie kamer, strumienie **bez lustra**, kamery symulowane | **nietestowane na sprzęcie** — laptop nie ma kamery |
-| `twin/runtime.py` | pętla sterowania w wątku, nadzór bezpieczeństwa, sim albo sprzęt | sprawdzone ręcznie na symulacji |
-| `twin/cli.py` | `lerobot-twin check / card / calib-sim / workspace` | test arkusza |
-| `control/safety.py` | nowy parametr `start(..., go_home=False)` — łączenie bez ruchu | domyślne zachowanie bez zmian |
+| `twin/scene.py` | + panele z obrazem, czujniki kontaktu szczęk; **punkt główny bez fałszywego półpiksela** | test na maskach segmentacji; kalibracja 4× dokładniejsza w obrocie |
+| `twin/calib/intrinsics.py` | ChArUco: arkusz, zbieranie ujęć z pilnowaniem różnorodności, K + dystorsja, bramki | K z renderu do ~1 px, rogi 0,002 px od rzutu |
+| `twin/perception.py` | mapa stołu na żywo, kostka z kamer, `CubeTracker` (w dłoni) | 1,2 mm / 0,6° z dwóch kamer |
+| `twin/rl/task.py` | obserwacja/akcja/nagroda — numpy i torch, te same wzory | test równości numpy/torch |
+| `twin/rl/env.py` | Gymnasium CPU, `check_env` | ekspert IK rozwiązuje `reach` 10/10 |
+| `twin/rl/batch.py` | MuJoCo Warp, randomizacja per świat + `set_const` | zgodność z CPU 1e-7 → 4e-3 po 60 krokach losowych |
+| `twin/rl/ppo.py`, `policy.py`, `evaluate.py` | PPO (także douczanie `--init`), plik polityki z zadaniem i wynikami, ewaluacja na CPU | `reach-v1`, `lift-v2` w `assets/policies` |
+| `twin/rl/sysid.py` | nagranie ruchu przez nadzór, dopasowanie kp/tłumienia/armatury/tarcia/opóźnienia | na nagraniu o znanej dynamice: błąd do poziomu szumu, opóźnienie ±1 ms |
+| `twin/rl/runner.py` | polityka na `Twin`, stop przy rozjeździe > 25°, czekanie na kostkę | test na bliźniaku; pełny łańcuch z kamerami (`test_twin_lift_from_cameras`) |
+| `twin/ui/*` | panel (viser), zadania w tle, most sceny, strażnik kamer | test startu panelu + scenariusz w przeglądarce |
+| `robot/feetech.py` | + `socket://` (most), SYNC READ z powrotem do odczytów po kolei | testy na symulowanej magistrali |
+
+Testy: `pytest -q` — wszystko poza znanym, starym `test_mapping.py::test_direct_and_ik_move_the_tip_the_same_way`
+(za sztywny próg w samym teście, sprzed bliźniaka).
 
 ---
 
 ## 3. Decyzje i dlaczego
 
-- **MuJoCo + MuJoCo Menagerie** (`robotstudio_so101`, Apache-2.0) zamiast
-  własnego modelu: pochodzi z `so101_new_calib.xml`, czyli tej samej konwencji
-  zera co backend `feetech` — kąty z serw idą do symulacji bez przesunięć.
-  Ma proste kształty kolizyjne i dostrojone parametry chwytu.
-- **Scena przejmuje opcje fizyki ramienia** (stożek eliptyczny, `impratio`, krok
-  5 ms). `MjSpec.attach` domyślnie zostawia opcje sceny i tylko ostrzega.
-- **IK z priorytetem pozycji.** SO-101 ma 5 osi; ważenie błędu obrotu i pozycji
-  w jednej sumie odciągało ramię o 20 cm od celu przy nieosiągalnej orientacji.
-- **Fala kalibracyjna losuje w przestrzeni STAWÓW**, a nie kartezjańsko jak
-  galaxeo (A1X ma 6 osi) — każda poza jest osiągalna z definicji; obrót
-  nadgarstka dobierany tak, żeby karta patrzyła na kamerę.
-- **Fala pilnuje kadru.** Pierwsza detekcja daje pełną pozę kamery z PnP;
-  kandydaci, dla których karta wypadłaby z kadru, są odrzucani. Bez tego 30
-  z 40 poz było nad kadrem, a sesja zbierała 8 obserwacji w 90 pozach.
-- **Pełne K w symulacji** (`focal_pixel`, `principal_pixel`), nie samo `fovy`.
-- **Panel webowy na viserze** (jeszcze niezbudowany): przeglądarka, więc działa
-  lokalnie i zdalnie; ma piramidy kamer z obrazem na żywo i uchwyt do
-  przeciągania końcówki.
-- **Gymnasium** jako API środowiska: od razu pasuje do SB3, LeRobota, CleanRL.
+- **Jedna definicja zadania dla CPU, GPU i ramienia** (`rl/task.py` z `xp` =
+  numpy albo torch). Dwie kopie „prawie tej samej” obserwacji to ciche źródło
+  sim-2-real.
+- **Akcja jako przyrost celu stawów, chwytak bezwzględnie**, oba ograniczone
+  tak jak `SafetySupervisor` — w treningu polityka nie może robić tego, czego
+  nadzór na ramieniu nie przepuści.
+- **Trening w osobnym procesie** — CUDA przez kilkanaście minut; padnięcie
+  sterownika nie może zabrać panelu ani pętli ramienia. Zatrzymanie plikiem
+  `STOP` w katalogu przebiegu, polityka z tego miejsca zostaje zapisana.
+- **Kamera symulowana ma prawdziwą pozę (`sim_pose`) osobno od kalibracji** —
+  kalibruje się ją jak prawdziwą i widać błąd względem prawdy.
+- **Kostka na mapie górnej ściany, część wspólna masek** — średnia kamer
+  rozmazywała boki (12–17 mm), część wspólna daje 1–2 mm.
+- **Śledzenie kostki w dłoni** — wizja gubi kostkę dokładnie przy chwycie;
+  szczęka zatrzymana na obiekcie + kostka ostatnio przy szczękach = jedzie z TCP.
+- **Jeden wątek renderujący** w `Twin` — kontekst GL może być bieżący tylko w
+  jednym wątku; wcześniej każdy wątek (panel, fala, mapa) renderował sam.
+- **Trening widzi kostkę tak jak percepcja, nie jak fizyka.** Zmierzone na
+  CPU: `lift` uczona na prawdzie — 20/20 na prawdzie, 19/20 ze złożonym
+  obrotem, 19/20 z szumem 3 mm, **7/20** z odświeżaniem 10 Hz i opóźnieniem
+  150 ms. Stąd `Randomization.cube_*`; `lift-v2` jest uczona już z nimi.
+- **Kostka z kamer = dopasowanie sylwetki bryły**, a nie sama część wspólna
+  masek — ta druga potrzebuje dwóch kamer, a ramię zasłania kostkę jednej
+  z nich w połowie epizodów.
 
 ---
 
-## 4. Liczby, które warto znać
+## 4. Następne kroki
 
-| | |
-|---|---|
-| budowa sceny (`scene.build`) | **293 ms** — nie przebudowywać przy każdym resecie |
-| 1 s fizyki | 6,9 ms (145× szybciej niż czas rzeczywisty) |
-| render 640×480 na Intel HD 620 | 164 ms domyślnie · 79 ms bez cieni · 70 ms bez cieni i MSAA · **8 ms bez siatek ramienia** |
-| trójkąty siatek ramienia | **348 164** — to one są wąskim gardłem renderu, nie karta |
-| pętla sterowania na Windows | 28 Hz zamiast zadanych 50 |
-
----
-
-## 5. Następne kroki (w kolejności)
-
-### 5.1 Środowisko Gymnasium — `twin/env.py`
-
-Projekt ustalony, kodu jeszcze nie ma.
-
-- Scena budowana **raz** w `__init__`; randomizacja przy `reset` przez pola
-  skompilowanego modelu: `model.cam_pos` / `cam_quat` (drżenie w granicach
-  niepewności kalibracji), `light_pos` / `light_diffuse`, `geom_rgba`,
-  położenia obiektów przez `qpos`. Zmiana rozmiaru obiektu wymaga przebudowy.
-- **Akcja**: przyrosty celów stawów w [-1, 1] × maks. krok na takt (domyślnie),
-  opcjonalnie cele bezwzględne.
-- **Obserwacja**: `state` (stawy + TCP + dane zadania), `images` z każdej
-  skalibrowanej kamery (render w natywnej rozdzielczości, potem zmniejszenie —
-  geometria kalibracji zostaje), opcjonalnie **zszyta mapa stołu** z
-  `calib/topdown.fused` — w galaxeo to ona dała pierwsze udane polityki.
-- **Zadania**: `reach` (nagroda −odległość, sukces < 2 cm) i `lift` (dojazd +
-  kontakt obu szczęk + wysokość kostki).
-- Rejestracja: `LeRobotMP/TwinReach-v0`, `LeRobotMP/TwinLift-v0`.
-- Testy: `gymnasium.utils.env_checker.check_env` + skryptowy ekspert z IK, który
-  rozwiązuje `reach` (dowód, że zadanie jest wykonalne).
-- Render dla RL: cienie wyłączone (`model.light_castshadow[:] = 0`),
-  `model.vis.quality.offsamples = 0`; rozważyć zdziesiątkowane siatki wizualne.
-
-### 5.2 Panel webowy (viser 1.1.1) — `twin/ui/`
-
-API sprawdzone na zainstalowanej wersji:
-
-- `viser.ViserServer(host, port, label)`, `server.scene.set_up_direction("+z")`.
-- **Most MuJoCo → viser**: jeden węzeł na geom wizualny (grupy 0–2), siatka
-  z `model.mesh_vert` / `mesh_face` przez `geom_dataid`, poza co takt z
-  `data.geom_xpos` / `geom_xmat` w `server.atomic()`.
-- **Kamery w 3D**: `scene.add_camera_frustum(name, fov, aspect, image=..., wxyz, position)`;
-  `handle.image` da się podmieniać — miniatury na żywo na piramidach.
-  `fov = 2·atan(H / 2 / fy)`.
-- **Uchwyt końcówki**: `scene.add_transform_controls` → `on_update` → `kin.ik` →
-  `twin.set_target` (tylko przy włączonym sprzęgle).
-- **Zakładki**: Ramię (sim / port szeregowy, wykrywanie CH343 po VID `0x1A86`,
-  sprzęgło, STOP, dom, suwaki stawów z blokadą sprzężenia zwrotnego, chwytak) ·
-  Kamery (`probe_devices`, dodaj/usuń, podgląd, stan kalibracji) · Kalibracja
-  (zmierzony bok taga, arkusz przez `send_file_download`, sesja w wątku z paskiem
-  postępu, `apply_fit` + zapis + przebudowa sceny) · Sim↔Real (nałożenie kadru
-  i renderu z suwakiem przezroczystości, mapa stołu) · RL.
-- Pod spodem jest gotowy `runtime.Twin`: `connect(backend, port, go_home=False)`,
-  `set_engaged`, `set_target`, `move`, `home`, `estop`, `status`, `lock`.
-
-### 5.3 Kalibracja na prawdziwym ramieniu
-
-Kawałki istnieją; brakuje polecenia i intrynsyk.
-
-1. **Najpierw intrynsyki** — `twin/calib/intrinsics.py` (ChArUco w OpenCV).
-   Do tej pory kamera ma nominalne K z 65° pola widzenia; z takim K pozy kamer
-   będą obciążone.
-2. Potem sesja:
-   ```python
-   ws = Workspace.load(); tw = Twin(ws); tw.connect("feetech", "COM12")
-   tw.cameras.sync()
-   card = ws.card_obj(); nominal = card.nominal(pinch_point(RobotKinematics(ws.spec())))
-   checker = CollisionChecker(sc.build(ws.scene_config(with_card=True, card_pose=nominal, card_collider=0.012)))
-   intr = {c.name: c.intrinsics() for c in ws.cameras if c.enabled}
-   fit = Session(tw, tw.cameras, intr, tw.scene.kin, card, nominal, checker).run(print)
-   ws.apply_fit(fit); ws.save()
-   ```
-   Karta musi być w szczękach **przed** startem — pierwszy ruch zamyka chwytak.
-   Stół w bliźniaku musi się zgadzać z prawdziwym (wysokość podstawy = blat).
-
-### 5.4 Rekonstrukcja 3D z biurka i dobór chwytu
-
-Raport: **[docs/RESEARCH_3D.md](docs/RESEARCH_3D.md)**, prototypy z pomiarami:
-[`research/3d/`](research/3d/). Najważniejsze:
-
-- **Pierwszy krok bez sieci neuronowych, na CPU**: maski z różnicy względem
-  pustego stołu + render ramienia z bliźniaka → wspólna otoczka wizualna ze
-  znanych póz kamer (1,3–2,3 s, 94–100% pokrycia bryły) → CoACD → obiekt
-  w scenie → chwyt analityczny sprawdzony w MuJoCo.
-- **Piksele ramienia to „nie wiem", nie tło** — inaczej otoczka gubi do 85% obiektu.
-- **SO-101 chwyta tylko w pionowej płaszczyźnie przez oś podstawy** (5 osi);
-  z góry dla r = 15–30 cm, z boku dopiero od 25 cm. Szczęka na zawiasie:
-  klocek 60 mm chwycony w środku wypada, przesunięty na stałą szczękę — trzyma.
-- Z Mety: SAM 3.1 (maski z tekstu), MapAnything (jedyny, który bierze nasze
-  pozy kamer i daje skalę; wariant wag na Apache), SAM 3D Objects (domykanie
-  kształtu, ≥ 32 GB — na Sparku, ale kaolin trzeba zbudować pod sm_121).
-- Do rozstrzygnięcia: komercyjność projektu (połowa modeli ma licencje NC).
-
-### 5.5 Drobniejsze
-
-- Wykrywanie portu ramienia po VID `0x1A86` — numer COM zmienia się między sesjami.
-- Pętla 28 Hz na Windows zamiast 50 — zbadać.
-- Kalibracja kamery na nadgarstku (oko-w-dłoni) — solver trzeba odwrócić:
-  kamera jedzie z chwytakiem, karta stoi na stole.
+1. **Test na sprzęcie** według [docs/TWIN.md](docs/TWIN.md) — kroki 0–8.
+   Najpierw połączenie i suwaki, potem intrynsyki, położenie, sim-real,
+   identyfikacja, dopiero potem polityki.
+2. **Po identyfikacji douczyć polityki** (`--init`, w panelu *Start z
+   polityki*) — domyślne są uczone wokół modelu Menagerie. Douczanie zamiast
+   uczenia od zera: `lift` z modelem percepcji od zera po 220 iteracjach miała
+   0% sukcesu, a douczana z `lift-v1` startuje od umiejętności chwytu.
+3. **Obserwacje obrazowe w RL** — renderer MuJoCo Warp (wsadowy, na GPU)
+   zgadza się z OpenGL do 0,05 px; środowisko obrazowe to kolejny krok
+   (mapa stołu z kamer jako wejście, jak w galaxeo).
+4. **Kalibracja oko-w-dłoni** (`wrist_cam`) — solver odwrócony: karta na stole.
+5. **Rekonstrukcja 3D przedmiotów** — [docs/RESEARCH_3D.md](docs/RESEARCH_3D.md);
+   MuJoCo Warp ma render gaussian splats, co pozwala wstawić zeskanowany
+   przedmiot do renderu treningowego.
+6. Solver kalibracji bez odpornej funkcji straty — jedna zła obserwacja potrafi
+   podnieść residuum do 1 px (ziarno 4 w `calib-sim`); warto dodać odrzucanie.
 
 ---
 
-## 6. Pytania do rozstrzygnięcia
+## 5. Pytania do rozstrzygnięcia
 
-1. **Licencja galaxeo-manipulators.** Repozytorium nie ma pliku licencji.
-   `calib/tags.py`, `calib/handeye.py` i idea `calib/topdown.py` są przeniesione
-   z atrybucją do tego repo (Apache-2.0). Zakładamy zgodę machinekind — do potwierdzenia.
-2. Które zadania RL są priorytetem (reach / lift / pick-and-place / nalewanie jak w galaxeo)?
-3. Jakie kamery trafią na stanowisko (model, rozdzielczość) i czy nadgarstkowa?
-4. Trening na Sparku: MJX / MuJoCo Warp (tysiące środowisk na GPU) czy wektory CPU?
+1. **Licencja galaxeo-manipulators** — `calib/tags.py`, `calib/handeye.py`
+   i idea `calib/topdown.py` przeniesione z atrybucją; zakładamy zgodę machinekind.
+2. Które zadania po `reach` i `lift`: pick-and-place, nalewanie, sortowanie?
+3. Jakie kamery trafią na stanowisko i czy przepuszczanie USB kamer przez
+   Shadow wystarcza przepustowością (kilka strumieni MJPEG) — jeśli nie,
+   kamery trzeba będzie puścić siecią tak jak ramię.
+4. Czy Shadow widzi komputer przy ramieniu (Tailscale?) — od tego zależy
+   wybór: przepuszczenie USB czy most.
 
 ---
 
-## 7. Sprzęt
+## 6. Sprzęt
 
 | | ramię nr 1 (sierpień) | ramię nr 2 (wrzesień, bieżące) |
 |---|---|---|
@@ -231,19 +144,33 @@ i ramię ruszy.
 
 ---
 
-## 8. Pułapki, które cicho psują sim-2-real
+## 7. Pułapki, które cicho psują sim-2-real
 
-Każda jest teraz pilnowana testem albo poprawiona w kodzie — ale warto je znać
-przy kolejnym ramieniu, kamerze czy wersji bibliotek:
+Każda jest pilnowana testem albo poprawiona w kodzie:
 
 - **Znak punktu głównego w MuJoCo** — przy odwrotnym kadr przesuwa się o
   dwukrotność przesunięcia (62 px przy 30 px).
-- **Półpiksel w pionie w renderze MuJoCo** — stale 0,5 px wyżej niż rzut K.
+- **Fałszywy półpiksel w pionie** — dawna „kompensacja” wynikała z pomiaru
+  na środkach czerwonych plam, które podnosi cień dolnej połowy kulki. Mierzyć
+  geometrię trzeba na **maskach segmentacji**, nie na kolorze.
 - **Półpiksel w detektorze AprilTag** — `CORNER_REFINE_APRILTAG` oddaje rogi
-  w konwencji narożników pikseli; poprawka przepołowiła błąd obrotu kamery.
-  Dotyczy też galaxeo.
-- **`CameraStream` z aplikacji odbija obraz lustrzanie** (wygodne przy dłoni);
-  bliźniak otwiera kamery z `mirror=False`.
+  w konwencji narożników pikseli. Dotyczy też galaxeo.
+- **Zmiana masy w skompilowanym modelu bez `mj_setConst`** — stałe kontaktu
+  (`body_invweight0`) zostają od starej masy; kostka ściśnięta między szczęką
+  a blatem wylatywała z prędkością 10–180 m/s. Na GPU: `mjw.set_const`.
+- **Torch z PyPI na Windows nie ma CUDA** — koło z indeksu PyTorcha.
+- **`CameraStream` z aplikacji odbija obraz lustrzanie**; bliźniak otwiera
+  kamery z `mirror=False`.
 - **`MjSpec.attach` gubi opcje fizyki ramienia**, jeśli scena ich nie przejmie.
-- **Nadzór dociąga ramię do limitów z konfiguracji** przy połączeniu — ramię
-  stojące poza nimi „skoczy” o kilka stopni.
+- **Nadzór dociąga ramię do limitów z konfiguracji** przy połączeniu.
+- **Panel: poza każdego geomu 30×/s zrywała połączenie przeglądarki** (~3000
+  komunikatów/s) — most sceny wysyła pozy ciał i tylko przy zmianie, a siatki
+  do widoku są uproszczone (348 → 43 tys. trójkątów, 0,3 mm obrysu).
+- **Viser w ukrytej karcie przeglądarki nic nie rysuje** — klient przetwarza
+  komunikaty w pętli animacji; „pusty panel” w tle to nie błąd serwera.
+- **Polityka nauczona na prawdziwej pozycji obiektu nie przeżywa opóźnienia
+  percepcji** — patrz wyżej; każdy nowy obiekt z kamer musi mieć swój model
+  percepcji w treningu.
+- **Dopasowanie modelu „obiekt leży na blacie” do obiektu w powietrzu daje
+  pewne siebie bzdury** — bramka na jakość dopasowania (IoU), a obiekt w dłoni
+  z kinematyki.

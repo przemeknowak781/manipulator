@@ -16,11 +16,14 @@ gestów, zanim cokolwiek podłączysz.
                             └──────────────────────┘
 ```
 
-> **Nowe: cyfrowy bliźniak stanowiska.** Symulacja MuJoCo z kamerami
-> skalibrowanymi na prawdziwym biurku (karta z tagami w chwytaku, wiele kamer
-> naraz, 0,15 mm w symulacji), mapa stołu z wielu kamer i fundament pod
-> środowisko RL. Instrukcja: **[docs/TWIN.md](docs/TWIN.md)**, stan prac
-> i następne kroki: **[HANDOFF.md](HANDOFF.md)**.
+> **Nowe: cyfrowy bliźniak stanowiska z panelem w przeglądarce** (`lerobot-twin ui`).
+> Symulacja MuJoCo z kamerami skalibrowanymi na prawdziwym biurku (intrynsyki
+> z ChArUco, położenie wielu kamer z karty w chwytaku, wykrywanie przestawionej
+> kamery), mapa stołu i kostka z kamer na żywo, trening polityk na GPU
+> (MuJoCo Warp + PPO: `reach` w 2 min, `lift` w pół godziny), identyfikacja
+> dynamiki serw i uruchamianie polityk na ramieniu przez nadzór bezpieczeństwa.
+> Instrukcja i test na sprzęcie krok po kroku: **[docs/TWIN.md](docs/TWIN.md)**,
+> stan prac i decyzje: **[HANDOFF.md](HANDOFF.md)**.
 
 ---
 
