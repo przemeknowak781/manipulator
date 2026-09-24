@@ -132,8 +132,13 @@ odbierają ramię każdemu, a ramię zostaje w **zmierzonej** pozie: nie dociska
 do przeszkody, nie wraca skokiem do starego celu i nie cofa się (przy szybkim
 ruchu staje między zmierzoną pozą a ostatnim rozkazem). **Chwytak, który
 ściska, dalej ściska** — STOP ani Dom nie upuszczają trzymanej kostki; otwiera
-się go ręcznie suwakiem. Każde uruchomienie na prawdziwym ramieniu wymaga
-świeżego potwierdzenia.
+się go ręcznie suwakiem. **Połącz / Rozłącz puszczają trzymany przedmiot** na
+backendzie `feetech` (przy połączeniu serwa dostają cel = bieżąca pozycja) —
+przed nimi odłóż kostkę albo przytrzymaj ją ręką; w `sim` chwyt przetrwa.
+Każde uruchomienie na prawdziwym ramieniu wymaga świeżego potwierdzenia.
+STOP albo Dom wciśnięte w chwili startu polityki, fali czy identyfikacji
+wygrywają: zadanie nie weźmie ramienia pod aktywnym STOP-em i nie ruszy po
+*Skasuj STOP*.
 
 Pętla sama zatrzymuje ramię (STOP awaryjny, powód w pasku stanu), gdy:
 - serwo ramienia zgłosi błąd (przeciążenie, przegrzanie, napięcie, czujnik kąta);
@@ -233,13 +238,24 @@ dynamikę stanowiska*. Od teraz trening randomizuje wokół zmierzonego ramienia
 nie katalogu. Z tego ruchu wyznaczalne są **tłumienie, armatura i opóźnienie**
 — na ruchu z panelu (5 stawów, 20 s), dla 13 syntetycznych ramion spoza siatki
 startowej i szumu 0,05°: tłumienie do 10,5%, armatura do 8,2%, opóźnienie do
-1,9 ms; podawany przedział niepewności zawsze obejmował prawdziwy błąd.
+1,9 ms; podawany przedział niepewności zawsze obejmował prawdziwy błąd. Przy
+czasach jak na prawdziwym ramieniu (30 Hz z jitterem, odczyt co drugi takt)
+nagranie idzie z taktów pętli (`Twin.add_tick_listener`), więc wynik zostaje
+w tych granicach: tłumienie do 5%, armatura do 8%, opóźnienie do 1,3 ms
+(wcześniejsze znakowanie zegarem nagrywającego dawało do 38% i 4,4 ms). Wynik
+panel pokazuje z przedziałem przy każdej wartości i z backendem, na którym
+nagrano. Dopasowanie, które niczego nie wyjaśnia (błąd niewiele mniejszy od
+modelu nominalnego albo przedział > 30% / nieskończony), ma wyłączone *Zapisz*
+— zapis tylko po zaznaczeniu *Zapisz mimo to*, i taki wynik nie zalicza kroku 5.
+Trening poszerza zakres każdego dopasowanego parametru co najmniej do jego
+przedziału niepewności.
 Wzmocnienia serw i tarcia suchego ten ruch nie rozróżnia (kp 0,63 dopasowuje
 się tak samo dobrze jak 1,0) — zostają z modelu, panel pisze przy nich
 „z modelu”, a trening po identyfikacji losuje je szerzej: kp ×0,6–1,5, tarcie
 ×0,5–2,0. Dopasowanie trwa 7–11 s; STOP, *Połącz* i *Rozłącz* przerywają tylko
-nagrywanie — gotowe nagranie dopasowuje się do końca. Nagranie z martwą pętlą
-albo nieświeżymi odczytami jest odrzucane.
+nagrywanie — gotowe nagranie dopasowuje się do końca; przerwane świadomie
+(STOP, Dom, Połącz) panel pokazuje jako *Przerwane*, nie jako błąd. Nagranie
+z martwą pętlą albo nieświeżymi odczytami jest odrzucane.
 
 **6. Trening.** Najszybciej: **douczanie** gotowych polityk na zmierzonej
 dynamice — zakładka Trening, *Start z polityki* `reach-v3` / `lift-v3`,
@@ -352,9 +368,12 @@ i co 2 s porównuje z nim bieżący — korelacją fazową, z **ramieniem wycię
 maską z bliźniaka** (ruch ramienia daje 0,4 px „przesunięcia”, obrót kamery
 o 1° — 9,8 px). Oprócz przesunięcia łapie **obrót wokół osi kamery i zmianę
 skali** (dopasowanie podobieństwa na piramidzie ¼–½ kadru); miarą jest
-największe przesunięcie narożnika kadru. Ruch ramienia daje najwyżej 0,76 px,
-przybliżenie o 1% — 3,7–4,4 px (prawda 4), obrót o 1° — 6,8–7,5 px (prawda 7).
-Sprawdzenie kosztuje 10–20 ms na kamerę. Powyżej 3 px piramida robi się czerwona i panel
+największe przesunięcie narożnika kadru, a dopasowanie jest odporne (wagi
+Tukeya): ręka albo tułów w kadrze nie udają ruchu kamery (ręka na 10–20 %
+kadru: ≤ 0,6 px; wcześniej do 59 px). Ruch ramienia daje ≤ 0,1 px (wcześniej
+do ok. 1,3 px), przybliżenie o 1% — 3,9–4,5 px (prawda 4), obrót o 1° —
+6,7–6,9 px (prawda 7). Alarm „przestawiona” wymaga **dwóch kolejnych
+zgodnych** sprawdzeń. Sprawdzenie kosztuje ok. 15 ms na kamerę. Powyżej 3 px piramida robi się czerwona i panel
 proponuje szybką relokalizację (krótka fala tylko dla tej kamery). Klatka
 starsza niż 1 s nie jest kadrem — zamrożony albo martwy strumień panel pokazuje
 jako błąd kamery i otwiera go na nowo.
@@ -401,7 +420,12 @@ Kostka (`perception.CubeDetector.detect_frames`):
    `n_cameras = -1` (z mapy) i `0` (ramię zasłania kostkę wszystkim) też są
    jednym świadkiem. Jeden świadek przy dłoni jest przyjmowany tylko przy
    pustej szczęce, gdy 3 wykrycia zgadzają się co do 1 cm, a TCP przesunął się
-   o ≥ 1,5 cm (kostka potrącona). Kostka, która wypadła z dłoni, opada na blat
+   o ≥ 1,5 cm (kostka potrącona) — albo gdy dłoń stoi, ale szczęka jest otwarta
+   szerzej niż 0,40 rad (47 mm; kostka trzymana w szczękach to ok. 0,20 rad,
+   więc duch kostki z dłoni tak nie przejdzie). Gdy kostka nie jest przyjęta,
+   źródło w panelu mówi dlaczego i co zrobić („brak (…)”). Na prawdziwym ramieniu
+   sprawdź, że kostka trzymana w szczękach daje kąt poniżej 0,40 rad. Kostka,
+   która wypadła z dłoni, opada na blat
    („upuszczona”). Wykrycie ma czas kadru (`t`); stare i powtórzone nie
    przedłużają życia kostki. Zamknięta pętla z `lift-v3`: sama kamera `a` —
    17/17 ułożeń, kamery `a`+`b` — 14/14.

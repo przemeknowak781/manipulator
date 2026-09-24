@@ -271,5 +271,7 @@ def _finish(ac: ActorCritic, prog: Progress, path: Path | None) -> Policy:
 
 def _rand_dict(r: Randomization) -> dict[str, Any]:
     d = asdict(r)
-    d["centre"] = asdict(r.centre)
+    # Dynamics.to_dict: niepewnosc inf jako "inf" - asdict dalby Infinity w config.json/meta.json,
+    # ktorego scisly JSON (przegladarka panelu) nie czyta.
+    d["centre"] = r.centre.to_dict()
     return d

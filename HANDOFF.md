@@ -124,6 +124,15 @@ jednego świadka kostki przy dłoni, skalę w strażniku kamer (10–20 ms na
 kamerę zamiast do 300 ms), pozę kamery oceniania względem K użytego w fali,
 znacznik `render` dla maszyn bez GPU.
 
+Trzecia runda (po drugiej weryfikacji): pętla po przerwie łącza czeka na dwa
+zgodne odczyty (spóźniona odpowiedź sprzed przestoju nie cofa ramienia),
+strażnik rozjazdu nie myli wolniejszego serwa z kolizją, STOP po błędzie
+chwytaka da się skasować i nie ściska dalej, STOP nie domyka zamykającego się
+chwytaka, backend `lerobot` łączy się z plikiem kalibracji (wcześniej nigdy),
+STOP / Dom w chwili startu polityki wygrywają z nią, identyfikacja nagrywa
+z taktów pętli i nie pozwala zapisać dopasowania, które nic nie wyjaśnia,
+strażnik kamer nie myli ręki w kadrze z ruchem kamery.
+
 Polityki uczone przed poprawkami (inny chwytak, inne obserwacje, epizod `lift`
 bez końca) zastąpione douczonymi `reach-v3` (CPU 100% / 100%, 1,2 mm, nadgarstek bez obrotów do limitu) i
 `lift-v3` (CPU 100% / 100%, z kamer 8/8, kostka ~11 cm zamiast 17). Przy tym

@@ -526,3 +526,13 @@ def test_runner_drives_the_simulated_arm_through_the_supervisor():
         assert twin.joints()["shoulder_pan"] > start + 5.0
     finally:
         twin.close()
+
+
+def test_policy_metadata_stays_strict_json_with_an_infinite_band():
+    """Dopasowanie bez niepewnosci (band inf) szlo do meta.json jako Infinity - panel go nie czytal."""
+    import json
+
+    from lerobot_mp.twin.rl.ppo import _rand_dict
+
+    dyn = Dynamics(damping=1.2, fitted=("damping",), band={"damping": float("inf")}, source="identyfikacja")
+    json.dumps(_rand_dict(Randomization.around(dyn)), allow_nan=False)
