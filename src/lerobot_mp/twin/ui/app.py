@@ -36,6 +36,7 @@ from ..kinematics import inverse, pose
 from ..perception import CubeDetector, CubeTracker, TableMapper
 from ..runtime import Twin
 from ..workspace import CameraRecord, Workspace, nominal_K
+from . import guide as gd
 from . import jobs
 from .bridge import SceneMirror, mat_to_wxyz
 from .watch import CameraWatch, arm_mask, distort_mask
@@ -90,6 +91,53 @@ CUBE_COLORS = {"czerwona": ((0, 120, 70), (12, 255, 255), (170, 120, 70), (180, 
                "zielona": ((40, 80, 60), (85, 255, 255), (40, 80, 60), (85, 255, 255)),
                "niebieska": ((95, 100, 60), (130, 255, 255), (95, 100, 60), (130, 255, 255)),
                "zolta": ((20, 100, 90), (35, 255, 255), (20, 100, 90), (35, 255, 255))}
+
+
+#: "Jak uzywac" na gorze kazdej zakladki: kolejnosc dzialan w tej zakladce.
+TAB_HELP = {
+    "Ramie": (
+        "1. **Polaczenie**: Ramie = sim (proba bez sprzetu) albo feetech (SO-101), Port, **Polacz** - przy "
+        "pierwszym polaczeniu bez jazdy do domu.\n"
+        "2. Suwaki pokazuja zmierzone katy. Ruch: zaznacz **Sprzeglo** i przesun jeden suwak o kilka stopni.\n"
+        "3. **Uchwyt koncowki w 3D** - to samo myszka (tez tylko ze sprzeglem).\n"
+        "4. **Pozycja domowa** i **STOP** odbieraja ramie kazdemu; po STOP-ie **Skasuj STOP**.\n"
+        "5. **Stanowisko (stol)**: zmierz blat i polozenie podstawy, **Zastosuj**."),
+    "Kamery": (
+        "1. **Dodaj kamere**: USB (**Szukaj kamer USB**, **Dodaj kamere USB**) albo symulowana "
+        "(przed ramieniem / w miejscu widoku 3D).\n"
+        "2. Tabela: zrodlo, K i poza. Piramidy w 3D: zielona = zaufana, pomaranczowa = niezaufana, "
+        "czerwona = przestawiona.\n"
+        "3. **Wybrana kamera**: podglad, wlacz/wylacz, przesuwanie symulowanej w 3D, usuwanie.\n"
+        "4. Dalej: zakladka **Kalibracja**."),
+    "Kalibracja": (
+        "1. Kazda prawdziwa kamera - **Intrynsyki**: arkusz tablicy, zmierzony bok kwadratu, **Zbieraj kadry**, "
+        "**Oblicz i zapisz K**.\n"
+        "2. Wszystkie kamery naraz - **Polozenie**: arkusz karty, zmierzony bok taga, karta w szczekach, "
+        "potwierdzenie, **Start fali**, **Zapisz wynik kalibracji**.\n"
+        "3. Czerwona piramida (kamera przestawiona): **Szybka relokalizacja** i **Relokalizuj wybrana**.\n"
+        "4. **Przerwij** konczy fale (ramie wraca do domu) i zbieranie kadrow - bez zapisu."),
+    "Mapa": (
+        "Mapa dziala sama, gdy jest co najmniej jedna zaufana kamera (Kalibracja).\n"
+        "1. Sprawdz pokrycie blatu pod mapa.\n"
+        "2. Wybierz **Kolor kostki**, poloz kostke 3 cm przed ramieniem - ma sie pojawic ramka i polozenie.\n"
+        "3. **lift** z kamer (Polityki) potrzebuje wlaczonych **Mapy na zywo** i **Szukaj kostki**."),
+    "Trening": (
+        "1. **Dynamika serw**: polacz ramie, **Identyfikuj** (~20 s ruchu), **Zapisz jako dynamike stanowiska**.\n"
+        "2. Najszybciej douczanie: **Start z polityki** reach-v3 / lift-v3, 100-300 iteracji, **Ucz**.\n"
+        "3. Od zera: Zadanie, Iteracje (reach ~160, lift ~600), **Ucz**; postep na wykresie, "
+        "**Zatrzymaj** zapisuje polityke.\n"
+        "Trening idzie w osobnym procesie na GPU - ramieniem nie rusza."),
+    "Polityki": (
+        "1. Wybierz polityke - wyniki GPU i CPU pod lista; **Ewaluuj na CPU** nie rusza ramieniem.\n"
+        "2. Najpierw na ramieniu sim: **Uruchom**. Prawdziwe ramie: potwierdzenie przed kazdym uruchomieniem.\n"
+        "3. reach: przeciagaj zolta kulke celu w 3D. lift na prawdziwym ramieniu: kostka z **kamer**.\n"
+        "4. **Zatrzymaj** - ramie trzyma ostatni cel; **STOP** - zatrzymanie awaryjne."),
+    "Sim-Real": (
+        "1. **Kamera**: prawdziwa, z zaufana poza (Kalibracja).\n"
+        "2. **Krawedzie symulacji**: zolte krawedzie renderu na kadrze i mediana rozjazdu - do 3 px dobrze.\n"
+        "3. Wiecej: sprawdz bok taga i stol (Ramie > Stanowisko), powtorz fale.\n"
+        "Kamery symulowane porownuje sie z prawda w zakladce Kamery."),
+}
 
 
 def wxyz_to_mat(q) -> np.ndarray:
@@ -225,6 +273,12 @@ class TwinApp:
         self._tick_errors: set[str] = set()
         self.estimates: dict[str, Any] = {}
         self._dirty_save = 0.0                          # przeciaganie kamery: zapis po chwili spokoju
+        # Przewodnik: ostatnia mediana Sim-Real kazdej kamery, co juz jechalo na danym
+        # backendzie ("reach", "lift-kamery") i lista polityk z ostatniego odswiezenia
+        # (bez czytania dysku w kazdym takcie).
+        self._simreal_px: dict[str, float] = {}
+        self._ran: dict[str, set[str]] = {}
+        self._policy_list: list[dict] = []
         t_start = time.monotonic()
 
         # Serwer powstaje DOPIERO teraz, gdy cale ciezkie przygotowanie (scena, torch,
@@ -274,6 +328,7 @@ class TwinApp:
         self._sync_mirror()
         self.twin.cameras.sync()
         self._refresh_cameras()
+        self._guard("przewodnik", self._tick_guide)
         logger.info("Panel gotowy w %.1f s", time.monotonic() - t_start)
 
     # ================================================================ narzedzia
@@ -311,12 +366,23 @@ class TwinApp:
     def T_b2w(self) -> np.ndarray:
         return self.twin.scene.T_base2world
 
+    def _tab_help(self, tab: str) -> None:
+        """Zwinieta notka "Jak uzywac" na gorze zakladki (`TAB_HELP`)."""
+        with self.server.gui.add_folder("Jak uzywac", expand_by_default=False):
+            self.server.gui.add_markdown(TAB_HELP[tab])
+
     # ================================================================ naglowek
     def _build_header(self) -> None:
         g = self.server.gui
         self.status_md = g.add_markdown("**Blizniak** - uruchamianie...")
         stop = g.add_button("STOP", color="red", icon=viser.Icon.HAND_STOP,
-                            hint="Zatrzymanie awaryjne: ramie staje, polityka i fala sie koncza")
+                            hint="Zatrzymanie awaryjne, zawsze dostepne: ramie staje w zmierzonej pozie, polityka, "
+                                 "fala i nagranie identyfikacji sie koncza, sprzeglo gasnie. Sciskajacy chwytak "
+                                 "dalej sciska. Ruszyc dalej: Ramie > Skasuj STOP.")
+        # Przewodnik zawsze nad zakladkami: gdzie operator jest w procedurze (docs/TWIN.md,
+        # kroki 0-8) i jedna nastepna akcja. Logika w `guide.py`, tu tylko wyswietlanie.
+        with g.add_folder("Przewodnik", expand_by_default=True):
+            self.guide_md = g.add_markdown("")
 
         @stop.on_click
         async def _(event):
@@ -426,20 +492,77 @@ class TwinApp:
         warn_txt = f" | **Uwaga:** {'; '.join(warns)}" if warns else ""
         return f"**Ramie:** {arm} | **Kamery:** {cam_txt} | **Polityka:** {pol} | **Trening:** {tr}{warn_txt}"
 
+    # ------------------------------------------------------------ przewodnik
+    def _guide_snapshot(self) -> gd.GuideSnapshot:
+        """Stan panelu dla przewodnika - same odczyty z pamieci (bez dysku, renderu i kamer)."""
+        st = self.twin.status
+        connected = bool(st.connected)
+        backend = st.backend if connected else str(self.arm_backend.value)
+        simulated = bool(st.simulated) if connected else backend == "sim"
+        safety = self.twin.safety_state
+        estop = safety is not None and getattr(safety, "value", safety) == "ESTOP"
+        with self.frame_lock:
+            live = set(self.frames)
+        cams = []
+        for c in self.ws.cameras:
+            problem = c.intrinsics_problem()
+            cams.append(gd.CameraSnap(
+                c.name, c.simulated, c.enabled, has_frame=c.name in live, intrinsics_ok=not problem,
+                intrinsics_problem=problem, calibrated=c.calibrated, trusted=c.trusted,
+                reason=str(c.calibration.get("reason", "") or ""), moved=self.watch.moved(c.name),
+                simreal_px=self._simreal_px.get(c.name)))
+        runner = self.runner
+        running = runner is not None and runner.status.running
+        vision = runner is not None and runner.cube_provider == self._vision_cube
+        if runner is not None and runner.status.success and connected:
+            # Krok 7/8 zrobiony, gdy polityka na TYM backendzie choc raz doszla do celu.
+            self._ran.setdefault(backend, set()).add(runner.task.name + ("-kamery" if vision else ""))
+        jobs_on = (("fala kalibracyjna", self.calib_job.running), ("intrynsyki", self.intr_job.running),
+                   ("identyfikacja", self.sysid_job.running), ("trening", self.train.running),
+                   ("ewaluacja", self.eval_job.running))
+        dyn = self.ws.dynamics
+        return gd.GuideSnapshot(
+            connected=connected, backend=backend, simulated=simulated, arm_error=str(st.error or ""), estop=estop,
+            owner=self._busy(PANEL_OWNER), warnings=tuple(str(w) for w in (getattr(st, "warnings", None) or [])),
+            cameras=tuple(cams), dynamics=str(dyn.get("source") or "zmierzona") if dyn else "",
+            policies=tuple((p["name"], p["task"], bool(p.get("bundled"))) for p in self._policy_list),
+            jobs=tuple(n for n, on in jobs_on if on), policy_running=runner.task.name if running else "",
+            policy_from_cameras=running and vision, calib_result_pending=bool(self.calib_apply.visible),
+            dyn_result_pending=bool(self.dyn_keep.visible), ran=frozenset(self._ran.get(backend, ())),
+            intr_camera=str(self.intr_job.data.get("camera", "")) if self.intr_job.running else "")
+
+    def _tick_guide(self) -> None:
+        # Przypisanie tej samej tresci nic nie wysyla (`_skip_unchanged_markdown`).
+        self.guide_md.content = gd.render(gd.build(self._guide_snapshot()))
+
     # ================================================================== ramie
     def _build_arm(self) -> None:
         g = self.server.gui
+        self._tab_help("Ramie")
         with g.add_folder("Polaczenie"):
             self.arm_backend = g.add_dropdown("Ramie", ("sim", "feetech", "lerobot"), initial_value=self.ws.backend
                                               if self.ws.backend in ("sim", "feetech", "lerobot") else "sim",
-                                              hint="sim - blizniak jest ramieniem; feetech - serwa wprost przez port")
+                                              hint="sim - blizniak jest ramieniem (proba bez sprzetu); feetech - "
+                                                   "serwa SO-101 wprost przez port (do blizniaka ten); lerobot - "
+                                                   "przez kalibracje LeRobota (katy przesuniete). Dziala po Polacz.")
             self.arm_port = g.add_text("Port", self.ws.port or "",
-                                       hint="COM12, /dev/ttyACM0 albo socket://adres:5555 (most lerobot-mp-bridge)")
+                                       hint="Port dla feetech/lerobot: COM12, /dev/ttyACM0 albo "
+                                            "socket://adres:5555 (most lerobot-mp-bridge). Dla sim nieuzywany.")
             self.ports_md = g.add_markdown("")
-            scan = g.add_button("Wykryj porty", icon=viser.Icon.SEARCH)
-            self.arm_home_on_connect = g.add_checkbox("Po polaczeniu jedz do pozycji domowej", False)
-            connect = g.add_button("Polacz", icon=viser.Icon.PLUG_CONNECTED, color="green")
-            disconnect = g.add_button("Rozlacz", icon=viser.Icon.PLUG_CONNECTED_X)
+            scan = g.add_button("Wykryj porty", icon=viser.Icon.SEARCH,
+                                hint="Wypisuje porty USB-serial; przejsciowke CH343 (SO-101) wpisuje w pole Port, "
+                                     "gdy jest puste. Niczym nie rusza.")
+            self.arm_home_on_connect = g.add_checkbox(
+                "Po polaczeniu jedz do pozycji domowej", False,
+                hint="Zaznaczone: zaraz po Polacz ramie jedzie rampa do domu. Przy pierwszym polaczeniu "
+                     "prawdziwego ramienia zostaw odznaczone - ramie zostaje tam, gdzie stoi.")
+            connect = g.add_button("Polacz", icon=viser.Icon.PLUG_CONNECTED, color="green",
+                                   hint="Konczy wszystko, co jezdzi (polityka, fala, nagranie identyfikacji), "
+                                        "kasuje potwierdzenia i laczy wybrane ramie; bez jazdy do domu ramie "
+                                        "stoi. Backend i port zapisuje w stanowisku.")
+            disconnect = g.add_button("Rozlacz", icon=viser.Icon.PLUG_CONNECTED_X,
+                                      hint="Konczy polityke, fale i nagranie identyfikacji, odbiera ramie "
+                                           "wszystkim i rozlacza backend. Potwierdzenia trzeba potem dac od nowa.")
 
         @scan.on_click
         @self._safe
@@ -472,11 +595,19 @@ class TwinApp:
 
         with g.add_folder("Sterowanie"):
             self.arm_engage = g.add_checkbox("Sprzeglo: panel steruje ramieniem", False,
-                                             hint="Bez sprzegla ramie trzyma pozycje, a suwaki tylko pokazuja katy")
-            home = g.add_button("Pozycja domowa", icon=viser.Icon.HOME)
-            clear = g.add_button("Skasuj STOP", icon=viser.Icon.RESTORE)
+                                             hint="Panel bierze ramie: suwaki i uchwyt koncowki RUSZAJA ramieniem. "
+                                                  "Odmowa, gdy ramie ma polityka, fala albo identyfikacja; STOP, Dom "
+                                                  "i Polacz je gasza. Bez sprzegla suwaki tylko pokazuja katy.")
+            home = g.add_button("Pozycja domowa", icon=viser.Icon.HOME,
+                                hint="Odbiera ramie kazdemu (panel, polityka, fala, identyfikacja) i jedzie rampa "
+                                     "do domu - RUSZA ramieniem. Sciskajacy chwytak zostaje zamkniety.")
+            clear = g.add_button("Skasuj STOP", icon=viser.Icon.RESTORE,
+                                 hint="Kasuje STOP awaryjny (takze od bledu serwa). Najpierw usun przyczyne; ramie "
+                                      "samo nie rusza, ale nastepne polecenia juz przejda.")
             self.tcp_gizmo_on = g.add_checkbox("Uchwyt koncowki w 3D", False,
-                                               hint="Przeciagnij koncowke; katy liczy odwrotna kinematyka")
+                                               hint="Strzalki na koncowce w 3D. Ze sprzeglem przeciaganie rusza "
+                                                    "ramieniem (IK, sama pozycja); skok stawu > 15 st. jest "
+                                                    "odrzucany - ciagnij malymi krokami.")
             self.tcp_md = g.add_markdown("")
             spec = self.ws.spec()
             kin = self.twin.scene.kin
@@ -489,7 +620,13 @@ class TwinApp:
                     # Zaokraglone do 0,5 st. do srodka zakresu MJCF - ladne liczby na suwaku, zadnej poza zakresem.
                     lo = float(np.ceil(np.degrees(kin.lo[k]) * 2) / 2)
                     hi = float(np.floor(np.degrees(kin.hi[k]) * 2) / 2)
-                s = g.add_slider(name, lo, hi, 0.5, float(np.clip(spec.home.get(name, 0.0), lo, hi)))
+                if name == spec.gripper:
+                    tip = ("Chwytak 0..100: 0 = szczeki zamkniete, 100 = otwarte (tiki serwa jak w feetech). Ze "
+                           "sprzeglem ustawia cel - tak otwierasz chwytak, ktory po STOP-ie dalej sciska.")
+                else:
+                    tip = (f"Kat stawu [st.], zakres {lo:g}..{hi:g}. Ze sprzeglem ustawia cel (ramie jedzie przez "
+                           f"nadzor); bez sprzegla pokazuje zmierzony kat.")
+                s = g.add_slider(name, lo, hi, 0.5, float(np.clip(spec.home.get(name, 0.0), lo, hi)), hint=tip)
                 self.sliders[name] = s
                 self.slider_range[name] = (lo, hi)
 
@@ -565,14 +702,21 @@ class TwinApp:
             g.add_markdown("Blat i to, gdzie na nim stoi podstawa - zmierz na biurku. Kamery sa "
                            "skalibrowane wzgledem PODSTAWY, wiec zmiana stolu ich nie rusza.")
             self.tab_size = g.add_vector2("Blat: szerokosc, glebokosc [m]", tuple(t.size), min=(0.2, 0.2),
-                                          max=(3.0, 3.0), step=0.01)
+                                          max=(3.0, 3.0), step=0.01,
+                                          hint="Wymiary blatu [m] (0,2-3,0), zmierz na biurku. Dziala po Zastosuj.")
             self.tab_base = g.add_vector2("Podstawa od srodka blatu [m]", tuple(t.base_xy), min=(-1.5, -1.5),
-                                          max=(1.5, 1.5), step=0.005)
+                                          max=(1.5, 1.5), step=0.005,
+                                          hint="Gdzie stoi podstawa ramienia wzgledem srodka blatu, x i y [m]. "
+                                               "Dziala po Zastosuj.")
             self.tab_yaw = g.add_number("Obrot podstawy [st.]", float(np.degrees(t.base_yaw)), min=-180.0,
-                                        max=180.0, step=1.0)
+                                        max=180.0, step=1.0,
+                                        hint="Obrot podstawy wokol osi pionowej [st.], -180..180. Dziala po Zastosuj.")
             self.tab_h = g.add_number("Wysokosc blatu nad podloga [m]", float(t.height), min=0.3, max=1.5,
-                                      step=0.01)
-            apply_table = g.add_button("Zastosuj", icon=viser.Icon.CHECK)
+                                      step=0.01, hint="Wysokosc blatu [m] (0,3-1,5); zle ustawiona psuje Sim-Real. "
+                                                      "Dziala po Zastosuj.")
+            apply_table = g.add_button("Zastosuj", icon=viser.Icon.CHECK,
+                                       hint="Zapisuje stol i przebudowuje scene blizniaka. Ramieniem nie rusza, "
+                                            "kamer nie przestawia (sa wzgledem podstawy).")
 
         @apply_table.on_click
         @self._safe
@@ -665,27 +809,47 @@ class TwinApp:
     # ================================================================= kamery
     def _build_cameras(self) -> None:
         g = self.server.gui
+        self._tab_help("Kamery")
         self.cams_md = g.add_markdown("")
-        self.cam_pick = g.add_dropdown("Kamera", ("-",), initial_value="-")
+        self.cam_pick = g.add_dropdown("Kamera", ("-",), initial_value="-",
+                                       hint="Kamera, ktorej dotycza podglad i przyciski w Wybrana kamera.")
         self.cam_preview = g.add_image(np.zeros((240, 320, 3), np.uint8), label="Podglad", format="jpeg",
                                        jpeg_quality=70)
         self.cam_info = g.add_markdown("")
         with g.add_folder("Wybrana kamera"):
-            self.cam_enabled = g.add_checkbox("Wlaczona", True)
-            self.cam_move = g.add_checkbox("Przesuwaj w 3D (kamera symulowana)", False)
+            self.cam_enabled = g.add_checkbox("Wlaczona", True,
+                                              hint="Wylaczona kamera znika ze sceny, mapy, fali i Sim-Real, ale "
+                                                   "zostaje w stanowisku. Zmiana przebudowuje scene.")
+            self.cam_move = g.add_checkbox("Przesuwaj w 3D (kamera symulowana)", False,
+                                           hint="Tylko kamera symulowana: uchwyt w 3D - przeciagnij, zeby ja "
+                                                "przestawic (zmienia sie prawda, nie kalibracja).")
             here = g.add_button("Ustaw w miejscu widoku 3D", icon=viser.Icon.CAMERA_SELFIE,
-                                hint="Kamera symulowana staje tam, skad teraz patrzysz na scene")
+                                hint="Kamera symulowana staje tam, skad teraz patrzysz na scene 3D. "
+                                     "Prawdziwej kamery nie przestawia (odmowa).")
             remember = g.add_button("Zapamietaj kadr odniesienia", icon=viser.Icon.PHOTO_CHECK,
-                                    hint="Od tego kadru liczone jest wykrywanie przestawienia kamery")
-            truth = g.add_button("Symulowana: uznaj prawdziwa poze za kalibracje", icon=viser.Icon.CHECK)
-            remove = g.add_button("Usun kamere", icon=viser.Icon.TRASH, color="red")
+                                    hint="Biezacy kadr jako odniesienie: od niego straznik liczy przestawienie "
+                                         "kamery (co 2 s, prog 3 px). Po zapisie kalibracji robi sie samo.")
+            truth = g.add_button("Symulowana: uznaj prawdziwa poze za kalibracje", icon=viser.Icon.CHECK,
+                                 hint="Skrot w symulacji: kalibracja = prawdziwa poza kamery symulowanej "
+                                      "(zaufana), bez fali. Do proby procedury lepiej Start fali.")
+            remove = g.add_button("Usun kamere", icon=viser.Icon.TRASH, color="red",
+                                  hint="Usuwa wybrana kamere razem z jej kalibracja - od razu, bez pytania.")
         with g.add_folder("Dodaj kamere", expand_by_default=False):
-            probe = g.add_button("Szukaj kamer USB", icon=viser.Icon.SEARCH)
-            self.usb_pick = g.add_dropdown("Znalezione", ("-",), initial_value="-")
-            add_usb = g.add_button("Dodaj kamere USB", icon=viser.Icon.PLUS)
-            self.sim_fov = g.add_slider("Pole widzenia kamery sym. [st.]", 40.0, 90.0, 1.0, 62.0)
-            add_view = g.add_button("Dodaj symulowana w miejscu widoku 3D", icon=viser.Icon.CAMERA_PLUS)
-            add_front = g.add_button("Dodaj symulowana przed ramieniem", icon=viser.Icon.CAMERA_PLUS)
+            probe = g.add_button("Szukaj kamer USB", icon=viser.Icon.SEARCH,
+                                 hint="Szuka kamer USB, ktorych nie ma jeszcze w stanowisku. Na Shadow kamera "
+                                      "musi byc przepuszczona w kliencie.")
+            self.usb_pick = g.add_dropdown("Znalezione", ("-",), initial_value="-",
+                                           hint="Kamera z ostatniego Szukaj kamer USB: indeks i rozdzielczosc.")
+            add_usb = g.add_button("Dodaj kamere USB", icon=viser.Icon.PLUS,
+                                   hint="Dodaje wybrana kamere USB z nominalnym K - potem Kalibracja, krok 1.")
+            self.sim_fov = g.add_slider("Pole widzenia kamery sym. [st.]", 40.0, 90.0, 1.0, 62.0,
+                                        hint="Pionowe pole widzenia NOWEJ kamery symulowanej [st.], 40-90; "
+                                             "typowa kamera USB ok. 60.")
+            add_view = g.add_button("Dodaj symulowana w miejscu widoku 3D", icon=viser.Icon.CAMERA_PLUS,
+                                    hint="Nowa kamera symulowana 640x480 tam, skad patrzysz na scene 3D.")
+            add_front = g.add_button("Dodaj symulowana przed ramieniem", icon=viser.Icon.CAMERA_PLUS,
+                                     hint="Nowa kamera symulowana 640x480 ok. 0,55 m od ramienia, patrzaca na blat; "
+                                          "kolejne staja z innych stron.")
         self.cam_gizmo = self.server.scene.add_transform_controls("/uchwyt_kamery", scale=0.1, visible=False)
         self._found_usb: list[dict] = []
 
@@ -1084,31 +1248,58 @@ class TwinApp:
     # ============================================================= kalibracja
     def _build_calibration(self) -> None:
         g = self.server.gui
+        self._tab_help("Kalibracja")
         g.add_markdown("Kolejnosc dla nowej kamery: **1** intrynsyki (tablica w reku), **2** polozenie "
                        "(karta w chwytaku, ramie macha). Kamera symulowana ma znane K - wystarczy krok 2.")
         with g.add_folder("1. Intrynsyki - tablica ChArUco"):
-            self.board_mm = g.add_number("Zmierzony bok kwadratu [mm]", 28.0, min=5.0, max=100.0, step=0.1)
-            sheet = g.add_button("Pobierz arkusz tablicy (A4, PNG)", icon=viser.Icon.DOWNLOAD)
-            self.intr_cam = g.add_dropdown("Kamera", ("-",), initial_value="-")
-            start = g.add_button("Zbieraj kadry", icon=viser.Icon.PLAYER_RECORD)
-            solve = g.add_button("Oblicz i zapisz K", icon=viser.Icon.CALCULATOR, color="green")
+            self.board_mm = g.add_number("Zmierzony bok kwadratu [mm]", 28.0, min=5.0, max=100.0, step=0.1,
+                                         hint="Bok kwadratu tablicy zmierzony linijka na wydruku [mm] "
+                                              "(nominalnie 28). Zly bok = zla skala K.")
+            sheet = g.add_button("Pobierz arkusz tablicy (A4, PNG)", icon=viser.Icon.DOWNLOAD,
+                                 hint="PNG tablicy ChArUco z bokiem jak wyzej. Drukuj w skali 100%.")
+            self.intr_cam = g.add_dropdown("Kamera", ("-",), initial_value="-",
+                                           hint="Kamera, z ktorej zbierasz kadry tablicy (prawdziwa - "
+                                                "symulowana zna swoje K).")
+            start = g.add_button("Zbieraj kadry", icon=viser.Icon.PLAYER_RECORD,
+                                 hint="Zbiera kadry tablicy z wybranej kamery; kadr zapisuje sie sam, gdy wnosi nowe "
+                                      "ujecie. Pokazuj tablice w rogach, blizej, dalej, pochylona (12+ kadrow). "
+                                      "Ramieniem nie rusza.")
+            solve = g.add_button("Oblicz i zapisz K", icon=viser.Icon.CALCULATOR, color="green",
+                                 hint="Konczy zbieranie, liczy K i dystorsje i zapisuje w kamerze (dobrze: residuum "
+                                      "do 0,6 px). Poza liczona z poprzednim K przestaje byc zaufana.")
             self.intr_md = g.add_markdown("")
             self.intr_img = g.add_image(np.zeros((240, 320, 3), np.uint8), format="jpeg", jpeg_quality=70,
                                         visible=False)
         with g.add_folder("2. Polozenie kamer - karta w chwytaku"):
             self.tag_mm = g.add_number("Zmierzony bok taga [mm]", float(self.ws.card_obj().tag_size * 1000),
-                                       min=10.0, max=120.0, step=0.1)
-            card = g.add_button("Pobierz arkusz karty (A4, PNG)", icon=viser.Icon.DOWNLOAD)
+                                       min=10.0, max=120.0, step=0.1,
+                                       hint="Bok taga na karcie zmierzony linijka [mm]. Uzywany przy fali; "
+                                            "zmieniony po fali blokuje zapis wyniku.")
+            card = g.add_button("Pobierz arkusz karty (A4, PNG)", icon=viser.Icon.DOWNLOAD,
+                                hint="PNG karty z dwoma tagami (300 dpi). Drukuj 100%, zegnij, wolny koniec w "
+                                     "szczeki (ok. 70 mm ma wystawac).")
             self.calib_confirm = g.add_checkbox("Karta w szczekach, przestrzen nad stolem wolna", False,
-                                                hint="Prawdziwe ramie: pierwszy ruch zamyka chwytak na karcie")
-            wave = g.add_button("Start fali (wszystkie wlaczone kamery)", icon=viser.Icon.WAVE_SINE, color="green")
-            self.reloc_cam = g.add_dropdown("Szybka relokalizacja kamery", ("-",), initial_value="-")
-            reloc = g.add_button("Relokalizuj wybrana (krotka fala)", icon=viser.Icon.CURRENT_LOCATION)
-            cancel = g.add_button("Przerwij", icon=viser.Icon.PLAYER_STOP)
+                                                hint="Prawdziwe ramie: potwierdzenie przed kazda fala (gasnie po "
+                                                     "starcie). Pierwszy ruch zamyka chwytak na karcie. W sim "
+                                                     "niepotrzebne.")
+            wave = g.add_button("Start fali (wszystkie wlaczone kamery)", icon=viser.Icon.WAVE_SINE, color="green",
+                                hint="RUSZA ramieniem: ~20 poz z karta, wszystkie wlaczone kamery z kadrem licza "
+                                     "swoja poze; na koniec ramie wraca do domu. Odmowa, gdy ramie ma polityka "
+                                     "albo identyfikacja.")
+            self.reloc_cam = g.add_dropdown("Szybka relokalizacja kamery", ("-",), initial_value="-",
+                                            hint="Przestawiona kamera (czerwona piramida) do krotkiej fali.")
+            reloc = g.add_button("Relokalizuj wybrana (krotka fala)", icon=viser.Icon.CURRENT_LOCATION,
+                                 hint="Krotka fala tylko dla wybranej kamery - RUSZA ramieniem; karta w szczekach "
+                                      "i potwierdzenie jak przy Start fali.")
+            cancel = g.add_button("Przerwij", icon=viser.Icon.PLAYER_STOP,
+                                  hint="Konczy fale (ramie wraca do domu, wyniku nie ma) i zbieranie kadrow "
+                                       "intrynsyk (K zostaje, jakie bylo).")
             self.calib_bar = g.add_progress_bar(0.0, animated=True, visible=False)
             self.calib_md = g.add_markdown("")
             apply = g.add_button("Zapisz wynik kalibracji", icon=viser.Icon.DEVICE_FLOPPY, color="green",
-                                 visible=False)
+                                 visible=False,
+                                 hint="Zapisuje pozy kamer z fali (z uzytym bokiem taga i K) i kadry odniesienia. "
+                                      "Niezaufane kamery zapisuja sie z powodem.")
             self.calib_apply = apply
 
         @sheet.on_click
@@ -1186,6 +1377,8 @@ class TwinApp:
                                f"- uruchom fale ponownie z nowym bokiem")
         self.ws.card["tag_size"] = used
         names = self.ws.apply_fit(fit, tag_size=used, intrinsics=self.calib_job.data.get("intrinsics"))
+        for n in names:
+            self._simreal_px.pop(n, None)               # nowa poza - Sim-Real do sprawdzenia od nowa
         self._save()
         self.twin.rebuild()
         for n in names:
@@ -1300,14 +1493,21 @@ class TwinApp:
     # ================================================================== mapa
     def _build_map(self) -> None:
         g = self.server.gui
+        self._tab_help("Mapa")
         g.add_markdown("Kadry wszystkich skalibrowanych kamer przerysowane na blat i zszyte - przedmiot na stole "
                        "trafia w swoje prawdziwe (x, y), skadkolwiek patrzy kamera.")
-        self.map_on = g.add_checkbox("Mapa na zywo", True)
-        self.map_3d = g.add_checkbox("Pokaz mape na blacie w 3D", True)
+        self.map_on = g.add_checkbox("Mapa na zywo", True,
+                                     hint="Zszywa kadry zaufanych kamer w mape blatu (ok. 3 razy na s). Wylaczenie "
+                                          "zatrzymuje polityke, ktora bierze kostke z kamer.")
+        self.map_3d = g.add_checkbox("Pokaz mape na blacie w 3D", True,
+                                     hint="Kladzie mape na blacie w widoku 3D - tylko widok.")
         self.map_img = g.add_image(np.zeros((224, 224, 3), np.uint8), label="Mapa blatu", format="jpeg",
                                    jpeg_quality=80)
-        self.cube_on = g.add_checkbox("Szukaj kostki", True)
-        self.cube_color = g.add_dropdown("Kolor kostki", tuple(CUBE_COLORS), initial_value="czerwona")
+        self.cube_on = g.add_checkbox("Szukaj kostki", True,
+                                      hint="Wykrywa kostke 3 cm w kolorze ponizej (piksele ramienia nie glosuja). "
+                                           "Potrzebne dla lift z kamer; wylaczenie zatrzymuje taka polityke.")
+        self.cube_color = g.add_dropdown("Kolor kostki", tuple(CUBE_COLORS), initial_value="czerwona",
+                                         hint="Kolor kostki dla detektora (progi HSV); dziala od razu.")
         self.map_md = g.add_markdown("")
         self.map_node = None
         self.cube_node = self.server.scene.add_box("/percepcja/kostka", color=(255, 80, 200), dimensions=(0.03,) * 3,
@@ -1423,20 +1623,36 @@ class TwinApp:
     # =============================================================== trening
     def _build_training(self) -> None:
         g = self.server.gui
+        self._tab_help("Trening")
         with g.add_folder("Nowy trening (PPO na GPU, MuJoCo Warp)"):
-            self.tr_task = g.add_dropdown("Zadanie", ("reach", "lift"), initial_value="reach")
-            self.tr_envs = g.add_dropdown("Swiatow naraz", ("1024", "2048", "4096", "8192"), initial_value="4096")
+            self.tr_task = g.add_dropdown("Zadanie", ("reach", "lift"), initial_value="reach",
+                                          hint="reach - koncowka do punktu; lift - chwyt i podniesienie kostki. "
+                                               "Przy Start z polityki zadanie bierze sie z polityki.")
+            self.tr_envs = g.add_dropdown("Swiatow naraz", ("1024", "2048", "4096", "8192"), initial_value="4096",
+                                          hint="Ile swiatow MuJoCo Warp naraz na GPU; 4096 sprawdzone na A4500, "
+                                               "wiecej = wiecej pamieci GPU.")
             self.tr_iters = g.add_number("Iteracje", 200, min=10, max=5000, step=10,
-                                         hint="reach: ~150 wystarcza (2 min); lift: 400-600 (15-25 min)")
-            self.tr_rand = g.add_checkbox("Randomizacja dziedziny", True)
+                                         hint="Iteracje PPO. Od zera: reach ok. 160 (~2,5 min), lift ok. 600 "
+                                              "(~30 min); douczanie 100-300.")
+            self.tr_rand = g.add_checkbox("Randomizacja dziedziny", True,
+                                          hint="Losuje dynamike serw, kostke i opoznienia wokol zmierzonej "
+                                               "dynamiki. Odznaczone = dokladnie zmierzona (model percepcji "
+                                               "kostki zostaje).")
             self.tr_spread = g.add_slider("Szerokosc randomizacji", 0.0, 2.0, 0.1, 1.0,
-                                          hint="Wokol dynamiki zmierzonej na ramieniu (ponizej)")
-            self.tr_name = g.add_text("Nazwa (puste = zadanie + data)", "")
+                                          hint="Mnoznik zakresow randomizacji (0-2, 1 = domyslne) wokol dynamiki "
+                                               "zmierzonej na ramieniu (Dynamika serw ponizej).")
+            self.tr_name = g.add_text("Nazwa (puste = zadanie + data)", "",
+                                      hint="Katalog nowej polityki; ta sama nazwa co istniejaca nadpisuje jej "
+                                           "przebieg.")
             self.tr_init = g.add_dropdown("Start z polityki", ("(od zera)",), initial_value="(od zera)",
-                                          hint="Douczanie - np. po identyfikacji dynamiki na ramieniu. "
-                                               "Zadanie bierze sie wtedy z polityki.")
-            start = g.add_button("Ucz", icon=viser.Icon.PLAYER_PLAY, color="green")
-            stop = g.add_button("Zatrzymaj (zapisze polityke)", icon=viser.Icon.PLAYER_STOP)
+                                          hint="Douczanie z wag wybranej polityki (np. reach-v3 / lift-v3 po "
+                                               "identyfikacji dynamiki), 100-300 iteracji. Zadanie bierze sie "
+                                               "wtedy z polityki.")
+            start = g.add_button("Ucz", icon=viser.Icon.PLAYER_PLAY, color="green",
+                                 hint="Trening w osobnym procesie na GPU (pierwsza iteracja po ~20 s kompilacji). "
+                                      "Ramieniem nie rusza; drugi trening naraz - odmowa.")
+            stop = g.add_button("Zatrzymaj (zapisze polityke)", icon=viser.Icon.PLAYER_STOP,
+                                hint="Konczy trening i zapisuje polityke z miejsca, w ktorym stanal.")
             self.tr_bar = g.add_progress_bar(0.0, animated=True, visible=False)
             self.tr_md = g.add_markdown("")
             self.tr_plot = g.add_uplot(
@@ -1446,13 +1662,20 @@ class TwinApp:
                 scales={"y": uplot.Scale(range=(0, 1))})
         with g.add_folder("Dynamika serw (sim-to-real)"):
             self.dyn_md = g.add_markdown("")
-            ident = g.add_button("Identyfikuj na polaczonym ramieniu (~20 s ruchu)", icon=viser.Icon.ACTIVITY)
-            self.dyn_confirm = g.add_checkbox("Prawdziwe ramie: przestrzen wokol wolna", False)
+            ident = g.add_button("Identyfikuj na polaczonym ramieniu (~20 s ruchu)", icon=viser.Icon.ACTIVITY,
+                                 hint="RUSZA ramieniem ~20 s (ruchy po 12 st.; do pozy startowej 30 st./s), potem "
+                                      "7-11 s dopasowania bez ramienia. Odmowa, gdy ramie ma inne zadanie.")
+            self.dyn_confirm = g.add_checkbox("Prawdziwe ramie: przestrzen wokol wolna", False,
+                                              hint="Prawdziwe ramie: potwierdzenie przed kazda identyfikacja (gasnie "
+                                                   "po starcie). W sim niepotrzebne.")
             self.dyn_bar = g.add_progress_bar(0.0, visible=False)
             self.dyn_res = g.add_markdown("")
             keep = g.add_button("Zapisz jako dynamike stanowiska", icon=viser.Icon.DEVICE_FLOPPY, color="green",
-                                visible=False)
-            reset = g.add_button("Wroc do modelu Menagerie", icon=viser.Icon.RESTORE)
+                                visible=False,
+                                hint="Wynik identyfikacji staje sie dynamika stanowiska - srodkiem randomizacji "
+                                     "w kolejnych treningach.")
+            reset = g.add_button("Wroc do modelu Menagerie", icon=viser.Icon.RESTORE,
+                                 hint="Kasuje zapisana dynamike (bez pytania): trening wraca do modelu Menagerie.")
             self.dyn_keep = keep
         self._show_dynamics()
 
@@ -1572,20 +1795,38 @@ class TwinApp:
     # =============================================================== polityki
     def _build_policies(self) -> None:
         g = self.server.gui
-        self.pol_pick = g.add_dropdown("Polityka", ("-",), initial_value="-")
-        refresh = g.add_button("Odswiez liste", icon=viser.Icon.REFRESH)
+        self._tab_help("Polityki")
+        self.pol_pick = g.add_dropdown("Polityka", ("-",), initial_value="-",
+                                       hint="Polityka do ewaluacji i uruchomienia: bazowe (reach-v3, lift-v3) i "
+                                            "nauczone na stanowisku.")
+        refresh = g.add_button("Odswiez liste", icon=viser.Icon.REFRESH,
+                               hint="Czyta liste polityk z dysku od nowa (np. po treningu z wiersza polecen).")
         self.pol_md = g.add_markdown("")
-        ev = g.add_button("Ewaluuj na CPU (zwykle MuJoCo, 50 epizodow)", icon=viser.Icon.CHART_BAR)
+        ev = g.add_button("Ewaluuj na CPU (zwykle MuJoCo, 50 epizodow)", icon=viser.Icon.CHART_BAR,
+                          hint="Epizody w zwyklym MuJoCo na CPU, bez randomizacji i z nia; wynik zapisuje w "
+                               "polityce. Ramieniem nie rusza.")
         self.pol_eval_md = g.add_markdown("")
         with g.add_folder("Uruchom na blizniaku"):
             self.pol_cube_src = g.add_dropdown("lift: skad polozenie kostki", ("symulacja", "kamery"),
                                                initial_value="symulacja",
-                                               hint="kamery = ta sama percepcja co na biurku (zakladka Mapa)")
-            self.pol_confirm = g.add_checkbox("Prawdziwe ramie: rozumiem, ze sie ruszy", False)
-            run = g.add_button("Uruchom", icon=viser.Icon.PLAYER_PLAY, color="green")
-            halt = g.add_button("Zatrzymaj", icon=viser.Icon.PLAYER_STOP)
-            new_goal = g.add_button("reach: losowy cel", icon=viser.Icon.TARGET)
-            new_cube = g.add_button("lift (sim): poloz kostke losowo", icon=viser.Icon.CUBE)
+                                               hint="Tylko lift. symulacja - kostka z blizniaka (tylko ramie sim); "
+                                                    "kamery - ta sama percepcja co na biurku (zakladka Mapa, zaufana "
+                                                    "kamera). Prawdziwe ramie: tylko kamery.")
+            self.pol_confirm = g.add_checkbox("Prawdziwe ramie: rozumiem, ze sie ruszy", False,
+                                              hint="Prawdziwe ramie: potwierdzenie przed kazdym Uruchom (gasnie po "
+                                                   "starcie). W sim niepotrzebne.")
+            run = g.add_button("Uruchom", icon=viser.Icon.PLAYER_PLAY, color="green",
+                               hint="Polityka jedzie na polaczonym ramieniu (przez nadzor) - RUSZA ramieniem. "
+                                    "Odmowa przy aktywnym STOP-ie albo gdy ramie ma fala / identyfikacja; "
+                                    "sprzeglo panelu gasnie.")
+            halt = g.add_button("Zatrzymaj", icon=viser.Icon.PLAYER_STOP,
+                                hint="Zatrzymuje polityke; ramie trzyma ostatni cel.")
+            new_goal = g.add_button("reach: losowy cel", icon=viser.Icon.TARGET,
+                                    hint="Nowy losowy cel z obszaru treningu (zolta kulka); gdy jedzie reach, "
+                                         "ramie za nim pojedzie. Cel mozna tez przeciagac w 3D.")
+            new_cube = g.add_button("lift (sim): poloz kostke losowo", icon=viser.Icon.CUBE,
+                                    hint="Tylko w blizniaku: kladzie kostke w losowym miejscu blatu symulacji "
+                                         "(dodaje ja do sceny, gdy jej nie ma). Ramieniem nie rusza.")
             self.pol_run_md = g.add_markdown("")
         self.goal_node = self.server.scene.add_icosphere("/cel", radius=0.012, color=(255, 196, 0), visible=False)
         self.goal_gizmo = self.server.scene.add_transform_controls("/cel_uchwyt", scale=0.08, disable_rotations=True,
@@ -1642,6 +1883,7 @@ class TwinApp:
     def _refresh_policies(self) -> None:
         from ..rl.policy import list_policies
         items = list_policies(self.policies_dir)
+        self._policy_list = items
         opts = tuple(p["name"] for p in items) or ("-",)
         cur = self.pol_pick.value
         self.pol_pick.options = opts
@@ -1844,11 +2086,17 @@ class TwinApp:
     # =============================================================== sim-real
     def _build_simreal(self) -> None:
         g = self.server.gui
+        self._tab_help("Sim-Real")
         g.add_markdown("Prawdziwy kadr i render blizniaka z TEJ SAMEJ kamery (skalibrowana poza, K, katy "
                        "zmierzone na serwach). Rozjazd krawedzi to blad kalibracji albo modelu - widac go od razu.")
-        self.sr_cam = g.add_dropdown("Kamera", ("-",), initial_value="-")
-        self.sr_alpha = g.add_slider("Przezroczystosc renderu", 0.0, 1.0, 0.05, 0.5)
-        self.sr_edges = g.add_checkbox("Krawedzie symulacji zamiast renderu", True)
+        self.sr_cam = g.add_dropdown("Kamera", ("-",), initial_value="-",
+                                     hint="Prawdziwa, skalibrowana kamera; render blizniaka z jej pozy i K.")
+        self.sr_alpha = g.add_slider("Przezroczystosc renderu", 0.0, 1.0, 0.05, 0.5,
+                                     hint="Udzial renderu w nakladce: 0 = sam kadr, 1 = sam render. Dziala przy "
+                                          "odznaczonych krawedziach.")
+        self.sr_edges = g.add_checkbox("Krawedzie symulacji zamiast renderu", True,
+                                       hint="Zolte krawedzie renderu na kadrze i mediana ich odleglosci od krawedzi "
+                                            "kadru [px]; do 3 px - kalibracja i model zgodne.")
         self.sr_img = g.add_image(np.zeros((240, 320, 3), np.uint8), format="jpeg", jpeg_quality=75)
         self.sr_md = g.add_markdown("")
 
@@ -1883,6 +2131,7 @@ class TwinApp:
             e_real = cv2.Canny(cv2.cvtColor(real, cv2.COLOR_RGB2GRAY), 60, 160)
             dt = cv2.distanceTransform(255 - e_real, cv2.DIST_L2, 3)
             score = float(np.median(dt[e_sim])) if e_sim.any() else float("nan")
+            self._simreal_px[name] = score                # przewodnik: krok 4 sprawdzony (albo nie)
             self.sr_md.content = f"mediana odleglosci krawedzi symulacji od krawedzi kadru: **{score:.1f} px**"
         else:
             out = cv2.addWeighted(real, 1 - a, sim, a, 0)
@@ -1949,6 +2198,8 @@ class TwinApp:
         self._tick_calibration()
         self._tick_training()
         self._tick_policies()
+        # Po zakladkach: wynik fali / identyfikacji do zapisu jest juz widoczny w tym takcie.
+        self._guard("przewodnik", self._tick_guide)
         return frames
 
     def _tick_watch(self, frames: dict[str, np.ndarray]) -> None:

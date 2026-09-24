@@ -65,7 +65,14 @@ lerobot-twin ui                  # http://localhost:8080
 lerobot-twin ui --host 0.0.0.0   # także z sieci — panel nie ma hasła, tylko w zaufanej sieci
 ```
 
-Stały **STOP** i pasek stanu nad zakładkami. Każdy ruch — z suwaków, z uchwytu
+Stały **STOP** i pasek stanu nad zakładkami, pod nimi **Przewodnik**: lista
+kroków pierwszego testu (niżej, 0–8) liczona z bieżącego stanu — ramię,
+kamery, K, pozy, Sim-Real, dynamika, polityki — i jedno **Teraz:** z zakładką
+i przyciskiem, plus blokady (aktywny STOP, kto ma ramię, ostrzeżenia). W
+symulacji prowadzi przez te same kroki z kamerami symulowanymi. Każda
+kontrolka ma podpowiedź po najechaniu (co robi, czy rusza ramieniem, jednostki),
+a każda zakładka zwiniętą notkę **Jak używać**. Logika przewodnika:
+`ui/guide.py` (bez visera, `tests/test_twin_guide.py`). Każdy ruch — z suwaków, z uchwytu
 w 3D, z polityki, z fali kalibracyjnej, z identyfikacji — idzie przez
 `runtime.Twin` i jego `SafetySupervisor`.
 
@@ -433,6 +440,7 @@ src/lerobot_mp/twin/
 └── ui/
     ├── app.py         panel (viser)
     ├── bridge.py      scena MuJoCo w przeglądarce (węzeł na ciało)
+    ├── guide.py       przewodnik: kroki procedury i następna akcja ze stanu panelu
     ├── jobs.py        zadania w tle: trening (proces), kalibracje, identyfikacja
     └── watch.py       wykrywanie przestawionej kamery
 
