@@ -343,9 +343,9 @@ def run_sysid(job: Job, twin) -> Any:
         rec = record(twin, excitation(home), on_tick=lambda p: setattr(job, "progress", 0.4 * p),
                      should_stop=job.cancel.is_set, take=False)
     finally:
-        if twin.owner == SYSID_OWNER:
-            twin.set_engaged(False)
-            twin.release(SYSID_OWNER)
+        # Sprawdzenie wlasciciela i sprzeglo razem, pod blokada wlasnosci w `Twin` - patrz `sysid.record`.
+        twin.set_engaged(False, owner=SYSID_OWNER)
+        twin.release(SYSID_OWNER)
     if not job.protect():
         job.message = "przerwane w trakcie nagrania - nagranie odrzucone"
         return None

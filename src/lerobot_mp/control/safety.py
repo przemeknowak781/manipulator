@@ -211,7 +211,12 @@ class SafetySupervisor:
             for name in JOINT_NAMES:
                 alpha = _smoothstep((self._ramp_t - self._ramp_start.get(name, 0.0)) / self._ramp_duration)
                 target[name] = self._ramp_from[name] + alpha * (self._ramp_to[name] - self._ramp_from[name])
-            if self._ramp_t >= self._ramp_duration + max(self._ramp_start.values(), default=0.0):
+            # Staw spoza limitow (tylko blizniak, `keep_outside`) konczy rampe dopiero po
+            # powrocie w zakres i wlasnej rampie stamtad. Zmierzone: wrist_roll 45 st. za
+            # limitem (powrot 15 st./s dluzszy niz rampa 2,5 s) - Dom konczyl sie (IDLE)
+            # z rozkazem 158 st., a poza ACTIVE poszerzone limity zostaja, wiec staw
+            # zostawal poza zakresem. Aplikacja dloni `_soft` nie ma - bez zmian.
+            if not self._soft and self._ramp_t >= self._ramp_duration + max(self._ramp_start.values(), default=0.0):
                 self.state = SafetyState.IDLE
                 self._was_active = False
             return target

@@ -24,7 +24,8 @@ Straznicy, ktorych srodowisko treningowe nie ma, a prawdziwe ramie potrzebuje:
 * **koniec po sukcesie** - `end_on_success` taktow sukcesu z rzedu konczy
   epizod (lift: kostka nad blatem), zamiast pozwalac polityce krecic ramieniem
   z kostka do limitow stawow przez reszte epizodu; sukces lift liczy sie tylko
-  z pozy swiezej (kamery albo "w dloni"), nigdy z "ostatnie widziane";
+  z pozy swiezej (kamery albo "w dloni"), nigdy z "ostatnie widziane", i tylko
+  gdy szczeka trzyma (stoi, ciasniej rozkazana, nie domyka sie w trakcie serii);
 * **cel reach w obszarze treningu** - cel spoza niego (pod blatem, za
   podstawa) jest rzutowany na obszar, z ktorego losowano cele w treningu.
 """
@@ -127,6 +128,13 @@ class PolicyRunner:
         self._t_start: float | None = None
         self._t_hz, self._ticks = 0.0, 0
         self._cube: np.ndarray | None = None
+        #: Szczeka "trzyma" (sukces lift): jak w `CubeTracker` - stoi (< `grip_still` rad miedzy
+        #: taktami), szerzej niz rozkaz o `grip_block_margin` i niz zamknieta o `grip_open_margin`.
+        self.grip_still, self.grip_block_margin, self.grip_open_margin = 0.02, 0.05, 0.05
+        #: W trakcie serii sukcesu szczeka nie domyka sie o wiecej niz tyle [rad] (~3 jednostki).
+        self.grip_creep = 0.03
+        self._grip_prev: float | None = None
+        self._streak_grip = 0.0
 
     # ------------------------------------------------------------------ cel
     @property
@@ -176,6 +184,7 @@ class PolicyRunner:
         self.prev_action = np.zeros(6)
         self.status = RunnerStatus(running=True, goal_clamped=self.status.goal_clamped)
         self._cube, self._cube_src = None, None
+        self._grip_prev = None
         self._stop.clear()
         self._t_start, self._ticks = None, 0            # zegar startuje z pierwszym taktem
         # Sprzeglo tylko, jesli ramie wciaz nasze - sprawdzenie i wlaczenie razem w `Twin`.
@@ -259,6 +268,7 @@ class PolicyRunner:
                 self._halt(f"ramie nie nadaza za celem ({np.degrees(lag):.0f} st.) - kolizja albo blokada",
                            hold_measured=True)
                 return False
+            holding = self._jaw_holding(q[5])
             obs = self.observation(measured)
             action = self.policy.act(obs)
             q_cmd = tk.apply_action(np, self.task, self.limits, self.q_cmd[None], action[None])[0]
@@ -274,9 +284,20 @@ class PolicyRunner:
                 st.success = st.distance < self.task.success_dist
             else:
                 # Na ramieniu nie ma czujnikow kontaktu szczek - sukcesem jest kostka
-                # (z kamer albo "w dloni") wyzej nad blatem niz `lift_height`.
-                st.success = (self._cube is not None and self._cube_fresh()
+                # (z kamer albo "w dloni") wyzej nad blatem niz `lift_height`, i to tylko,
+                # gdy szczeka ja TRZYMA (stoi, ciasniej rozkazana niz jest). Zmierzone
+                # (blizniak, 1 z 18 sukcesow): seria 1 s przy 10,9 cm, a kostka obracala
+                # sie w szczekach, szczeka domykala sie 31,8 -> 0 przez 3,5 s i kostka spadla
+                # 4 s po "zadanie wykonane".
+                # Szczeka "stoi" z taktu na takt nawet przy powolnym domykaniu (9 jednostek/s
+                # to 0,005 rad na takt) - dlatego tez: w trakcie serii nie domyka sie o wiecej
+                # niz `grip_creep` od jej poczatku.
+                if holding and st.success_streak > 0 and q[5] < self._streak_grip - self.grip_creep:
+                    holding = False
+                st.success = (self._cube is not None and self._cube_fresh() and holding
                               and self._cube[2] - self.task.cube_half > self.task.lift_height)
+                if st.success and st.success_streak == 0:
+                    self._streak_grip = float(q[5])
             st.success_streak = st.success_streak + 1 if st.success else 0
             self._ticks += 1
             if now - self._t_hz >= 1.0:
@@ -302,6 +323,18 @@ class PolicyRunner:
             self._halt(f"{type(exc).__name__}: {exc}")
             return False
         return True
+
+    def _jaw_holding(self, grip_q: float) -> bool:
+        """Czy szczeka trzyma: stoi od poprzedniego taktu, jest szerzej niz rozkaz i niz pusta, zamknieta.
+
+        Te same progi, co `CubeTracker` ("w dloni"). Rozkaz z POPRZEDNIEGO taktu - za nim
+        serwo wlasnie jedzie. Szczeka, ktora sie domyka (kostka wypada, obraca sie), nie stoi.
+        """
+        prev, self._grip_prev = self._grip_prev, float(grip_q)
+        still = prev is not None and abs(grip_q - prev) < self.grip_still
+        squeezing = (grip_q - self.q_cmd[5] > self.grip_block_margin
+                     and grip_q > self.limits.lo[5] + self.grip_open_margin)
+        return bool(still and squeezing)
 
     def _cube_fresh(self) -> bool:
         """Czy poza kostki jest swieza - tylko z takiej wolno liczyc sukces lift.

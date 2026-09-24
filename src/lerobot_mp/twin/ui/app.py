@@ -551,10 +551,9 @@ class TwinApp:
             return
         self._gizmo_seed = None
         self._gizmo_t = 0.0                         # uchwyt TCP od razu na koncowce
-        self.twin.set_engaged(True)
-        if self.twin.owner != PANEL_OWNER:          # odebrane (STOP, Dom) miedzy claim a sprzeglem
-            if self.twin.owner is None:
-                self.twin.set_engaged(False)
+        # Sprzeglo tylko, jesli ramie wciaz nalezy do panelu - sprawdzenie i wlaczenie razem
+        # (pod blokada wlasnosci w `Twin`); odebrane (STOP, Dom) miedzy claim a sprzeglem - odmowa.
+        if not self.twin.set_engaged(True, owner=PANEL_OWNER):
             self.arm_engage.value = False
 
     def _build_table(self) -> None:
