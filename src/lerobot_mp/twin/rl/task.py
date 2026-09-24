@@ -63,6 +63,19 @@ class TaskConfig:
     start_noise_deg: float = 8.0
     #: Kara za szarpanie: waga ||a - a_poprzednie||^2.
     action_rate: float = 0.02
+    #: Ile taktow sukcesu Z RZEDU konczy epizod (0 = nigdy). Tak samo zatrzymuje sie
+    #: runner na ramieniu ("zadanie wykonane"). Bez tego lift-v2 po chwycie jechal
+    #: dalej: podstawa -105 st., lokiec -92, nadgarstek +95 i -150 (wszystkie limity),
+    #: kostka 37 cm nad blatem zamiast 6 - i trzymal tak do konca epizodu (8,5 s).
+    end_on_success: int = 0
+    #: Kara za cel stawu ramienia przy limicie: waga * sum((1 - zapas/limit_margin)^2)
+    #: po stawach blizej limitu niz `limit_margin` [rad]. Nagroda nie mowila nic o
+    #: postawie, wiec nic nie trzymalo polityki z dala od limitow.
+    limit_penalty: float = 0.0
+    limit_margin: float = 0.15
+    #: Kara za ruch ramienia, gdy zadanie jest juz wykonane: waga * ||a_ramie||^2.
+    #: Seria `end_on_success` ma byc trzymaniem kostki, a nie wymachem z nia.
+    hold_still: float = 0.0
 
     @property
     def obs_dim(self) -> int:
@@ -89,6 +102,8 @@ def make_task(name: str = "reach", **overrides) -> TaskConfig:
     if name not in TASKS:
         raise ValueError(f"nieznane zadanie {name!r}; dostepne: {', '.join(TASKS)}")
     base = TaskConfig(name=name, episode_steps=100 if name == "reach" else 200)
+    if name == "lift":
+        base = replace(base, end_on_success=10, limit_penalty=0.5, hold_still=0.5)
     return replace(base, **overrides)
 
 
@@ -174,20 +189,32 @@ def fold_yaw(xp, R):
 
 
 # ---------------------------------------------------------------- nagroda
-def reward(xp, task: TaskConfig, tcp, action, prev_action, goal=None, cube_pos=None, jaw_contacts=None):
+def limit_cost(xp, task: TaskConfig, limits: Limits, q_cmd):
+    """(N,) kara za cele stawow ramienia blizej limitu niz `limit_margin` (0 w srodku zakresu)."""
+    lo, hi = _as(xp, limits.lo[:5], q_cmd), _as(xp, limits.hi[:5], q_cmd)
+    room = xp.minimum(q_cmd[..., :5] - lo, hi - q_cmd[..., :5])
+    near = _clip(xp, 1.0 - room / task.limit_margin, 0.0, 1.0)
+    return task.limit_penalty * (near * near).sum(-1)
+
+
+def reward(xp, task: TaskConfig, tcp, action, prev_action, goal=None, cube_pos=None, jaw_contacts=None,
+           q_cmd=None, limits: Limits | None = None):
     """(nagroda, sukces, porazka) dla kazdego swiata.
 
     `jaw_contacts` (N, 2): czy kostka dotyka szczeki stalej i ruchomej.
     Porazka = kostka spadla ze stolu; epizod sie wtedy konczy.
+    `q_cmd` (N, 6) i `limits` - do kary za limity (`limit_penalty`); bez nich jej nie ma.
     """
-    rate = task.action_rate * ((action - prev_action) ** 2).sum(-1)
+    cost = task.action_rate * ((action - prev_action) ** 2).sum(-1)
+    if task.limit_penalty > 0 and q_cmd is not None and limits is not None:
+        cost = cost + limit_cost(xp, task, limits, q_cmd)
     if task.name == "reach":
         d = _norm(goal - tcp)
         # Dwie skale: zgrubna ciagnie z daleka, dokladna nagradza ostatnie milimetry.
         r = 0.5 * (1.0 - xp.tanh(d / 0.10)) + 0.5 * (1.0 - xp.tanh(d / 0.01))
         success = d < task.success_dist
         failure = d < -1.0                                  # w reach nie ma porazki
-        return r - rate, success, failure
+        return r - cost, success, failure
     d = _norm(cube_pos - tcp)
     grasped = (jaw_contacts[..., 0] > 0.5) & (jaw_contacts[..., 1] > 0.5)
     height = cube_pos[..., 2] - task.cube_half
@@ -196,8 +223,23 @@ def reward(xp, task: TaskConfig, tcp, action, prev_action, goal=None, cube_pos=N
     g = grasped.to(tcp.dtype) if xp is not np else grasped.astype(tcp.dtype)
     s = success.to(tcp.dtype) if xp is not np else success.astype(tcp.dtype)
     r = (1.0 - xp.tanh(d / 0.05)) + g + 4.0 * g * lifted + 2.0 * s
+    if task.hold_still > 0:
+        cost = cost + task.hold_still * s * (_clip(xp, action[..., :5], -1.0, 1.0) ** 2).sum(-1)
     failure = height < -0.05
-    return r - rate, success, failure
+    return r - cost, success, failure
+
+
+def success_streak(xp, task: TaskConfig, streak, success):
+    """(nowa seria sukcesow z rzedu, czy konczy epizod) - to samo w env, batch i runnerze.
+
+    Koniec epizodu po serii jest "ucieciem" (jak limit czasu), a nie stanem koncowym:
+    PPO dolicza mu wartosc stanu. Gdyby liczyl zero, polityka nauczylaby sie NIE konczyc
+    - kostka trzymana tuz ponizej `lift_height` daje ~6 na takt przez reszte epizodu,
+    a zakonczenie tylko 8 x 10 taktow.
+    """
+    streak = xp.where(success, streak + 1, streak * 0)
+    done = streak >= task.end_on_success if task.end_on_success > 0 else success & ~success
+    return streak, done
 
 
 # ---------------------------------------------------------------- starty

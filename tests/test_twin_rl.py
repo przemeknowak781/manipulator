@@ -96,13 +96,18 @@ def test_observation_and_reward_are_the_same_in_numpy_and_torch(name):
     act, prev = rng.uniform(-1, 1, (n, 6)), rng.uniform(-1, 1, (n, 6))
     jaws = rng.integers(0, 2, (n, 2)).astype(float)
 
+    task = tk.make_task(name, limit_penalty=0.5, hold_still=0.5, end_on_success=2)
+    cube[: n // 2, 2] = 0.09                                   # polowa "podniesiona" - sukces i kara za ruch
+    streak = rng.integers(0, 3, n)
+
     def run(xp, conv):
         obs = tk.observe(xp, task, lim, conv(q), conv(q_cmd), conv(tcp), conv(prev), goal=conv(goal),
                          cube_pos=conv(cube), cube_rot=conv(rot))
         r, s, f = tk.reward(xp, task, conv(tcp), conv(act), conv(prev), goal=conv(goal), cube_pos=conv(cube),
-                            jaw_contacts=conv(jaws))
+                            jaw_contacts=conv(jaws), q_cmd=conv(q_cmd), limits=lim)
         nxt = tk.apply_action(xp, task, lim, conv(q_cmd), conv(act))
-        return [np.asarray(x) for x in (obs, r, s, f, nxt)]
+        st, done = tk.success_streak(xp, task, streak if xp is np else torch.as_tensor(streak), s)
+        return [np.asarray(x) for x in (obs, r, s, f, nxt, st, done)]
 
     a = run(np, lambda x: x)
     b = run(torch, lambda x: torch.as_tensor(x, dtype=torch.float64))
@@ -148,6 +153,135 @@ def test_randomization_around_measured_dynamics_centres_on_it():
     assert np.median(s["kp"]) == pytest.approx(1.3, rel=0.02)
     assert r.max_delay == 3
     assert s["kp"].min() >= 1.3 * r.kp[0] - 1e-9
+
+
+def test_no_randomization_keeps_the_measured_arm_and_the_camera_model():
+    """--no-rand = zmierzona dynamika bez rozrzutu (a nie Menagerie), percepcja kostki jak z kamer."""
+    dyn = Dynamics(kp=0.8, damping=1.4, delay=1.6, source="identyfikacja")
+    r = Randomization.around(dyn, spread=0.0)
+    s = r.sample(np.random.default_rng(0), 500)
+    assert np.allclose(s["kp"], 0.8) and np.allclose(s["damping"], 1.4) and np.all(s["delay"] == 2)
+    assert np.allclose(s["cube_mass"], 1.0)
+    assert r.centre.source == "identyfikacja" and not r.randomized
+    assert r.fold_yaw and r.cube_delay > 0 and r.cube_period > 1
+    nom = Randomization.nominal(dyn)
+    assert not nom.randomized and nom.centre is dyn and nom.min_delay == nom.max_delay == 2
+    assert not nom.fold_yaw and nom.cube_delay == 0 and nom.obs_noise_deg == 0.0
+    assert Randomization.around(dyn, 1.0).randomized and Randomization().randomized
+    assert not Randomization.none().randomized
+
+
+def test_train_plan_does_not_label_a_nominal_run_as_randomized():
+    from lerobot_mp.twin.cli import _train_plan, parser
+
+    dyn = Dynamics(kp=0.8, delay=1.2, source="identyfikacja")
+    rand, evals = _train_plan(dyn, no_rand=True, spread=1.0)
+    assert rand.centre is dyn and [e[1] for e in evals] == ["cpu_nominal"]
+    assert evals[0][2].centre is dyn
+    rand, evals = _train_plan(dyn, no_rand=False, spread=1.0)
+    assert [e[1] for e in evals] == ["cpu_nominal", "cpu_rand"] and evals[1][2] is rand and rand.randomized
+    # panel ruszajacy ramieniem nie wystawia sie domyslnie na siec
+    assert parser().parse_args(["ui"]).host == "127.0.0.1"
+    assert parser().parse_args(["ui", "--host", "0.0.0.0"]).host == "0.0.0.0"
+
+
+def test_nominal_evaluation_runs_on_the_identified_arm():
+    from dataclasses import asdict
+
+    from lerobot_mp.twin.rl.evaluate import evaluate
+    from lerobot_mp.twin.workspace import Workspace
+
+    task = tk.make_task("reach", episode_steps=5)
+    pol = Policy(PolicyMeta(task=asdict(task), hidden=[8], obs_dim=task.obs_dim, act_dim=6))
+    ws = Workspace()
+    ws.dynamics = Dynamics(kp=0.8, delay=1.0, source="identyfikacja").to_dict()
+    res = evaluate(pol, 1, workspace=ws)
+    assert res["centre"] == "identyfikacja" and res["randomized"] is False
+    res = evaluate(pol, 1, randomization=Randomization.none(), workspace=ws)
+    assert res["centre"] == "menagerie" and res["randomized"] is False
+
+
+def test_lift_episode_ends_after_the_success_streak(monkeypatch):
+    """Po sukcesie lift-v2 wymachiwal kostka do limitow przez 170 taktow - teraz epizod sie konczy."""
+    real = tk.reward
+
+    def always_success(xp, task, *a, **kw):
+        r, s, f = real(xp, task, *a, **kw)
+        return r, s | True, f
+
+    monkeypatch.setattr(tk, "reward", always_success)
+    task = tk.make_task("lift")
+    assert task.end_on_success == 10 and tk.make_task("reach").end_on_success == 0
+    env = TwinEnv(task, randomization=Randomization.none())
+    try:
+        env.reset(seed=0)
+        for k in range(1, 11):
+            _, _, term, trunc, info = env.step(np.zeros(6))
+            assert not term and trunc == (k == 10) and info["finished"] == (k == 10)
+    finally:
+        env.close()
+    env = TwinEnv(tk.make_task("reach", episode_steps=15), randomization=Randomization.none())
+    try:
+        env.reset(seed=0)
+        ends = [env.step(np.zeros(6))[3] for _ in range(15)]
+        assert ends == [False] * 14 + [True]                  # reach: tylko limit czasu
+    finally:
+        env.close()
+
+
+def test_old_lift_policy_file_stops_on_success_too():
+    from dataclasses import asdict
+
+    old = asdict(tk.make_task("lift"))
+    for k in ("end_on_success", "limit_penalty", "limit_margin", "hold_still"):
+        old.pop(k)
+    meta = PolicyMeta(task=old, hidden=[8], obs_dim=tk.OBS_DIMS["lift"], act_dim=6)
+    assert meta.task_config().end_on_success == 10
+
+
+def test_lift_reward_pushes_away_from_joint_limits_and_holds_still_after_success():
+    task = tk.make_task("lift")
+    env = TwinEnv("reach", randomization=Randomization.none())
+    lim = env.limits
+    env.close()
+    tcp = np.array([[0.2, 0.0, 0.1]])
+    cube = tcp.copy()
+    jaws = np.ones((1, 2))
+    a0 = np.zeros((1, 6))
+
+    def r(q_cmd, action=a0, cube_pos=cube):
+        return tk.reward(np, task, tcp, action, action, cube_pos=cube_pos, jaw_contacts=jaws,
+                         q_cmd=q_cmd[None], limits=lim)[0][0]
+
+    home = lim.home.copy()
+    at_limits = home.copy()
+    at_limits[[0, 2, 3, 4]] = [lim.lo[0], lim.lo[2], lim.hi[3], lim.lo[4]]     # poza z wymachu lift-v2
+    assert r(home) - r(at_limits) == pytest.approx(4 * task.limit_penalty)
+    near = home.copy()
+    near[0] = lim.lo[0] + task.limit_margin / 2
+    assert 0 < r(home) - r(near) < task.limit_penalty
+    moving = np.array([[1.0, -1.0, 0.0, 0.0, 0.0, 0.0]])
+    assert r(home) - r(home, moving) == pytest.approx(2 * task.hold_still)           # kostka w gorze
+    low = cube.copy()
+    low[0, 2] = 0.03
+    assert r(home, moving, low) == pytest.approx(r(home, a0, low))                   # jeszcze nie sukces
+
+
+def test_observed_tcp_matches_the_joint_angles():
+    """Runner liczy TCP z FK katow; w treningu TCP bylo sprzed ostatniego kroku fizyki (4-8 mm w ruchu)."""
+    env = TwinEnv("reach", randomization=Randomization.none())
+    try:
+        env.reset(seed=0)
+        rng = np.random.default_rng(0)
+        worst = 0.0
+        for _ in range(40):
+            env.step(np.sign(rng.uniform(-1, 1, 6)))
+            s = env.state()
+            fk = env.kin.tcp(env.kin.from_q(s["q"]))[:3, 3]
+            worst = max(worst, float(np.linalg.norm(fk - s["tcp"])))
+        assert worst < 1e-4, f"TCP {worst * 1000:.2f} mm od FK(q)"
+    finally:
+        env.close()
 
 
 def test_policy_sees_the_cube_as_the_cameras_would():
@@ -199,6 +333,57 @@ def test_gpu_batch_env_matches_the_cpu_env():
         assert np.abs(og[0].cpu().numpy() - oc).max() < 1e-3
         assert float(rg[0]) == pytest.approx(rc, abs=1e-3)
     cpu.close()
+
+
+@cuda
+def test_gpu_applies_the_same_multi_tick_action_delay_as_the_cpu():
+    """Opoznienie z identyfikacji (np. 2 takty) - GPU scinalo je do 1 taktu."""
+    from dataclasses import replace
+
+    from lerobot_mp.twin.rl.batch import BatchEnv
+
+    rand = replace(Randomization.none(), min_delay=2, max_delay=2)
+    cpu = TwinEnv("reach", randomization=rand)
+    cpu.reset(seed=3)
+    assert len(cpu._delay) == 2
+    gpu = BatchEnv("reach", num_envs=2, randomization=rand)
+    gpu.reset()
+    assert gpu.delay_n.tolist() == [2, 2]
+    dev = gpu.device
+    gpu.qpos[:] = torch.as_tensor(cpu.scene.data.qpos, dtype=torch.float32, device=dev)
+    gpu.qvel[:] = 0
+    q_cmd = torch.as_tensor(cpu.q_cmd, dtype=torch.float32, device=dev)
+    gpu.ctrl[:, gpu.act] = q_cmd
+    gpu.q_cmd[:] = q_cmd
+    gpu.goal[:] = torch.as_tensor(cpu.goal, dtype=torch.float32, device=dev)
+    rng = np.random.default_rng(1)
+    for _ in range(12):
+        a = rng.uniform(-1, 1, 6)
+        oc, *_ = cpu.step(a)
+        og, *_ = gpu.step(torch.as_tensor(a, device=dev).repeat(2, 1))
+        assert np.abs(gpu.q_cmd[0].cpu().numpy() - cpu.q_cmd).max() < 1e-5
+        assert np.abs(og[0].cpu().numpy() - oc).max() < 1e-3
+    cpu.close()
+
+
+@cuda
+def test_gpu_ends_episodes_after_the_success_streak(monkeypatch):
+    from lerobot_mp.twin.rl.batch import BatchEnv
+
+    real = tk.reward
+
+    def always_success(xp, task, *a, **kw):
+        r, s, f = real(xp, task, *a, **kw)
+        return r, s | True, f
+
+    monkeypatch.setattr(tk, "reward", always_success)
+    gpu = BatchEnv(tk.make_task("reach", end_on_success=3), num_envs=4, randomization=Randomization.none())
+    gpu.reset()
+    for k in range(1, 4):
+        _, _, done, info = gpu.step(torch.zeros(4, 6, device=gpu.device))
+        assert bool(done.all()) == (k == 3) and bool(info["finished"].all()) == (k == 3)
+    assert bool(info["time_outs"].all())                     # PPO dolicza wartosc stanu
+    assert gpu.t.tolist() == [0] * 4 and gpu.streak.tolist() == [0] * 4
 
 
 def test_runner_drives_the_simulated_arm_through_the_supervisor():
