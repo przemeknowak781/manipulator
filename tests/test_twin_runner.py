@@ -103,29 +103,52 @@ def test_home_stops_the_runner(twin, monkeypatch):
 
 # ------------------------------------------------------------ koniec po sukcesie (lift)
 def lift_runner(twin, cube_z: float, source: str | None = "w dloni", as_tuple: bool = False) -> PolicyRunner:
+    """Polityka lift, ktora zamyka szczeke (akcja chwytaka -1), i kostka na wysokosci `cube_z`."""
     task = tk.make_task("lift")
     cube = (np.array([0.2, 0.0, cube_z]), np.eye(3))
+    pol = constant_policy(task, {5: -1.0})
     if as_tuple:                                           # dostawca sam podaje zrodlo pozy
-        return PolicyRunner(twin, constant_policy(task), cube_provider=lambda: (*cube, source))
-    return PolicyRunner(twin, constant_policy(task), cube_provider=lambda: cube,
+        return PolicyRunner(twin, pol, cube_provider=lambda: (*cube, source))
+    return PolicyRunner(twin, pol, cube_provider=lambda: cube,
                         cube_source=(lambda: source) if source is not None else None)
+
+
+def holding_arm(**kw) -> FakeArm:
+    """Ramie z kostka w szczekach: chwytak zablokowany na 30 (rozkaz zamkniecia ciasniej)."""
+    arm = FakeArm(**kw)
+    arm.blocked["gripper"] = 30.0
+    return arm
 
 
 def test_lift_ends_when_the_cube_is_held_above_the_table(twin, monkeypatch):
     """Po podniesieniu kostki polityka lift-v2 krecila ramieniem do limitow stawow przez reszte
     epizodu (8,5 s) - runner ma skonczyc po `end_on_success` taktach sukcesu z rzedu."""
-    connect_fake(twin, monkeypatch, FakeArm())
+    connect_fake(twin, monkeypatch, holding_arm())
     runner = lift_runner(twin, cube_z=0.015 + 0.08)
     assert runner.end_on_success == 10
     runner.start(threaded=False)
     drive(twin, runner, 2.0)
     assert runner.status.stopped_because == "zadanie wykonane"
-    assert runner.status.step == 10
+    # Seria liczy sie od chwili, gdy szczeka stoi na kostce, a rozkaz jest ciasniejszy.
+    assert 10 <= runner.status.step <= 14
     assert twin.owner is None
 
 
+@pytest.mark.parametrize("jaw", ["free", "creeping"])
+def test_lift_success_needs_a_jaw_that_holds(twin, monkeypatch, jaw):
+    """Kostka "w dloni" 8 cm nad blatem, ale szczeka nie trzyma: pusta (dojezdza do rozkazu) albo
+    powoli sie domyka (kostka obraca sie i wysuwa). Zmierzone (blizniak): seria 1 s przy 10,9 cm,
+    szczeka 31,8 -> 0 w 3,5 s i kostka spadla 4 s po "zadanie wykonane"."""
+    arm = FakeArm() if jaw == "free" else FakeArm(vmax=300.0, vmax_of={"gripper": 9.0})
+    connect_fake(twin, monkeypatch, arm)
+    runner = lift_runner(twin, cube_z=0.015 + 0.08)
+    runner.start(threaded=False)
+    drive(twin, runner, 3.0)
+    assert runner.status.running and runner.status.stopped_because != "zadanie wykonane"
+
+
 def test_lift_does_not_end_while_the_cube_is_on_the_table(twin, monkeypatch):
-    connect_fake(twin, monkeypatch, FakeArm())
+    connect_fake(twin, monkeypatch, holding_arm())
     runner = lift_runner(twin, cube_z=0.015)
     runner.start(threaded=False)
     drive(twin, runner, 2.0)
@@ -138,7 +161,7 @@ def test_lift_success_is_not_counted_from_a_stale_pose(twin, monkeypatch, source
     """Kostka wypadla ze szczek, a tracker podawal przez 6 s ostatnia poze w powietrzu jako
     "ostatnie widziane": runner konczyl "zadanie wykonane" z kostka na blacie. Na prawdziwym
     ramieniu bez zrodla pozy (stary dostawca) sukces tez sie nie liczy."""
-    connect_fake(twin, monkeypatch, FakeArm())
+    connect_fake(twin, monkeypatch, holding_arm())
     runner = lift_runner(twin, cube_z=0.015 + 0.08, source=source, as_tuple=as_tuple)
     runner.start(threaded=False)
     drive(twin, runner, 2.0)
@@ -148,7 +171,7 @@ def test_lift_success_is_not_counted_from_a_stale_pose(twin, monkeypatch, source
 
 @pytest.mark.parametrize("source", ["kamery", "w dloni"])
 def test_lift_success_counts_from_a_fresh_pose_given_by_the_provider(twin, monkeypatch, source):
-    connect_fake(twin, monkeypatch, FakeArm())
+    connect_fake(twin, monkeypatch, holding_arm())
     runner = lift_runner(twin, cube_z=0.015 + 0.08, source=source, as_tuple=True)
     runner.start(threaded=False)
     drive(twin, runner, 2.0)

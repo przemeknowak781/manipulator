@@ -238,9 +238,10 @@ def record(twin, plan: list[tuple[float, dict[str, float]]], settle: float = 1.0
                 on_tick(t / duration)
             time.sleep(period)
     finally:
-        if twin.owner == OWNER:
-            twin.set_engaged(False)
-            twin.release(OWNER)
+        # Sprawdzenie wlasciciela i sprzeglo razem, w `Twin` (pod blokada wlasnosci): osobne
+        # `if twin.owner == OWNER` wylaczalo sprzeglo panelu, gdy STOP i panel weszly miedzy nie.
+        twin.set_engaged(False, owner=OWNER)
+        twin.release(OWNER)
     rec = Recording(np.array(ts), np.array(cmds, float), np.array(meas, float),
                     {"backend": twin.status.backend, "loop_hz": twin.loop_hz,
                      "time": time.strftime("%Y-%m-%dT%H:%M:%S")})

@@ -17,7 +17,8 @@ Ramieniem steruje naraz JEDEN wlasciciel (`claim`/`release`): panel (suwaki
 ze sprzeglem), polityka, fala kalibracyjna albo identyfikacja. Bez tego
 trzy watki pisaly ten sam cel na zmiane i ramie skakalo miedzy nimi.
 Dom, STOP, polaczenie i rozlaczenie odbieraja ramie wlascicielowi
-(`preempt`) i zatrzymuja je w ZMIERZONEJ pozie.
+(`preempt`) i zatrzymuja je tam, gdzie serwo sie zatrzyma - nie dalej niz ostatni
+rozkaz, nie za zmierzona poza (`hold_measured`).
 
 MuJoCo nie jest bezpieczne watkowo, a scene czytaja: petla (fizyka), UI (poza
 do rysowania) i kamery symulowane (render). Wszystko przez `self.lock` - ale
@@ -179,9 +180,10 @@ class _LoopState:
     link_down: bool = False
     #: Cokolwiek juz ruszylo ramieniem od polaczenia (patrz `_tick`).
     moved: bool = False
-    #: Lacze niepotwierdzone: ostatni odczyt bez zadnej odpowiedzi albo backend wstrzymal
-    #: wysylke. Nadzor stoi (krok 0 s), nic nie wysylamy, a pierwszy dobry odczyt
-    #: zaczyna rozkaz od nowa od zmierzonej pozy - takze ponizej progu utraty lacza.
+    #: Lacze niepotwierdzone: odczyt bez zadnej odpowiedzi, backend wstrzymal wysylke albo
+    #: petla stala dluzej niz `Twin.max_gap`. Nadzor stoi (krok 0 s), nic nie wysylamy, a dwa
+    #: kolejne zgodne odczyty zaczynaja rozkaz od nowa od zmierzonej pozy
+    #: (`Twin._confirm_after_silence`) - takze ponizej progu utraty lacza.
     silent: bool = False
     #: Rozkaz, ktory NAPRAWDE poszedl do serw ostatnim razem (to widzi `status.command`).
     last_sent: dict[str, float] = field(default_factory=dict)
@@ -190,8 +192,21 @@ class _LoopState:
     prev_measured_t: float = 0.0
     #: Od kiedy staw odjechal od rozkazu dalej niz `Twin.track_err_deg`.
     lag_since: dict[str, float] = field(default_factory=dict)
+    #: Swieze odczyty z ostatniej ~sekundy (chwila, poza) - czy staw jedzie do rozkazu.
+    hist: list[tuple[float, dict[str, float]]] = field(default_factory=list)
     #: Od kiedy serwo chwytaka zglasza blad (None = nie zglasza).
     grip_fault_since: float | None = None
+    #: Od kiedy serwo chwytaka NIE zglasza bledu (None = zglasza albo nie bylo bledu).
+    grip_ok_since: float | None = None
+    #: Od kiedy rozkaz chwytaka jest ciasniejszy od pomiaru (None = nie jest) - `Twin._grip_squeezing`.
+    grip_tight_since: float | None = None
+    #: Po milczeniu: pierwszy swiezy odczyt czeka na potwierdzenie nastepnym (i od kiedy czeka).
+    confirm: dict[str, float] | None = None
+    confirm_since: float | None = None
+    #: Lacze wrocilo po utracie (STOP): potwierdzona poza idzie przez `hold_measured`, nie `reseed`.
+    recover_hold: bool = False
+    #: Petla stoi (lacze niepotwierdzone) - `Twin.move` nie liczy wtedy czasu rampy.
+    frozen: bool = False
 
 
 class Twin:
@@ -208,8 +223,30 @@ class Twin:
     #: rozjazd kilkunastu stopni przez ulamek sekundy - ponizej progu.
     track_err_deg = 25.0
     track_err_s = 0.5
-    #: Chwytak "sciska", gdy rozkaz jest ciasniejszy od pomiaru o wiecej niz tyle [0..100].
+    #: ...ale tylko, gdy staw przez ostatnie `track_err_s` NIE jechal do rozkazu co najmniej
+    #: tyle st./s. Zmierzone (emulator STS3215 za mostem, 10 ms w jedna strone): suwak
+    #: wrist_roll od konca do konca przy serwie 185 st./s (nadzor 220) albo shoulder_lift przy
+    #: 70 st./s (nadzor 120) dawal rozjazd 40-50 st. - falszywy STOP, choc serwo jechalo pelna
+    #: predkoscia. Staw zablokowany albo bez momentu stoi (albo odjezdza) - STOP jak dotad.
+    track_min_speed = 15.0
+    #: Przyspieszenie serwa do drogi hamowania przy trzymaniu pozy [st./s^2]. LeRobot zapisuje
+    #: Acceleration=254 (~2230 st./s^2); nizsza wartosc = dluzsza droga = trzymanie blizej
+    #: ostatniego rozkazu, czyli najwyzej tam, dokad serwo i tak jechalo.
+    servo_accel = 2000.0
+    #: Zapas na predkosc stawu z odczytow przy trzymaniu pozy (patrz `_measured_now`).
+    vel_margin = 1.3
+    #: Chwytak "sciska", gdy rozkaz jest ciasniejszy od pomiaru o wiecej niz tyle [0..100]...
     grip_squeeze_margin = 3.0
+    #: ...i szczeka STOI: dwa kolejne swieze odczyty blizej niz tyle [0..100]. Zamykajaca sie
+    #: szczeka tez odstaje od rozkazu (~20 jednostek przy 300/s) - STOP trzymal wtedy pelny
+    #: rozkaz zamkniecia i szczeki zamykaly sie dalej o 15-27 jednostek (palec miedzy nimi).
+    grip_still = 1.0
+    #: ...i rozkaz jest ciasniejszy od pomiaru od co najmniej tylu sekund. Szczeka, ktorej
+    #: rozkazano zamkniecie przed chwila, stoi jeszcze (opoznienie lacza, okres odczytu) -
+    #: emulator: Dom 80 ms po rozkazie zamkniecia zostawial chwytak na 77,5 zamiast w domu.
+    grip_block_s = 0.15
+    #: Odciazenie chwytaka znika, gdy bledu nie ma od tylu sekund, a szczeka juz nie sciska.
+    grip_clear_s = 1.0
     #: Po bledzie serwa chwytaka (przeciazenie przy mocnym chwycie) rozkaz szczek najwyzej
     #: tyle ciasniej niz pomiar [0..100, ~0,6 st. na jednostke] - docisk zostaje, prad spada.
     grip_ease = 8.0
@@ -217,8 +254,18 @@ class Twin:
     grip_fault_s = 2.0
     #: Roznica tikow chwytaka backend/blizniak, od ktorej panel ostrzega.
     grip_ticks_tol = 20.0
-    #: Dwa kolejne odczyty przy polaczeniu musza sie zgadzac do tylu jednostek.
+    #: Dwa kolejne odczyty przy polaczeniu (i po kazdym milczeniu lacza) musza sie zgadzac
+    #: do tylu jednostek.
     start_read_tol = 2.0
+    #: Po milczeniu lacza odczyty niezgodne dluzej niz tyle sekund = STOP (petla dalej stoi).
+    confirm_timeout_s = 1.0
+    #: `move` konczy sie dopiero, gdy stawy ramienia stoja (wolniej niz `move_still_speed`
+    #: st./s) najwyzej `move_arrive_deg` od rozkazu; inaczej RuntimeError po `settle` +
+    #: `move_arrive_s`. Zmierzone: przestoj lacza 1,1 s pod koniec przejazdu - `move` wracal
+    #: "normalnie" z ramieniem 17 st. od celu, jadacym 130 st./s (fala brala wtedy kadry).
+    move_arrive_deg = 10.0
+    move_still_speed = 10.0
+    move_arrive_s = 1.5
 
     def __init__(self, workspace: Workspace, loop_hz: float = 50.0):
         self.workspace = workspace
@@ -272,6 +319,8 @@ class Twin:
         self._warnings: dict[str, str] = {}
         #: Najciasniejszy dozwolony rozkaz chwytaka po jego bledzie (None = bez ograniczenia).
         self._grip_floor: float | None = None
+        #: STOP z powodu bledu chwytaka: szczeka trzyma zmierzone rozwarcie, bez docisku.
+        self._grip_release = False
 
     # ------------------------------------------------------------ scena
     def rebuild(self) -> None:
@@ -418,22 +467,26 @@ class Twin:
             logger.exception("Blad przy przerywaniu wlasciciela ramienia")
 
     def hold_measured(self, measured: Mapping[str, float] | None = None) -> None:
-        """Cel := zmierzona poza; rozkaz nadzoru i ograniczniki predkosci od nowa w niej - nic nie skacze.
+        """Cel := poza, w ktorej ramie stanie; rozkaz nadzoru i ograniczniki predkosci od nowa w niej.
 
-        Bez `measured`: ostatni odczyt przesuniety o jego wiek wzdluz predkosci stawu
-        (najwyzej do ostatniego rozkazu) - patrz `_measured_now`.
+        Jedna regula dla STOP-u, Domu, odebrania ramienia i stopu na kolizji (bez
+        `measured`): kazdy staw trzyma punkt, w ktorym serwo i tak sie zatrzyma - ostatni
+        odczyt przesuniety o jego wiek i droge hamowania, najwyzej do ostatniego rozkazu,
+        nigdy za zmierzona poze w strone przeciwna do ruchu (`_measured_now`). Staw w biegu
+        nie zawraca wiec skokiem; staw zablokowany (kolizja, serwo bez momentu) ma predkosc
+        zero i trzyma czysty pomiar - bez docisku do przeszkody.
 
-        Chwytak, ktory sciska (rozkaz ciasniejszy od pomiaru), trzyma SWOJ rozkaz:
-        rozkaz = zmierzony kat zablokowanej szczeki to zerowa sila, a kostka niesiona
+        Chwytak, ktory sciska (rozkaz ciasniejszy od pomiaru, szczeka stoi), trzyma SWOJ
+        rozkaz: rozkaz = zmierzony kat zablokowanej szczeki to zerowa sila, a kostka niesiona
         17-20 cm nad blatem wypadala po STOP-ie, Domu albo stopie polityki na rozjezdzie.
-        Stawy ramienia - zmierzone, bo po kolizji ich rozkaz lezy za przeszkoda.
+        Szczeka w trakcie zamykania NIE sciska - staje w zmierzonym miejscu (palec miedzy
+        szczekami). Wyjatek: STOP od bledu chwytaka (`_grip_release`) - bez docisku.
         """
         sup = self._supervisor
         if sup is None:
             return
         if measured is None:
-            b = self._backend
-            measured = self.joints() if b is not None and b.info.simulated else self._measured_now()
+            measured = self._measured_now()
         measured = {k: float(v) for k, v in measured.items() if k in JOINT_NAMES}
         if not measured:
             return
@@ -445,27 +498,57 @@ class Twin:
             self._target = dict(pose) if self._engaged else None
 
     def _hold_pose(self, measured: Mapping[str, float]) -> dict[str, float]:
-        """Poza do trzymania: stawy ramienia zmierzone, sciskajacy chwytak przy swoim rozkazie."""
+        """Poza do trzymania: stawy ramienia jak podane, sciskajacy chwytak przy swoim rozkazie."""
         pose = dict(measured)
         sup = self._supervisor
-        if GRIPPER in pose and sup is not None:
-            cmd = sup.command.get(GRIPPER)
-            if cmd is not None and pose[GRIPPER] - cmd > self.grip_squeeze_margin:
-                pose[GRIPPER] = cmd
+        if GRIPPER in pose and sup is not None and not self._grip_release:
+            if self._grip_squeezing(pose[GRIPPER]):
+                pose[GRIPPER] = sup.command[GRIPPER]
             if self._grip_floor is not None:
                 pose[GRIPPER] = max(pose[GRIPPER], self._grip_floor)
         return pose
 
-    def _measured_now(self) -> dict[str, float]:
-        """Ostatni odczyt serw przesuniety do "teraz" wzdluz predkosci stawow.
+    def _grip_squeezing(self, measured: float) -> bool:
+        """Chwytak sciska: rozkaz ciasniejszy od pomiaru o wiecej niz margines I szczeka stoi.
 
-        Odczyt ma do 40 ms (+ takt do wyslania trzymania), a serwo w tym czasie
-        jedzie dalej. Zmierzone (serwo 250 st./s, STOP w trakcie szybkiego ruchu):
-        trzymanie samego odczytu cofalo ramie o 3,7-6,4 st. z pelna predkoscia serwa.
-        Przesuniecie tylko miedzy pomiarem a ostatnim wyslanym rozkazem - po kolizji
-        predkosc jest zerowa i zostaje czysty pomiar (bez docisku do przeszkody).
+        Bez warunku postoju zamykajaca sie szczeka (odstaje od rozkazu ~20 jednostek przy
+        300/s) liczyla sie jako sciskajaca: STOP trzymal pelny rozkaz zamkniecia, a szczeki
+        zamykaly sie dalej o 15-27 jednostek (emulator) - na palcu miedzy nimi. Dom zostawial
+        chwytak w przypadkowym rozwarciu. Ustalony, nieruchomy chwyt zostaje jak dotad.
         """
-        ls = self._ls
+        sup, ls = self._supervisor, self._ls
+        cmd = None if sup is None else sup.command.get(GRIPPER)
+        if cmd is None or measured - cmd <= self.grip_squeeze_margin:
+            return False
+        if ls is None:
+            return True
+        now = self._clock if self._manual else time.monotonic()
+        if ls.grip_tight_since is None or now - ls.grip_tight_since < self.grip_block_s:
+            return False
+        a, b = ls.measured.get(GRIPPER), ls.prev_measured.get(GRIPPER)
+        return a is None or b is None or abs(float(a) - float(b)) <= self.grip_still
+
+    def _measured_now(self) -> dict[str, float]:
+        """Gdzie kazdy staw sie zatrzyma, gdy teraz dostanie rozkaz "stoj" - poza do trzymania.
+
+        Odczyt ma do 40-70 ms (+ takt do wyslania trzymania), a serwo w tym czasie jedzie
+        dalej i potrzebuje jeszcze drogi hamowania v^2/2a (`servo_accel`). Zmierzone
+        (emulator STS3215, ~2230 st./s^2): trzymanie punktu bez drogi hamowania cofalo
+        wrist_roll o 6-14 st., Dom w biegu wysylal skok 7 st. wstecz. Wynik jest przyciety
+        miedzy pomiar a ostatni wyslany rozkaz: dalej niz tam serwo i tak by nie pojechalo,
+        a po kolizji predkosc jest zerowa i zostaje czysty pomiar (bez docisku do przeszkody).
+
+        Chwytak: tylko w strone otwierania - zamykajaca sie szczeka trzyma pomiar, bo STOP
+        nie moze domykac szczek (palec). Cofniecie o ulamek to lekkie otwarcie.
+
+        Predkosc z dwoch odczytow co 40 ms stemplowanych poczatkiem taktu, a nie chwila
+        probki - jitter lacza zanizal ja o ~25% i serwo i tak cofalo sie do 12,7 st.
+        (emulator, 10 ms +-5 ms). Stad zapas `vel_margin`; nadmiar i tak przycina ostatni
+        rozkaz. Granica to dalszy z (ostatni wyslany, biezacy rozkaz nadzoru): STOP z innego
+        watku miedzy krokiem nadzoru a wysylka trzymal punkt krok za rozkazem, ktory zaraz
+        poszedl (wrist_roll: 4,4 st. wstecz w jednym takcie).
+        """
+        ls, sup = self._ls, self._supervisor
         m = dict(self._latest)
         if ls is None or not ls.prev_measured:
             return m
@@ -474,25 +557,32 @@ class Twin:
             return m
         now = self._clock if self._manual else time.monotonic()
         horizon = min(max(now - ls.measured_t, 0.0) + 1.0 / self.loop_hz, 2 * self._read_period)
+        cmd = sup.command if sup is not None else {}
         for k, v in m.items():
-            if k == GRIPPER or k not in ls.prev_measured or k not in ls.last_sent:
+            if k not in ls.prev_measured or k not in ls.last_sent:
                 continue
-            est = v + (v - ls.prev_measured[k]) / span * horizon
+            vel = (v - ls.prev_measured[k]) / span * self.vel_margin
+            if k == GRIPPER and vel < 0:
+                continue
+            est = v + vel * horizon + vel * abs(vel) / (2.0 * self.servo_accel)
             c = ls.last_sent[k]
+            c2 = cmd.get(k, c)
+            if (c2 - v) * (c - v) >= 0 and abs(c2 - v) > abs(c - v):
+                c = c2
             m[k] = min(max(est, min(v, c)), max(v, c))
         return m
 
     def _squeeze_keep(self) -> dict[str, float]:
         """{chwytak: rozkaz}, gdy chwytak sciska - rampa do domu nie otwiera go po drodze."""
         sup = self._supervisor
-        if sup is None:
+        if sup is None or self._grip_release:
             return {}
         b = self._backend
         measured = self.joints() if b is not None and b.info.simulated else dict(self._latest)
         cmd = sup.command.get(GRIPPER)
         if cmd is None or GRIPPER not in measured:
             return {}
-        if measured[GRIPPER] - cmd > self.grip_squeeze_margin:
+        if self._grip_squeezing(float(measured[GRIPPER])):
             return {GRIPPER: cmd}
         return {}
 
@@ -509,8 +599,13 @@ class Twin:
         ws = self.workspace
         backend = (backend or ws.backend).lower()
         port = port if port is not None else ws.port
+        # Bez `max_relative_target` (D3): LeRobot przycinal cel do +-12 st. od pozycji, wiec
+        # rozjazd pomiar-rozkaz nie przekraczal ~12 st., straznik rozjazdu (25 st.) nie mogl
+        # zadzialac, a serwo dociskalo do przeszkody bez konca (zmierzone na prawdziwym stosie
+        # LeRobota nad emulatorem; bez limitu STOP po 0,78 s). Nadzor blizniaka i tak ogranicza
+        # predkosc. Aplikacja dloni ma wlasna konfiguracje - bez zmian.
         cfg = load_config(overrides={"robot": {"backend": "sim" if backend == "sim" else backend,
-                                               "port": port}})
+                                               "port": port, "max_relative_target": None}})
         b: RobotBackend | None = None
         try:
             b = SceneBackend(self) if backend == "sim" else create_backend(cfg)
@@ -536,7 +631,7 @@ class Twin:
         self._target, self._engaged = None, False
         self._latest = dict(measured)
         self._fault, self._note = "", ""
-        self._grip_floor = None
+        self._grip_floor, self._grip_release = None, False
         self._warnings = {}
         grip = _gripper_mismatch(b, self.grip_ticks_tol)
         if grip:
@@ -648,12 +743,23 @@ class Twin:
         self.preempt(reason)
 
     def clear_estop(self) -> None:
+        """Kasuje STOP. Blad chwytaka, jesli trwa, liczy sie od nowa (znow `grip_fault_s` na odciazeniu).
+
+        Bez restartu licznika STOP od bledu chwytaka wracal w nastepnym takcie: skasowanie,
+        sprzeglo i suwak chwytaka na 100 byly nadpisane, zanim szczeki drgnely - kostki nie
+        dalo sie wypuscic z panelu (emulator: 3 proby, 3 razy STOP po ~0 ms). Bit bledu,
+        ktory serwo trzyma do ponownego wlaczenia momentu, kasuje dopiero "Polacz".
+        """
         if self._supervisor is not None:
             with self._sup_lock:
                 self._supervisor.clear_estop()
             self._fault, self._note = "", ""
             self._grip_floor = None                        # blad chwytaka, jesli trwa, wroci w nastepnym takcie
+            self._grip_release = False
             self._warnings.pop("grip_eased", None)
+            ls = self._ls
+            if ls is not None:
+                ls.grip_fault_since, ls.grip_ok_since = None, None
 
     def move(self, joints: Mapping[str, float], duration: float, settle: float = 0.4,
              owner: str = "kalibracja", take: bool = True) -> None:
@@ -668,7 +774,12 @@ class Twin:
 
         RuntimeError, gdy w trakcie ramie odebrano (dom, STOP, inny wlasciciel),
         rozlaczono albo polaczono na nowo - wtedy fala nie moze liczyc na poze,
-        ktorej ramie nie osiagnelo.
+        ktorej ramie nie osiagnelo. Takze, gdy po `settle` (+ `move_arrive_s`) ramie nie
+        stoi przy rozkazie (`_arrival`) - fala brala kadry i FK z ramienia w biegu.
+
+        Zegar rampy stoi, gdy stoi petla (lacze niepotwierdzone): nadzor wtedy nie jedzie,
+        a zegar liczony dalej konczyl rampe w czasie przestoju i po nim rozkaz gonil cel
+        z pelna predkoscia.
         """
         if not self.connected:
             raise RuntimeError("ramie nie jest polaczone")
@@ -688,10 +799,15 @@ class Twin:
             self._engaged = True
         start = dict(self.status.command or self.joints())
         goal = {k: float(joints.get(k, v)) for k, v in start.items()}
-        t0 = time.monotonic()
+        t0 = t_prev = time.monotonic()
+        paused = 0.0
         while True:
             self._check_move(gen)
-            s = smoothstep((time.monotonic() - t0) / max(duration, 1e-3))
+            now = time.monotonic()
+            if self._frozen():
+                paused += now - t_prev
+            t_prev = now
+            s = smoothstep((now - t0 - paused) / max(duration, 1e-3))
             target = {k: start[k] + s * (goal[k] - start[k]) for k in start}
             with self._own_lock:
                 if self._gen != gen:
@@ -704,7 +820,58 @@ class Twin:
         while time.monotonic() < t_end:
             self._check_move(gen)
             time.sleep(min(0.05, settle))
-        self._check_move(gen)
+        deadline = t_end + self.move_arrive_s
+        prev_cmd: dict[str, float] | None = None
+        while True:
+            self._check_move(gen)
+            why, prev_cmd = self._arrival(prev_cmd)
+            if not why:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"ruch nie dojechal do celu w {settle + self.move_arrive_s:.1f} s: {why}")
+            time.sleep(0.05)
+
+    def _frozen(self) -> bool:
+        """Petla stoi: lacze z serwami niepotwierdzone albo utracone."""
+        ls = self._ls
+        return ls is not None and ls.frozen
+
+    def _arrival(self, prev_cmd: dict[str, float] | None) -> tuple[str, dict[str, float]]:
+        """("", rozkaz), gdy stawy ramienia stoja przy rozkazie; inaczej (dlaczego nie, rozkaz).
+
+        Rozkaz porownywany z poprzednim wywolaniem: nadzor moze jeszcze gonic cel
+        (po przestoju, staw spoza limitow). Przy rozkazie = najwyzej `move_arrive_deg`
+        (serwo pod ciezarem ma staly uchyb), stoi = wolniej niz `move_still_speed`.
+        """
+        st = self.status
+        cmd, meas = dict(st.command), dict(st.measured)
+        if self._frozen():
+            return "lacze z serwami niepotwierdzone", cmd
+        if prev_cmd is None:
+            return "sprawdzanie", cmd
+        arm = [k for k in cmd if k != GRIPPER]
+        going = [k for k in arm if abs(cmd[k] - prev_cmd.get(k, cmd[k])) > 0.2]
+        if going:
+            return f"rozkaz jeszcze jedzie ({', '.join(going)})", cmd
+        far = [(k, meas[k] - cmd[k]) for k in arm if k in meas and abs(meas[k] - cmd[k]) > self.move_arrive_deg]
+        if far:
+            return ", ".join(f"{k} {abs(e):.0f} st. od rozkazu" for k, e in far), cmd
+        speed = self._joint_speed()
+        fast = [(k, v) for k, v in speed.items() if k != GRIPPER and abs(v) > self.move_still_speed]
+        if fast:
+            return ", ".join(f"{k} jeszcze jedzie ({abs(v):.0f} st./s)" for k, v in fast), cmd
+        return "", cmd
+
+    def _joint_speed(self) -> dict[str, float]:
+        """Predkosc stawow [jednostka/s] z dwoch ostatnich swiezych odczytow."""
+        ls = self._ls
+        if ls is None or not ls.prev_measured:
+            return {}
+        span = ls.measured_t - ls.prev_measured_t
+        if span <= 1e-6:
+            return {}
+        return {k: (float(v) - float(ls.prev_measured[k])) / span
+                for k, v in ls.measured.items() if k in ls.prev_measured}
 
     def _check_move(self, gen: int) -> None:
         if self._supervisor is not None and self._supervisor.estopped:
@@ -767,18 +934,37 @@ class Twin:
                 if fresh:
                     ls.prev_measured, ls.prev_measured_t = before, before_t
                     ls.measured_t = now
+                    ls.hist.append((now, dict(ls.measured)))
+                    if ls.hist[0][0] < now - 2.0 * self.track_err_s:
+                        ls.hist = [h for h in ls.hist if h[0] >= now - 2.0 * self.track_err_s]
                     if ls.silent:
-                        self._reseed_after_silence(sup, ls)
+                        self._confirm_after_silence(sup, ls, now)
                 else:
-                    ls.silent = True
+                    ls.silent, ls.confirm = True, None
+            g, c = ls.measured.get(GRIPPER), sup.command.get(GRIPPER)
+            if g is not None and c is not None and float(g) - c > self.grip_squeeze_margin:
+                if ls.grip_tight_since is None:
+                    ls.grip_tight_since = now
+            else:
+                ls.grip_tight_since = None
 
             faults = _backend_faults(b)
             grip_faults = [f for f in faults if _fault_joint(f) == GRIPPER]
             arm_faults = [f for f in faults if _fault_joint(f) != GRIPPER]
             if grip_faults:
+                ls.grip_ok_since = None
                 grip_faults_long = self._ease_gripper(sup, ls, now, grip_faults)
             else:
                 ls.grip_fault_since, grip_faults_long = None, False
+                self._end_easing(sup, ls, now)
+            if grip_faults_long and not arm_faults and not self._grip_release:
+                # STOP od bledu chwytaka: szczeka staje na zmierzonym rozwarciu. Docisk (nawet
+                # odciazony) podtrzymywal przeciazenie, ktore do tego STOP-u doprowadzilo.
+                self._grip_release = True
+                g = ls.measured.get(GRIPPER)
+                if sup.estopped and g is not None:     # STOP juz byl - tylko chwytak bez docisku
+                    with self._sup_lock:
+                        sup.reseed({GRIPPER: float(g)})
             if arm_faults or grip_faults_long:
                 # Blad serwa ramienia (albo chwytaka, ktory mimo odciazenia trwa) = STOP.
                 msg = "; ".join(faults)
@@ -788,10 +974,19 @@ class Twin:
                 self._fault = msg
             link_down = any("brak odpowiedzi" in f for f in arm_faults)
             if ls.link_down and not link_down:
-                self.hold_measured(ls.measured)            # lacze wrocilo: od swiezego odczytu
+                # Lacze wrocilo: trzymanie od POTWIERDZONEGO odczytu (dwa zgodne), nie od
+                # pierwszego - ten bywa spozniona odpowiedzia sprzed utraty (`_confirm_after_silence`).
+                ls.recover_hold = True
+                if not ls.silent:                          # czesc serw milczala - ten odczyt to kandydat
+                    ls.silent, ls.confirm, ls.confirm_since = True, dict(ls.measured), now
             ls.link_down = link_down
 
             if not b.info.simulated and gap > self.max_gap:
+                # Przerwa w petli to tez klopot z laczem: odczyt, ktory trzymal petle 0,8 s, oddal
+                # spozniona odpowiedz sprzed przestoju, a nastepny druga, identyczna (emulator) -
+                # trzymanie z nich (predkosc zero = "zablokowany") cofalo serwo o 7 st. z 85 st./s.
+                # Petla stoi do dwoch zgodnych odczytow, trzymanie idzie od nich.
+                ls.silent, ls.confirm, ls.recover_hold = True, None, True
                 self._note, self._note_t = f"przerwa w petli sterowania ({gap * 1000:.0f} ms) - ruch przerwany", now
                 logger.warning(self._note)
                 self.preempt(self._note)
@@ -802,7 +997,9 @@ class Twin:
             # Lacze niepotwierdzone: nadzor stoi. Zmierzone przez most: przestoj 0,9 s
             # (ponizej progu utraty lacza) - nadzor liczyl dalej, nic nie szlo, a pierwszy
             # rozkaz po powrocie skakal 10,5 -> 27,2 st. i serwo jechalo tam z pelna predkoscia.
+            # Stoi tez do potwierdzenia pozy dwoma zgodnymi odczytami.
             frozen = ls.silent or link_down
+            ls.frozen = frozen
             # Cel, sprzeglo i krok nadzoru razem pod blokada nadzoru: `preempt`/`hold_measured`
             # z innego watku miedzy odczytem celu a krokiem dawaly jeszcze jeden takt
             # w strone starego celu (po kolizji - dalej w przeszkode).
@@ -882,18 +1079,90 @@ class Twin:
                     self._call_preempt(cb)
             return False
 
-    def _reseed_after_silence(self, sup: SafetySupervisor, ls: _LoopState) -> None:
-        """Pierwszy dobry odczyt po milczeniu lacza: rozkaz od nowa od zmierzonej pozy.
+    def _confirm_after_silence(self, sup: SafetySupervisor, ls: _LoopState, now: float) -> None:
+        """Swiezy odczyt po milczeniu lacza: petla rusza dopiero po DWOCH kolejnych zgodnych.
+
+        Pierwsza "swieza" odpowiedz po przestoju bywa spozniona ramka sprzed niego: TCP
+        oddaje ja po powrocie, a SYNC READ dopasowuje odpowiedzi tylko po ID serwa.
+        Zmierzone (emulator za mostem, pan 140 st./s, przestoj 0,9 s): reseed do niej
+        cofal rozkaz o 6-7 st. i serwo zawracalo z ~90 st./s - takze po STOP-ie
+        wcisnietym w przestoju; jedna odpowiedz spozniona o 0,3 s cofala o 2-4 st.
+        Petla stoi (nic nie wysyla), serwo dojezdza do ostatniego rozkazu i staje, a dwa
+        odczyty zgodne do `start_read_tol` to juz poza, w ktorej ono naprawde jest.
+        Niezgodne dluzej niz `confirm_timeout_s` - STOP z powodem (petla dalej stoi).
+        """
+        cand, ls.confirm = ls.confirm, dict(ls.measured)
+        if cand is None:
+            ls.confirm_since = now
+            return
+        common = cand.keys() & ls.measured.keys()
+        worst = max((abs(float(ls.measured[k]) - float(cand[k])) for k in common), default=0.0)
+        if worst <= self.start_read_tol:
+            self._reseed_after_silence(sup, ls, now, cand)
+            return
+        since = ls.confirm_since if ls.confirm_since is not None else now
+        if now - since >= self.confirm_timeout_s and not sup.estopped:
+            msg = (f"odczyty serw po przerwie lacza sie nie zgadzaja (roznica {worst:.1f} przez "
+                   f"{now - since:.1f} s) - ramie stoi; sprawdz lacze")
+            logger.error("STOP: %s", msg)
+            self._fault = msg
+            self.estop(msg)
+
+    def _reseed_after_silence(self, sup: SafetySupervisor, ls: _LoopState, now: float,
+                              first: Mapping[str, float] | None = None) -> None:
+        """Potwierdzona poza po milczeniu lacza: rozkaz od nowa od niej (`first` - pierwszy z dwoch odczytow).
 
         Dopoki lacze milczalo, nadzor stal, wiec rozkaz = ostatni wyslany. Serwo moglo
         jednak nie dojechac (przeszkoda) - start od pomiaru, jak po utracie lacza.
         Cel zostaje: ruch jedzie dalej od miejsca, gdzie ramie JEST, z limitem predkosci.
+        Po utracie lacza (STOP) - `hold_measured` tej pozy.
+
+        Ta sama regula co przy STOP-ie (`_measured_now`): staw, ktory miedzy dwoma odczytami
+        jedzie do ostatniego wyslanego rozkazu albo stoi najwyzej krok nadzoru (max_vel x 1,5
+        taktu) przed nim, trzyma ten rozkaz - serwo i tak tam dojedzie. Rozkaz wyslany tuz przed
+        przestojem potrafi dojsc do serwa PO nim (TCP); reseed do pomiaru cofal wtedy serwo
+        (emulator: +4,2 st. do spoznionego rozkazu, zaraz potem -5,5 st. z powrotem, do
+        ~90 st./s). Staw stojacy dalej (przeszkoda) - pomiar, bez docisku.
         """
-        ls.silent = False
+        ls.silent, ls.confirm, ls.confirm_since = False, None, None
         ls.lag_since.clear()
-        with self._sup_lock:
-            sup.reseed(self._hold_pose(ls.measured))
-        logger.info("Lacze z serwami wrocilo - rozkaz od zmierzonej pozy.")
+        ls.hist = [(now, dict(ls.measured))]
+        pose = {k: float(v) for k, v in ls.measured.items()}
+        for k, v in pose.items():
+            c = ls.last_sent.get(k)
+            if k == GRIPPER or c is None or k not in sup.cfg.joints:
+                continue
+            step = sup.cfg.joint(k).max_vel * sup.cfg.safety.velocity_scale * 1.5 / self.loop_hz
+            toward = 0.0 if first is None or k not in first else (v - float(first[k])) * (1.0 if c >= v else -1.0)
+            if abs(c - v) <= step + 0.5 or toward > 0.3:
+                pose[k] = c
+        if ls.recover_hold:
+            ls.recover_hold = False
+            self.hold_measured(pose)
+        else:
+            with self._sup_lock:
+                sup.reseed(self._hold_pose(pose))
+        logger.info("Lacze z serwami wrocilo - rozkaz od potwierdzonej, zmierzonej pozy.")
+
+    def _end_easing(self, sup: SafetySupervisor, ls: _LoopState, now: float) -> None:
+        """Odciazenie chwytaka znika, gdy bledu nie ma od `grip_clear_s`, a szczeka juz nie sciska.
+
+        Zostawalo na cala sesje panelu: po chwilowym przeciazeniu pusty chwytak zamykal sie
+        tylko do starego progu (22 zamiast 0) i ostrzezenie wisialo. Dopoki szczeka trzyma
+        (rozkaz = prog, ciasniej niz pomiar) - zostaje, bo powrot pelnego docisku znow by
+        przeciazyl serwo. Otwarcie (rozkaz nie ciasniej niz pomiar) = obiekt puszczony.
+        """
+        if self._grip_floor is None:
+            return
+        if ls.grip_ok_since is None:
+            ls.grip_ok_since = now
+        g, cmd = ls.measured.get(GRIPPER), sup.command.get(GRIPPER)
+        if g is None or cmd is None or now - ls.grip_ok_since < self.grip_clear_s:
+            return
+        if float(g) - cmd <= self.grip_squeeze_margin:
+            self._grip_floor = None
+            self._warnings.pop("grip_eased", None)
+            logger.info("Chwytak puscil - odciazenie po bledzie zdjete.")
 
     def _ease_gripper(self, sup: SafetySupervisor, ls: _LoopState, now: float, faults: list[str]) -> bool:
         """Blad TYLKO serwa chwytaka: szczeki luzniej zamiast STOP-u. True = trwa za dlugo (STOP).
@@ -923,26 +1192,45 @@ class Twin:
     def _check_tracking(self, b: RobotBackend, sup: SafetySupervisor, ls: _LoopState, now: float) -> None:
         """Straznik rozjazdu pomiar-rozkaz dla kazdego wlasciciela (patrz `track_err_deg`).
 
+        STOP, gdy staw jest dalej od rozkazu niz `track_err_deg` od `track_err_s` I przez
+        ostatnie `track_err_s` nie jechal do rozkazu co najmniej `track_min_speed`. Samo
+        "daleko od rozkazu" to takze serwo wolniejsze od nadzoru i odczyt sprzed 40-70 ms
+        (most) - pelne przejazdy suwakiem dawaly falszywy STOP. Staw zablokowany albo bez
+        momentu stoi albo odjezdza, wiec STOP przychodzi jak dotad (~0,5-1 s).
+
         Chwytak pominiety - szczeka zablokowana na kostce odstaje od rozkazu z definicji.
         """
         if not ls.moved or sup.estopped or not (self._engaged or sup.state in _MOVING):
             ls.lag_since.clear()
             return
         stale = _stale_joints(b)
+        # Odczyt sprzed ~track_err_s (najstarszy, jesli historia krotsza) - postep stawu.
+        past = ls.hist[0] if ls.hist else None
+        for t_h, pose in ls.hist:
+            if t_h > now - self.track_err_s:
+                break
+            past = (t_h, pose)
+        late = []
         for name in JOINT_NAMES:
             if name == GRIPPER or name in stale or name not in ls.measured or name not in ls.last_sent:
                 continue
-            if abs(ls.measured[name] - ls.last_sent[name]) > self.track_err_deg:
-                ls.lag_since.setdefault(name, now)
-            else:
+            err = ls.last_sent[name] - ls.measured[name]
+            if abs(err) <= self.track_err_deg:
                 ls.lag_since.pop(name, None)
-        late = [(name, now - t0) for name, t0 in ls.lag_since.items() if now - t0 >= self.track_err_s]
+                continue
+            t0 = ls.lag_since.setdefault(name, now)
+            if now - t0 < self.track_err_s:
+                continue
+            if past is not None and name in past[1] and now - past[0] > 1e-6:
+                toward = (ls.measured[name] - past[1][name]) * (1.0 if err > 0 else -1.0)
+                if toward >= self.track_min_speed * (now - past[0]):
+                    continue                               # jedzie do rozkazu - wolne serwo, nie kolizja
+            late.append((name, now - t0, err))
         if not late:
             return
-        name, held = late[0]
-        err = ls.measured[name] - ls.last_sent[name]
-        msg = (f"{name}: {abs(err):.0f} st. od rozkazu przez {held:.1f} s - serwo nie nadaza albo "
-               f"stracilo moment (kolizja?)")
+        name, held, err = late[0]
+        msg = (f"{name}: {abs(err):.0f} st. od rozkazu przez {held:.1f} s i nie jedzie do niego - serwo "
+               f"stracilo moment albo kolizja")
         logger.error("Rozjazd pomiar-rozkaz - STOP: %s", msg)
         ls.lag_since.clear()
         self._fault = msg

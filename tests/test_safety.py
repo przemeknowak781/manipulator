@@ -226,3 +226,38 @@ def test_begin_homing_can_keep_a_joint_where_it_is(supervisor, cfg):
     supervisor.begin_homing()                             # bez `keep` - jak dotad, wszystko do domu
     command = settle(supervisor, None, seconds=4.0, hand=False, engaged=False)
     assert command["gripper"] == pytest.approx(supervisor.home["gripper"], abs=0.5)
+
+
+@pytest.mark.parametrize("mode", ["homing", "starting"])
+def test_homing_is_not_done_while_a_joint_is_still_outside(cfg, mode):
+    """wrist_roll 195 st. (45 st. za limitem 150): powrot 15 st./s trwa 3 s, rampa 2,5 s.
+    Nadzor konczyl Dom (IDLE) z rozkazem 158,1 - staw dalej poza zakresem, a rozkaz
+    zamarzal tam, bo poza ACTIVE limity poszerzone zostaja."""
+    sup = SafetySupervisor(cfg)
+    sup.start({"wrist_roll": 195.0}, go_home=mode == "starting", keep_outside=True)
+    if mode == "homing":
+        sup.begin_homing()
+    dt = 0.02
+    hi = cfg.joint("wrist_roll").max
+    cmds = []
+    for _ in range(int(9.0 / dt)):
+        command, _ = sup.step(None, dt, hand_present=True, engaged=False)
+        cmds.append(command["wrist_roll"])
+        # Koniec rampy tylko ze stawem w zakresie.
+        assert not sup.is_homing_done or command["wrist_roll"] <= hi + 1e-6
+    assert sup.is_homing_done and sup.state is SafetyState.IDLE
+    assert cmds[-1] == pytest.approx(sup.home["wrist_roll"], abs=0.5)
+    # Po powrocie w zakres rampa stawu od nowa - bez skoku do pelnego max_vel.
+    vel = np.abs(np.diff(cmds)) / dt
+    assert vel.max() <= 1.5 * (hi - sup.home["wrist_roll"]) / cfg.safety.startup_ramp_s + 1.0
+
+
+def test_hand_app_homing_is_unchanged_by_the_outside_rule(supervisor, cfg):
+    """Aplikacja dloni (bez keep_outside) - Dom konczy sie po rampie jak dotad."""
+    settle(supervisor, {"wrist_roll": 140.0}, seconds=3.0)
+    supervisor.begin_homing()
+    n = 0
+    while not supervisor.is_homing_done:
+        supervisor.step(None, DT, hand_present=True, engaged=False)
+        n += 1
+    assert n * DT == pytest.approx(cfg.safety.startup_ramp_s, abs=DT + 1e-9)
